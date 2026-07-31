@@ -774,6 +774,11 @@ $snap[0] as $s
          else empty end),
         (if ($live.checks.state // "") == "pending"
          then {kind: "checks", text: "checks still running"} else empty end),
+        (if (($live.checks.state // "unknown") == "unknown")
+         then {kind: "checks",
+               text: (if $live == null then "checks not fetched"
+                      else "check status unconfirmed" end)}
+         else empty end),
         (if ($live.draft // false) then {kind: "draft", text: "still a draft"}
          else empty end),
         (if ($task.current_state.state // "") | IN("blocked","failed")
@@ -781,9 +786,9 @@ $snap[0] as $s
                text: (($task.current_state.detail | nn | clip(160))
                       // ("the lane is " + $task.current_state.state))}
          else empty end),
-        ($task.hints.open_decisions // [] | .[]
+        ($all_decisions | map(select(.origin == $ref.id)) | .[]
          | {kind: "decision", text: ("waiting on your decision: "
-                                     + (.summary | trim | clip(160)))}),
+                                     + (.question | trim | clip(160)))}),
         ($brec.unresolved_blocker_ids // [] | .[]
          | {kind: "depends-on", text: ("waits on " + .)}),
         (if ($brec.hold_reason | nn)
@@ -812,16 +817,18 @@ $snap[0] as $s
     # still running its pipeline owes the next move, checks that have not
     # reported are owed by CI, and only a PR nobody else is working on is
     # actually the captain's to land.
-    + (if ($blockers | any(.kind == "checks" and (.text | test("failing"))))
+    + (if ($blockers | any(.kind == "decision"))
+       then turn_of("captain"; "your decision"; "its lane is waiting on you"; "decide")
+       elif ($task.current_state.state // "") == "parked"
+       then turn_of("captain"; "your decision at a gate"; "its run is parked"; "decide")
+       elif ($blockers | any(.kind == "checks" and (.text | test("failing"))))
        then turn_of("worker"; "the worker fixing failing checks";
                     "its checks are failing"; null)
        elif ($blockers | any(.kind == "draft"))
        then turn_of("worker"; "the worker finishing a draft"; "it is still a draft"; null)
-       elif ($blockers | any(.kind == "decision"))
-       then turn_of("captain"; "your decision"; "its lane is waiting on you"; "decide")
-       elif ($blockers | any(.kind == "checks"))
+       elif ($live.checks.state // "") == "pending"
        then turn_of("external"; "CI checks"; "its checks are still running"; null)
-       elif (($task.current_state.state // "") | IN("working", "parked"))
+       elif ($task.current_state.state // "") == "working"
        # Only an attributed pipeline run is evidence that VALIDATION is what is
        # happening; a busy worker is evidence only that the worker is busy, and
        # the activity line below carries its own latest words either way.
@@ -830,6 +837,9 @@ $snap[0] as $s
                           "its pipeline is still running"; null)
              else turn_of("worker"; "the worker, still active on it";
                           "its lane is still working"; null) end)
+       elif ($blockers | any(.kind == "checks"))
+       then turn_of("external"; "confirmed check status";
+                    "its checks have not reported"; null)
        elif ($blockers | any(.kind == "depends-on"))
        then turn_of("captain";
                     ("you to land " + ([$blockers[] | select(.kind == "depends-on")
@@ -1424,7 +1434,9 @@ def attention_line:
 
 def why_now($fetched):
   if .row == "pr"
-  then (if .turn == "captain"
+  then (if .turn == "captain" and .action != "merge"
+        then (.waiting_for | e)
+        elif .turn == "captain"
         then (if ($fetched | not) then "checks not fetched"
               elif .checks.state == "passing" then "checks passing"
               elif .checks.state == "none" then "no checks"
@@ -1461,7 +1473,7 @@ def queue_row($names; $fetched):
   . as $it
   | (if (.decisions | length) > 0 then "details" else "div" end) as $tag
   | (if $tag == "details" then "summary" else "div" end) as $inner
-  | "<\($tag) class=\"item\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\">"
+  | "<\($tag) class=\"item\" data-item-id=\"\(.id | e)\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\" data-priority=\"\(if (.stuck // false) then 0 else 1 end)\">"
   + "<\($inner) class=\"\(if $inner == "div" then "line" else "" end)\" tabindex=\"0\">"
   + "<span class=\"chip \(.action | action_class)\">\(.action | action_word)</span>"
   + "<span class=\"title\">\(link(.link // .url; (if .row == "pr" then "#\(.number) " else "" end) + shorten(.title; $names + [.project, .repo]; 92)))</span>"
@@ -1651,8 +1663,8 @@ render_tail() {  # <state-json>
   });
 
   // Expanded rows are the captain's own progressive-disclosure choices; keep them.
-  document.querySelectorAll('details[data-lane], details.item, details.older').forEach(function (d, i) {
-    var key = 'open.' + (d.getAttribute('data-lane') || d.getAttribute('data-kind') || 'x') + '.' + i;
+  document.querySelectorAll('details[data-lane], details.item, details.older').forEach(function (d) {
+    var key = 'open.' + (d.getAttribute('data-lane') || d.getAttribute('data-item-id') || 'older');
     if (load(key, '') === '1') { d.open = true; }
     d.addEventListener('toggle', function () { save(key, d.open ? '1' : '0'); });
   });
@@ -1694,6 +1706,9 @@ render_tail() {  # <state-json>
         var bb = parseInt(b.getAttribute('data-age') || '0', 10);
         if (filters.sort === 'oldest') { return bb - aa; }
         if (filters.sort === 'recent') { return aa - bb; }
+        var ap = parseInt(a.getAttribute('data-priority') || '1', 10);
+        var bp = parseInt(b.getAttribute('data-priority') || '1', 10);
+        if (ap !== bp) { return ap - bp; }
         return bb - aa;
       });
       rows.forEach(function (r) { head.parentNode.insertBefore(r, n); });

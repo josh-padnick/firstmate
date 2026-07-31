@@ -71,7 +71,8 @@ record_busy() {  # <home> <id>
 write_fixture() {  # <home>
   local home=$1
   mkdir -p "$home/projects/wt-ship" "$home/projects/wt-scout" "$home/projects/wt-ask" \
-    "$home/projects/wt-held" "$home/projects/wt-busy" "$home/data/ship-ui" "$home/data/scout-plan"
+    "$home/projects/wt-held" "$home/projects/wt-busy" "$home/projects/wt-parked" \
+    "$home/data/ship-ui" "$home/data/scout-plan"
   printf '<html><head><title>The rendered table demo</title></head><body></body></html>\n' \
     > "$home/data/ship-ui/demo.html"
   printf '<html><head><title>Styling consolidation</title></head><body></body></html>\n' \
@@ -84,6 +85,7 @@ write_fixture() {  # <home>
 - [ ] scout-plan - Demo: styling consolidation architecture (repo: owner/demo) (kind: scout) (since 2026-07-21)
 - [ ] held-pr - Demo: held pull request lane https://github.com/owner/demo/pull/9 (repo: owner/demo) (kind: ship) (since 2026-07-22)
 - [ ] busy-pr - Demo: pull request still being validated https://github.com/owner/demo/pull/12 (repo: owner/demo) (kind: ship) (since 2026-07-24)
+- [ ] parked-pr - Demo: pull request parked at review https://github.com/owner/demo/pull/15 (repo: owner/demo) (kind: ship) (since 2026-07-25)
 
 ## Queued
 - [ ] scout-plan-decision-type-ladder - Which type ladder ships (repo: owner/demo) (kind: captain) (since 2026-07-21) (hold: The ladder can carry four steps or three, and the fourth is unused today. Option A, recommended: three steps, because the fourth is never used. Option B: keep four for headroom.) (hold-kind: captain)
@@ -92,6 +94,9 @@ write_fixture() {  # <home>
 - [ ] ask-only-decision-naming - What the component is called (repo: owner/demo) (kind: captain) (since 2026-07-23) (hold: Table versus DataTable.) (hold-kind: captain)
   Origin: ask-only
   Decision key: naming
+- [ ] held-pr-decision-scope - Confirm the migration scope before merge (repo: owner/demo) (kind: captain) (since 2026-07-22) (hold: Keep the migration within the current package.) (hold-kind: captain)
+  Origin: held-pr
+  Decision key: scope
 
 ## Done
 - [x] landed-one - Demo: first landed change https://github.com/owner/demo/pull/1 (repo: owner/demo) (kind: ship) (merged 2026-07-19)
@@ -141,6 +146,12 @@ EOF
     "pr=https://github.com/owner/demo/pull/12"
   printf 'working: validation running\n' > "$home/state/busy-pr.status"
 
+  fm_write_meta "$home/state/parked-pr.meta" \
+    "window=firstmate:fm-parked-pr" "worktree=$home/projects/wt-parked" \
+    "project=owner/demo" "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "pr=https://github.com/owner/demo/pull/15"
+  printf 'parked: waiting at the review gate\n' > "$home/state/parked-pr.status"
+
   # Blocked with nobody on it: the lane reported a blocker and its worker is
   # gone. This is the case the captain must be able to spot without asking.
   mkdir -p "$home/projects/wt-stalled"
@@ -163,6 +174,7 @@ EOF
   record_idle "$home" ask-only
   record_idle "$home" held-pr
   record_busy "$home" busy-pr
+  record_idle "$home" parked-pr
   record_idle "$home" stalled-lane
 }
 
@@ -294,6 +306,45 @@ $(printf '%s' "$out" | jq -c .merge_queue)"
     .merge_queue[] | select(.number == 9) | .checks.source == "not-fetched"
   ' >/dev/null || fail "check state must admit it was never fetched"
   pass "merge queue marks held work and names what blocks it"
+}
+
+test_merge_queue_uses_authoritative_waits() {
+  local home out state html snap
+  home=$(make_home merge-authority)
+  write_fixture "$home"
+  printf 'paused: durable decision remains open\n' > "$home/state/held-pr.status"
+  printf 'done: validation finished\n' > "$home/state/busy-pr.status"
+  record_idle "$home" held-pr
+  record_idle "$home" busy-pr
+  snap=$(capture "$home")
+  jq '(.tasks[] | select(.id == "parked-pr") | .current_state)
+      = {state:"parked", source:"run-step", detail:"parked at review"}' \
+    "$snap" > "$TMP_ROOT/merge-authority-snapshot.json"
+  out=$(FM_HOME="$home" "$DASH" --snapshot "$TMP_ROOT/merge-authority-snapshot.json" --json)
+
+  printf '%s' "$out" | jq -e '
+    (.merge_queue[] | select(.number == 15)
+     | .turn == "captain" and .action == "decide"
+       and .waiting_for == "your decision at a gate")
+    and
+    (.merge_queue[] | select(.number == 12)
+     | .status == "held" and .turn == "external" and .action == null
+       and .checks.state == "unknown"
+       and any(.blockers[]; .kind == "checks" and (.text | test("not fetched"))))
+    and
+    (.merge_queue[] | select(.number == 9)
+     | .status == "held" and .turn == "captain"
+       and any(.blockers[]; .kind == "decision"
+               and (.text | test("migration scope"))))
+  ' >/dev/null || fail "merge rows must use parked state, check certainty, and durable decisions: \
+$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,status,turn,waiting_for,blockers}]')"
+
+  state=$TMP_ROOT/merge-authority.json
+  printf '%s' "$out" > "$state"
+  html=$("$DASH" --render "$state") || fail "authoritative merge render failed"
+  assert_contains "$html" 'data-item-id="scout-plan"' "expandable row identity must use the stable item id"
+  assert_contains "$html" 'data-priority="0"' "stuck rows must carry their urgency into client-side sorting"
+  pass "merge turns, blockers, sort rank, and expansion identity use authoritative state"
 }
 
 test_activity_feed_is_newest_first() {
@@ -606,6 +657,7 @@ test_inbox_view_ships_beside_the_panels
 test_titles_and_links_are_real
 test_decision_queue_dedupes_against_status
 test_merge_queue_names_its_blockers
+test_merge_queue_uses_authoritative_waits
 test_activity_feed_is_newest_first
 test_completed_retention_is_disclosed
 test_pr_cache_ages_and_is_local_only
