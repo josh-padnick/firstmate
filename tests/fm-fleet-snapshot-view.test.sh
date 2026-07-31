@@ -779,8 +779,43 @@ test_parked_scout_decision_stays_pending() {
   pass "a scout still parked at a decision stays pending (terminal clear does not over-fire)"
 }
 
+test_status_events_are_a_bounded_newest_first_feed() {
+  local home fakebin out
+  home=$(make_home events)
+  write_fixture "$home"
+  fakebin=$(make_fakebin "$home")
+  cat > "$home/state/scout-task.status" <<'EOF'
+working: read the code
+
+needs-decision [key=shape]: choose an API shape
+resolved [key=shape]: captain picked the second option
+done: report ready
+EOF
+  out=$(PATH="$fakebin:$PATH" FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "scout-task") | .paths.status_log.events
+    | (map(.state)) == ["done", "resolved", "needs-decision", "working"]
+      and (.[0].raw == "done: report ready")
+      and (.[2].note == "choose an API shape")
+  ' >/dev/null || fail "status events must be the newest-first parsed feed: \
+$(printf '%s' "$out" | jq -c '.tasks[]|select(.id=="scout-task")|.paths.status_log.events')"
+
+  # Blank lines are not events, and the feed stays bounded.
+  out=$(PATH="$fakebin:$PATH" FM_SNAPSHOT_STATUS_EVENTS=2 FM_HOME="$home" "$SNAPSHOT" --json)
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "scout-task") | .paths.status_log.events
+    | length == 2 and (map(.state)) == ["done", "resolved"]
+  ' >/dev/null || fail "the feed must honour its bound"
+
+  printf '%s' "$out" | jq -e '
+    .tasks[] | select(.id == "cmux-task") | .paths.status_log.events == []
+  ' >/dev/null || fail "a task with no status log must have an empty feed, not a missing one"
+  pass "status events expose a bounded, newest-first, parsed activity feed"
+}
+
 test_empty_fleet_json
 test_fixture_snapshot_json
+test_status_events_are_a_bounded_newest_first_feed
 test_main_inventory_orphan_and_unstructured_disclosure
 test_normalized_roles_and_plural_blocker_readiness
 test_event_hints_follow_reconciled_current_state

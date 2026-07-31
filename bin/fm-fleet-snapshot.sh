@@ -24,7 +24,10 @@
 #     current_state is parsed from bin/fm-crew-state.sh <id> and preserves
 #     state, source, detail, and raw line separately.
 #     paths.status_log.last_event is historical wake-event data only, never
-#     current state.
+#     current state. paths.status_log.events is the bounded newest-first tail of
+#     that same history (FM_SNAPSHOT_STATUS_EVENTS, default 8), parsed with the
+#     shared classifier; it is the per-task activity feed renderers show and
+#     carries the identical never-current-state caveat.
 #     hints.open_decisions is the keyed open-decision set returned by
 #     fm-classify-lib.sh's authoritative status_open_decisions fold and reconciled
 #     against current_state; hints.pending_decision and hints.blocked_event are
@@ -83,6 +86,7 @@ FM_SNAPSHOT_SECONDMATE_MAX_BYTES=${FM_SNAPSHOT_SECONDMATE_MAX_BYTES:-262144}
 FM_SNAPSHOT_SECONDMATE_CHILDREN=${FM_SNAPSHOT_SECONDMATE_CHILDREN:-20}
 FM_SNAPSHOT_SECONDMATE_QUEUED=${FM_SNAPSHOT_SECONDMATE_QUEUED:-20}
 FM_SNAPSHOT_SECONDMATE_DECISIONS=${FM_SNAPSHOT_SECONDMATE_DECISIONS:-20}
+FM_SNAPSHOT_STATUS_EVENTS=${FM_SNAPSHOT_STATUS_EVENTS:-8}
 FM_SNAPSHOT_TERMINAL_LINES=${FM_SNAPSHOT_TERMINAL_LINES:-8}
 FM_SNAPSHOT_TERMINAL_BYTES=${FM_SNAPSHOT_TERMINAL_BYTES:-4096}
 FM_SNAPSHOT_TERMINAL_TIMEOUT=${FM_SNAPSHOT_TERMINAL_TIMEOUT:-2}
@@ -113,6 +117,7 @@ validate_positive_bound FM_SNAPSHOT_SECONDMATE_MAX_BYTES "$FM_SNAPSHOT_SECONDMAT
 validate_positive_bound FM_SNAPSHOT_SECONDMATE_CHILDREN "$FM_SNAPSHOT_SECONDMATE_CHILDREN"
 validate_positive_bound FM_SNAPSHOT_SECONDMATE_QUEUED "$FM_SNAPSHOT_SECONDMATE_QUEUED"
 validate_positive_bound FM_SNAPSHOT_SECONDMATE_DECISIONS "$FM_SNAPSHOT_SECONDMATE_DECISIONS"
+validate_positive_bound FM_SNAPSHOT_STATUS_EVENTS "$FM_SNAPSHOT_STATUS_EVENTS"
 validate_positive_bound FM_SNAPSHOT_TERMINAL_LINES "$FM_SNAPSHOT_TERMINAL_LINES"
 validate_positive_bound FM_SNAPSHOT_TERMINAL_BYTES "$FM_SNAPSHOT_TERMINAL_BYTES"
 validate_positive_bound FM_SNAPSHOT_TERMINAL_TIMEOUT "$FM_SNAPSHOT_TERMINAL_TIMEOUT"
@@ -225,13 +230,37 @@ crew_state_json() {  # <id>
     '{state:$state,source:$source,detail:$detail,raw:$raw}'
 }
 
+# The bounded newest-first tail of the same append-only event history, parsed
+# with the shared classifier so verb and note semantics have one owner. This is
+# the activity feed a renderer shows as "we did this, then that"; it is history,
+# never current state, exactly like last_event.
+status_events_json() {  # <status-log>
+  local log=$1 line verb note
+  if [ ! -f "$log" ]; then
+    printf '[]'
+    return 0
+  fi
+  {
+    while IFS= read -r line || [ -n "$line" ]; do
+      verb=$(status_line_verb "$line")
+      note=$(status_line_note "$line")
+      printf '%s\n%s\n%s\n' "$verb" "$note" "$line"
+    done < <(grep -v '^[[:space:]]*$' "$log" 2>/dev/null | tail -n "$FM_SNAPSHOT_STATUS_EVENTS")
+  } | jq -Rn '
+    [inputs] as $l
+    | [range(0; (($l | length) / 3) | floor)
+       | {state: $l[. * 3], note: $l[. * 3 + 1], raw: $l[. * 3 + 2]}]
+    | reverse'
+}
+
 status_event_json() {  # <status-log>
-  local log=$1 present=0 raw='' verb='' note=''
+  local log=$1 present=0 raw='' verb='' note='' events='[]'
   if [ -f "$log" ]; then
     present=1
     raw=$(last_nonempty_line "$log" || true)
     verb=$(status_line_verb "$raw")
     note=$(status_line_note "$raw")
+    events=$(status_events_json "$log")
   fi
   jq -n \
     --arg path "$log" \
@@ -239,7 +268,9 @@ status_event_json() {  # <status-log>
     --arg verb "$verb" \
     --arg note "$note" \
     --argjson present "$(bool_json "$present")" \
-    '{path:$path,present:$present,kind:"event_history",last_event:{state:$verb,note:$note,raw:$raw}}'
+    --argjson events "$events" \
+    '{path:$path,present:$present,kind:"event_history",
+      last_event:{state:$verb,note:$note,raw:$raw},events:$events}'
 }
 
 first_pr_url_in_file() {  # <file>
