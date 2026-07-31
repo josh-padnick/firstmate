@@ -704,7 +704,7 @@ $snap[0] as $s
 
 # ---- finished work whose deliverable is a document nobody has read yet ------
 | [ $tasks[]
-    | select(.kind != "secondmate")
+    | select(.kind == "scout")
     | select((.hints.open_decisions // []) | length == 0)
     | select(.paths.report.present == true)
     | select(.current_state.state == "done")
@@ -1473,7 +1473,7 @@ def queue_row($names; $fetched):
   . as $it
   | (if (.decisions | length) > 0 then "details" else "div" end) as $tag
   | (if $tag == "details" then "summary" else "div" end) as $inner
-  | "<\($tag) class=\"item\" data-item-id=\"\(.id | e)\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\" data-priority=\"\(if (.stuck // false) then 0 else 1 end)\">"
+  | "<\($tag) class=\"item\" data-item-id=\"\(.id | e)\" data-open-key=\"item.\(.id | e)\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\" data-priority=\"\(if (.stuck // false) then 0 else 1 end)\">"
   + "<\($inner) class=\"\(if $inner == "div" then "line" else "" end)\" tabindex=\"0\">"
   + "<span class=\"chip \(.action | action_class)\">\(.action | action_word)</span>"
   + "<span class=\"title\">\(link(.link // .url; (if .row == "pr" then "#\(.number) " else "" end) + shorten(.title; $names + [.project, .repo]; 92)))</span>"
@@ -1492,7 +1492,7 @@ def queue_row($names; $fetched):
   + "</\($tag)>";
 
 def lane_row($names):
-  "<details class=\"lane\(if .live then "" else " quiet" end)\" data-lane=\"\(.id)\">"
+  "<details class=\"lane\(if .live then "" else " quiet" end)\" data-lane=\"\(.id)\" data-open-key=\"lane.\(.id | e)\">"
   + "<summary tabindex=\"0\"><div class=\"name\">\(shorten(.title; $names + [.project]; 74) | e)</div>"
   + "<div class=\"sub\">"
   # The vocabulary the captain reads is Blocked / Working / Waiting / Complete.
@@ -1589,7 +1589,7 @@ def landed_row($names):
   + (if ($d.completed | length) == 0 then "<div class=\"hint\">Nothing landed yet.</div>"
      else ([ $d.completed[0:6][] | landed_row($names) ] | join(""))
           + (if ($d.completed | length) > 6
-             then "<details class=\"older\"><summary>View \(($d.completed | length) - 6) older</summary>"
+             then "<details class=\"older\" data-open-key=\"older\"><summary>View \(($d.completed | length) - 6) older</summary>"
                   + ([ $d.completed[6:][] | landed_row($names) ] | join(""))
                   + "</details>"
              else "" end) end)
@@ -1663,8 +1663,8 @@ render_tail() {  # <state-json>
   });
 
   // Expanded rows are the captain's own progressive-disclosure choices; keep them.
-  document.querySelectorAll('details[data-lane], details.item, details.older').forEach(function (d) {
-    var key = 'open.' + (d.getAttribute('data-lane') || d.getAttribute('data-item-id') || 'older');
+  document.querySelectorAll('details[data-open-key]').forEach(function (d) {
+    var key = 'open.' + d.getAttribute('data-open-key');
     if (load(key, '') === '1') { d.open = true; }
     d.addEventListener('toggle', function () { save(key, d.open ? '1' : '0'); });
   });

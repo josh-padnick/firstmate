@@ -343,8 +343,54 @@ $(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,status,turn,waiting_for,bl
   printf '%s' "$out" > "$state"
   html=$("$DASH" --render "$state") || fail "authoritative merge render failed"
   assert_contains "$html" 'data-item-id="scout-plan"' "expandable row identity must use the stable item id"
+  assert_contains "$html" 'data-open-key="item.scout-plan"' "queue expansion state must use the item namespace"
+  assert_contains "$html" 'data-open-key="lane.scout-plan"' "lane expansion state must use the lane namespace"
   assert_contains "$html" 'data-priority="0"' "stuck rows must carry their urgency into client-side sorting"
   pass "merge turns, blockers, sort rank, and expansion identity use authoritative state"
+}
+
+test_promoted_scout_report_cannot_mask_pr() {
+  local home out state html snap report url
+  home=$(make_home promoted)
+  write_fixture "$home"
+  report=$home/data/ship-ui/report.md
+  url=https://github.com/owner/demo/pull/21
+  printf '# Original scout report\n' > "$report"
+  snap=$(capture "$home")
+  jq --arg report "$report" --arg url "$url" '
+    (.tasks[] | select(.id == "ship-ui")) |= (
+      .kind = "ship"
+      | .current_state = {state:"done", source:"run-step", detail:"checks green"}
+      | .hints.open_decisions = []
+      | .paths.report = {present:true, path:$report}
+      | .pr = {url:$url}
+    )
+  ' "$snap" > "$TMP_ROOT/promoted-snapshot.json"
+  jq -n --arg fetched "$NOW" --arg url "$url" '{
+    fetched:$fetched,
+    records:[{
+      url:$url, reachable:true, number:21, title:"Promoted scout change",
+      state:"OPEN", draft:false, merged:false,
+      checks:{state:"passing", summary:"1 passed, 0 failed, 1 total"}
+    }]
+  }' > "$home/state/dashboard-prs.json"
+  out=$(FM_HOME="$home" "$DASH" --snapshot "$TMP_ROOT/promoted-snapshot.json" --json)
+
+  printf '%s' "$out" | jq -e '
+    ([.awaiting_captain[] | select(.id == "ship-ui")] | length) == 0
+    and
+    (.merge_queue[] | select(.id == "ship-ui")
+     | .number == 21 and .status == "ready"
+       and .turn == "captain" and .action == "merge")
+  ' >/dev/null || fail "a promoted scout report must not mask its ready pull request: \
+$(printf '%s' "$out" | jq -c '{awaiting:.awaiting_captain,merge:.merge_queue}')"
+
+  state=$TMP_ROOT/promoted-state.json
+  printf '%s' "$out" > "$state"
+  html=$("$DASH" --render "$state") || fail "promoted scout render failed"
+  assert_contains "$html" '#21 ' "the promoted ship must render as its pull request"
+  assert_contains "$html" '>Merge</span>' "the promoted ship must keep its merge action"
+  pass "a promoted scout report cannot mask its ready pull request"
 }
 
 test_activity_feed_is_newest_first() {
@@ -658,6 +704,7 @@ test_titles_and_links_are_real
 test_decision_queue_dedupes_against_status
 test_merge_queue_names_its_blockers
 test_merge_queue_uses_authoritative_waits
+test_promoted_scout_report_cannot_mask_pr
 test_activity_feed_is_newest_first
 test_completed_retention_is_disclosed
 test_pr_cache_ages_and_is_local_only
