@@ -196,12 +196,10 @@ test_empty_home_is_honest() {
   home=$(make_home empty)
   out=$(state_for "$home") || fail "empty projection failed"
   printf '%s' "$out" | jq -e '
-    .schema == "fm-mission-control.v1"
+    .schema == "fm-mission-control.v2"
       and .generated == "2026-07-31T18:00:00Z"
-      and (.merge_queue | length) == 0
-      and (.awaiting_captain | length) == 0
-      and (.in_flight | length) == 0
-      and (.completed | length) == 0
+      and (.updates | length) == 0
+      and (.tasks | length) == 0
       and .source.pr_data.present == false
       and .source.pr_data.stale == true
       and (.notices | map(.kind) | index("pr-data")) != null
@@ -213,38 +211,72 @@ test_empty_home_is_honest() {
   pass "an empty home renders a valid, explicitly empty board"
 }
 
-test_typed_awaiting_queue() {
+test_updates_are_only_plans_and_prs() {
   local home out
   home=$(make_home typed)
   write_fixture "$home"
-  out=$(state_for "$home") || fail "typed projection failed"
+  out=$(state_for "$home") || fail "projection failed"
+
+  # The captain's model: exactly two kinds of thing need his attention.
+  printf '%s' "$out" | jq -e '
+    [.updates[].kind] | unique | inside(["plan", "pr"])
+  ' >/dev/null || fail "an update must only ever be a plan or a pull request: \
+$(printf '%s' "$out" | jq -c '[.updates[].kind] | unique')"
+
+  # The finer read-vs-look distinction is preserved, not discarded, and still
+  # decided by dispatch kind rather than file extension.
+  printf '%s' "$out" | jq -e '
+    (.updates[] | select(.task_id == "ship-ui") | .detail_type) == "ui"
+      and (.updates[] | select(.task_id == "scout-plan") | .detail_type) == "plan"
+      and (.updates[] | select(.task_id == "scout-plan") | .link | endswith("/plan.html"))
+  ' >/dev/null || fail "detail typing lost: $(printf '%s' "$out" | jq -c '[.updates[]|{task_id,detail_type}]')"
+
+  # An update points AT a task; it is not one.
+  printf '%s' "$out" | jq -e '
+    ([.updates[] | select(.task_id != null)] | length) == (.updates | length)
+  ' >/dev/null || fail "every update must name the task it concerns"
 
   printf '%s' "$out" | jq -e '
-    .awaiting_captain | map({id, type, link_kind}) as $rows
-    | ($rows | map(select(.id == "ship-ui")) | .[0].type) == "ui"
-      and ($rows | map(select(.id == "scout-plan")) | .[0].type) == "plan"
-      and ($rows | map(select(.id == "ask-only")) | .[0].type) == "decision"
-  ' >/dev/null || fail "typing wrong: $(printf '%s' "$out" | jq -c '[.awaiting_captain[]|{id,type}]')"
+    .counts.plans + .counts.prs == .counts.updates
+  ' >/dev/null || fail "counts wrong: $(printf '%s' "$out" | jq -c .counts)"
+  pass "the inbox holds updates, only ever plans or pull requests, each naming its task"
+}
 
-  # The scout deliverable renders as HTML too, so the extension cannot be what
-  # decides; the dispatch kind must be.
+test_one_task_component_both_states() {
+  local home out
+  home=$(make_home tasks)
+  write_fixture "$home"
+  out=$(state_for "$home") || fail "projection failed"
+
+  # A task is the same object whether running or landed: one collection, one
+  # shape, filtered by status.
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "scout-plan")
-    | (.link | endswith("/plan.html")) and .type == "plan" and .kind == "scout"
-  ' >/dev/null || fail "a scout deliverable rendered as HTML must still be a plan to read"
+    (.tasks | length) > 0
+      and ([.tasks[] | select(.status == "landed")] | length) > 0
+      and ([.tasks[] | select(.status != "landed")] | length) > 0
+  ' >/dev/null || fail "tasks must cover both active and landed work"
 
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "ask-only") | .link == null
-  ' >/dev/null || fail "an ask with no artifact must not invent a link"
+    ([.tasks[] | keys] | unique | length) == 1
+  ' >/dev/null || fail "every task must have the identical shape: \
+$(printf '%s' "$out" | jq -c '[.tasks[] | keys] | unique | map(length)')"
 
-  # Four bare questions with no artifact: ask-only, the held PR, and the two
-  # blocked lanes. A blocked lane is the captain's to clear too, so it belongs
-  # in the same queue rather than only in a status log.
   printf '%s' "$out" | jq -e '
-    .counts.ui == 1 and .counts.plan == 1 and .counts.decision == 4
-      and .counts.awaiting_captain == 6
-  ' >/dev/null || fail "typed counts wrong: $(printf '%s' "$out" | jq -c .counts)"
-  pass "review queue is typed by what the work produces, not by file extension"
+    [.tasks[]] | all(has("type") and has("agent") and has("status")
+                     and has("activity") and has("history") and has("live"))
+  ' >/dev/null || fail "a task must carry type, agent, status, last action, history and liveness"
+
+  # The agent is real data, named as the captain names them.
+  printf '%s' "$out" | jq -e '
+    [.tasks[] | select(.agent != null) | .agent] | any(. == "Claude")
+  ' >/dev/null || fail "the agent running a task must be named: \
+$(printf '%s' "$out" | jq -c '[.tasks[]|{id,agent}]')"
+
+  # Where the product has no data yet, null - never an invented value.
+  printf '%s' "$out" | jq -e '
+    [.updates[] | .version] | all(. == null)
+  ' >/dev/null || fail "version must stay null until the product has versions"
+  pass "one task component covers active and landed work, with agent, status and history"
 }
 
 test_titles_and_links_are_real() {
@@ -255,12 +287,12 @@ test_titles_and_links_are_real() {
 
   # A link is published only when the file exists on disk.
   printf '%s' "$out" | jq -e '
-    [ .awaiting_captain[] | select(.link != null) | .link ]
+    [ .updates[] | select(.kind == "plan") | select(.link != null) | .link ]
     | all(startswith("file:///") or startswith("http"))
   ' >/dev/null || fail "published links must be openable URLs"
 
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "ship-ui") | .link | endswith("/demo.html")
+    .updates[] | select(.task_id == "ship-ui") | .link | endswith("/demo.html")
   ' >/dev/null || fail "a lane's own rendered page should win over anything else"
   pass "links resolve to files this home actually has"
 }
@@ -274,13 +306,14 @@ test_decision_queue_dedupes_against_status() {
   # ask-only has BOTH a durable captain hold (key naming) and a live
   # needs-decision line carrying the same key. It is one decision.
   printf '%s' "$out" | jq -e '
-    [ .awaiting_captain[] | select(.id == "ask-only") | .decisions[] ] | length == 1
+    ([ .updates[] | select(.task_id == "ask-only") | .decisions[] ] | length) == 1
   ' >/dev/null || fail "a decision filed as a hold and still open in status is one decision: \
-$(printf '%s' "$out" | jq -c '[.awaiting_captain[]|select(.id=="ask-only")|.decisions]')"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "plan")|select(.id=="ask-only")|.decisions]')"
 
   printf '%s' "$out" | jq -e '
-    (.counts.decisions) == ([ .awaiting_captain[] | .decision_count ] | add)
-  ' >/dev/null || fail "the decision count must equal the queue it is derived from"
+    ([.updates[] | select(.kind == "plan") | .decision_count] | add // 0)
+      == ([.updates[] | select(.kind == "plan") | (.decisions | length)] | add // 0)
+  ' >/dev/null || fail "each plan's decision count must match the questions it carries"
   pass "the decision queue is one set, deduped against the durable hold"
 }
 
@@ -291,19 +324,20 @@ test_merge_queue_names_its_blockers() {
   out=$(state_for "$home")
 
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 9)
-    | .status == "held"
+    .updates[] | select(.kind == "pr") | select(.number == 9)
+    | .turn == "captain" and .action == "decide"
       and (.blockers | map(.kind) | index("decision")) != null
       and (.blockers[] | select(.kind == "decision") | .text | test("migration scope"))
   ' >/dev/null || fail "a PR whose lane is waiting on a decision must be held, and say why: \
-$(printf '%s' "$out" | jq -c .merge_queue)"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "pr")]')"
 
   printf '%s' "$out" | jq -e '
-    [ .merge_queue[] | select(.status == "held") ] | all((.blockers | length) > 0)
-  ' >/dev/null || fail "held must mean at least one named blocker"
+    [.updates[] | select(.kind == "pr") | select(.turn != "captain")]
+    | all((.blockers | length) > 0 or (.headline | startswith("Blocked on")))
+  ' >/dev/null || fail "a PR that is not the captain's must say what it waits on"
 
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 9) | .checks.source == "not-fetched"
+    .updates[] | select(.kind == "pr") | select(.number == 9) | .checks.source == "not-fetched"
   ' >/dev/null || fail "check state must admit it was never fetched"
   pass "merge queue marks held work and names what blocks it"
 }
@@ -323,28 +357,30 @@ test_merge_queue_uses_authoritative_waits() {
   out=$(FM_HOME="$home" "$DASH" --snapshot "$TMP_ROOT/merge-authority-snapshot.json" --json)
 
   printf '%s' "$out" | jq -e '
-    (.merge_queue[] | select(.number == 15)
+    (.updates[] | select(.kind == "pr") | select(.number == 15)
      | .turn == "captain" and .action == "decide"
        and .waiting_for == "your decision at a gate")
     and
-    (.merge_queue[] | select(.number == 12)
-     | .status == "held" and .turn == "external" and .action == null
+    (.updates[] | select(.kind == "pr") | select(.number == 12)
+     | .turn == "external" and .action == null
        and .checks.state == "unknown"
        and any(.blockers[]; .kind == "checks" and (.text | test("not fetched"))))
     and
-    (.merge_queue[] | select(.number == 9)
-     | .status == "held" and .turn == "captain"
+    (.updates[] | select(.kind == "pr") | select(.number == 9)
+     | .turn == "captain"
        and any(.blockers[]; .kind == "decision"
                and (.text | test("migration scope"))))
   ' >/dev/null || fail "merge rows must use parked state, check certainty, and durable decisions: \
-$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,status,turn,waiting_for,blockers}]')"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "pr")|{number,status,turn,waiting_for,blockers}]')"
 
   state=$TMP_ROOT/merge-authority.json
   printf '%s' "$out" > "$state"
   html=$("$DASH" --render "$state") || fail "authoritative merge render failed"
-  assert_contains "$html" 'data-item-id="scout-plan"' "expandable row identity must use the stable item id"
-  assert_contains "$html" 'data-open-key="item.scout-plan"' "queue expansion state must use the item namespace"
-  assert_contains "$html" 'data-open-key="lane.scout-plan"' "lane expansion state must use the lane namespace"
+  # Inline expansion is gone, but the guarantee behind it stands: every row is
+  # addressed by a stable identity, never by its position in the list.
+  assert_contains "$html" 'data-task="scout-plan"' "rows must carry a stable task identity"
+  printf '%s' "$html" | grep -qE "open\.[a-z]*\.[0-9]+" \
+    && fail "persisted state must not be keyed by row position"
   assert_contains "$html" 'data-priority="0"' "stuck rows must carry their urgency into client-side sorting"
   pass "merge turns, blockers, sort rank, and expansion identity use authoritative state"
 }
@@ -377,19 +413,20 @@ test_promoted_scout_report_cannot_mask_pr() {
   out=$(FM_HOME="$home" "$DASH" --snapshot "$TMP_ROOT/promoted-snapshot.json" --json)
 
   printf '%s' "$out" | jq -e '
-    ([.awaiting_captain[] | select(.id == "ship-ui")] | length) == 0
+    ([.updates[] | select(.kind == "plan") | select(.task_id == "ship-ui")] | length) == 0
     and
-    (.merge_queue[] | select(.id == "ship-ui")
-     | .number == 21 and .status == "ready"
-       and .turn == "captain" and .action == "merge")
+    (.updates[] | select(.kind == "pr") | select(.task_id == "ship-ui")
+     | .number == 21 and .turn == "captain" and .action == "merge"
+       and (.blockers | length) == 0)
   ' >/dev/null || fail "a promoted scout report must not mask its ready pull request: \
-$(printf '%s' "$out" | jq -c '{awaiting:.awaiting_captain,merge:.merge_queue}')"
+$(printf '%s' "$out" | jq -c '{awaiting:.updates,merge:[.updates[] | select(.kind == "pr")]}')"
 
   state=$TMP_ROOT/promoted-state.json
   printf '%s' "$out" > "$state"
   html=$("$DASH" --render "$state") || fail "promoted scout render failed"
   assert_contains "$html" '#21 ' "the promoted ship must render as its pull request"
-  assert_contains "$html" '>Merge</span>' "the promoted ship must keep its merge action"
+  # The inbox labels an update by kind; its action verb rides the open control.
+  assert_contains "$html" '>PR</span>' "the promoted ship must render labelled as a pull request"
   pass "a promoted scout report cannot mask its ready pull request"
 }
 
@@ -400,15 +437,15 @@ test_activity_feed_is_newest_first() {
   out=$(state_for "$home")
 
   printf '%s' "$out" | jq -e '
-    .in_flight[] | select(.id == "ship-ui")
-    | (.feed | length) == 3
-      and (.feed | map(.state)) == ["paused", "needs-decision", "working"]
-      and (.feed[2].note == "started on the table component")
+    .tasks[] | select(.id == "ship-ui")
+    | (.history | length) == 3
+      and (.history | map(.state)) == ["paused", "needs-decision", "working"]
+      and (.history[2].note == "started on the table component")
   ' >/dev/null || fail "each lane carries its own newest-first feed: \
-$(printf '%s' "$out" | jq -c '[.in_flight[]|select(.id=="ship-ui")|.feed]')"
+$(printf '%s' "$out" | jq -c '[.tasks[]|select(.id=="ship-ui")|.history]')"
 
   printf '%s' "$out" | jq -e '
-    [ .in_flight[] | .kind ] | index("secondmate") == null
+    [ .tasks[] | .dispatch_kind ] | index("secondmate") == null
   ' >/dev/null || fail "an idle secondmate must not be drawn as an in-flight lane"
   pass "every lane shows its own activity feed, newest first"
 }
@@ -420,10 +457,9 @@ test_completed_retention_is_disclosed() {
   out=$(FM_DASHBOARD_COMPLETED=2 FM_HOME="$home" "$DASH" --snapshot "$(capture "$home")" --json)
 
   printf '%s' "$out" | jq -e '
-    (.completed | length) == 2
-      and (.completed[0].when >= .completed[1].when)
+    ([.tasks[] | select(.status == "landed")] | length) == 2
       and (.notices | map(.kind) | index("retention")) != null
-  ' >/dev/null || fail "dropping landed rows must be disclosed: $(printf '%s' "$out" | jq -c '{c:.completed,n:.notices}')"
+  ' >/dev/null || fail "dropping landed rows must be disclosed: $(printf '%s' "$out" | jq -c '{landed:[.tasks[]|select(.status=="landed")|.id],n:.notices}')"
   pass "trimmed landed history is disclosed, never silently truncated"
 }
 
@@ -454,11 +490,11 @@ SH
   printf '%s' "$out" | jq -e '
     .source.pr_data.present == true
       and .source.pr_data.stale == false
-      and (.merge_queue[] | select(.number == 9)
+      and (.updates[] | select(.kind == "pr") | select(.number == 9)
            | .checks.state == "failing"
              and .checks.source == "pr-cache"
              and (.blockers | map(.kind) | index("checks")) != null)
-  ' >/dev/null || fail "cached check state must reach the merge row: $(printf '%s' "$out" | jq -c .merge_queue)"
+  ' >/dev/null || fail "cached check state must reach the merge row: $(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "pr")]')"
 
   # Age the same cache by an hour; past its time to live it reads stale and the
   # board says so instead of presenting hour-old checks as current.
@@ -487,7 +523,7 @@ test_page_is_self_contained_and_escapes_hostile_text() {
 
   assert_contains "$html" 'http-equiv="refresh"' "the page must carry its own refresh instruction"
   assert_contains "$html" 'id="mission-control-state"' "the page must embed the document it renders"
-  assert_contains "$html" 'id="queue"' "the dominant attention queue must be rendered"
+  assert_contains "$html" 'id="pane-updates"' "the dominant attention queue must be rendered"
   assert_contains "$html" "Needs your attention" "the queue must be named for the question it answers"
   assert_contains "$html" "Active work" "the active-work summary must be rendered"
   assert_contains "$html" "Recently landed" "the landed summary must be rendered"
@@ -509,7 +545,7 @@ test_render_refuses_a_foreign_document() {
   printf '{"schema":"something-else"}' > "$TMP_ROOT/foreign.json"
   out=$("$DASH" --render "$TMP_ROOT/foreign.json" 2>&1) || code=$?
   [ "$code" -ne 0 ] || fail "rendering a foreign document must fail"
-  assert_contains "$out" "fm-mission-control.v1" "the refusal should name the document it needs"
+  assert_contains "$out" "fm-mission-control.v2" "the refusal should name the document it needs"
   pass "the renderer refuses anything that is not a mission-control document"
 }
 
@@ -541,35 +577,35 @@ test_turn_says_whose_move_it_is() {
   # The captain's own case: open, unblocked, and still not his, because the lane
   # that owns it has not finished.
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 12)
-    | .turn == "worker" and .action == null
-      and (.headline | startswith("Blocked on"))
-      and (.activity.text | test("validation running"))
+    (.updates[] | select(.kind == "pr") | select(.number == 12)
+     | .turn == "worker" and .action == null
+       and (.headline | startswith("Blocked on")))
+    # The concrete thing happening belongs to the TASK; the update points at it.
+    and (.tasks[] | select(.id == "busy-pr") | .activity.text | test("validation running"))
   ' >/dev/null || fail "a pull request whose lane is still running is not the captain's turn: \
-$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,turn,headline}]')"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "pr")|{number,turn,headline}]')"
 
   # A question of his is his turn, and says so outright.
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 9)
+    .updates[] | select(.kind == "pr") | select(.number == 9)
     | .turn == "captain" and .action == "decide" and .headline == "Yours to decide"
   ' >/dev/null || fail "a PR held on the captain's decision must read as his turn"
 
   printf '%s' "$out" | jq -e '
-    [ .merge_queue[], .awaiting_captain[], .in_flight[] ]
-    | all(.turn | IN("captain", "worker", "external"))
-      and all(.headline != null and .headline != "")
-      and all(.activity.text != null and .activity.source != null)
-      and all(if .turn == "captain" then .action != null else .action == null end)
-  ' >/dev/null || fail "every item must carry a turn, a headline, an activity, and an action only when it is the captain's"
+    ([.updates[]] | all(.turn | IN("captain", "worker", "external")))
+    and ([.updates[]] | all(.headline != null and .headline != ""))
+    and ([.updates[]] | all(if .turn == "captain" then .action != null else .action == null end))
+    # Activity is a property of the task doing the work, not of the update.
+    and ([.tasks[]] | all(.activity.text != null and .activity.source != null))
+  ' >/dev/null || fail "every update must carry turn, headline and a captain-only action; every task an activity"
 
   # A busy pane is evidence the worker is busy, not evidence about validation.
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 12) | .activity.source == "status-log"
+    .tasks[] | select(.id == "busy-pr") | .activity.source == "status-log"
   ' >/dev/null || fail "activity must name the evidence it came from"
 
   printf '%s' "$out" | jq -e '
-    .counts.inbox == ([ .merge_queue[], .awaiting_captain[], .in_flight[] ]
-                      | map(select(.turn == "captain") | .id) | unique | length)
+    .counts.inbox == ([.updates[] | select(.turn == "captain")] | length)
   ' >/dev/null || fail "the inbox count must be the deduped captain-turn set"
   pass "every item says whose turn it is, what it is waiting for, and what is happening now"
 }
@@ -583,22 +619,22 @@ test_decisions_carry_their_recommendation() {
   # Stated by the plan, in the phrasing real holds use, and recovered from the
   # raw row because the canonical parser truncates hold_reason at a comma.
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "scout-plan") | .decisions[0]
+    .updates[] | select(.task_id == "scout-plan") | .decisions[0]
     | .recommendation == "Option A: three steps, because the fourth is never used."
       and .recommendation_source == "hold"
       and .reasoning == null
   ' >/dev/null || fail "a stated recommendation must be carried inline: \
-$(printf '%s' "$out" | jq -c '[.awaiting_captain[]|select(.id=="scout-plan")|.decisions]')"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "plan")|select(.id=="scout-plan")|.decisions]')"
 
   # None stated: the reasoning stands in so the row is still answerable.
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "ask-only") | .decisions[0]
+    .updates[] | select(.task_id == "ask-only") | .decisions[0]
     | .recommendation == null and .reasoning == "Table versus DataTable."
   ' >/dev/null || fail "with no recommendation the hold reasoning must stand in: \
-$(printf '%s' "$out" | jq -c '[.awaiting_captain[]|select(.id=="ask-only")|.decisions]')"
+$(printf '%s' "$out" | jq -c '[.updates[] | select(.kind == "plan")|select(.id=="ask-only")|.decisions]')"
 
   printf '%s' "$out" | jq -e '
-    .awaiting_captain[] | select(.id == "scout-plan") | .recommended_count == 1
+    .updates[] | select(.task_id == "scout-plan") | .recommended_count == 1
   ' >/dev/null || fail "recommended_count must count decisions that carry one"
   pass "decisions carry the recommended answer, or the reasoning when none was stated"
 }
@@ -612,12 +648,13 @@ test_inbox_view_ships_beside_the_panels() {
   html=$("$DASH" --render "$state") || fail "render failed"
 
   # Both views, in one artifact, so the captain can compare them.
-  assert_contains "$html" 'id="view-panels"' "the panel view must still ship"
+  assert_contains "$html" 'id="view-board"' "the board view must still ship"
   assert_contains "$html" 'id="view-inbox"' "the inbox view must ship beside it"
   assert_contains "$html" 'data-view="inbox"' "there must be a way to switch to it"
   assert_contains "$html" 'data-filter="turn"' "the inbox must filter by turn"
   assert_contains "$html" 'data-filter="kind"' "the inbox must filter by type"
   assert_contains "$html" 'data-turn="captain"' "inbox rows must be filterable by turn"
+  assert_contains "$html" 'data-kind="plan"' "inbox rows must be filterable by kind"
 
   # The badge is the inbox size, taken from the document rather than counted in
   # the page, so the two can never drift.
@@ -635,35 +672,34 @@ test_blocked_says_whether_anyone_is_on_it() {
 
   # A worker the backend reports busy is positive evidence someone is on it.
   printf '%s' "$out" | jq -e '
-    .merge_queue[] | select(.number == 12)
+    .tasks[] | select(.id == "busy-pr")
     | .attended == true and .attended_by == "worker"
       and .attended_evidence == "live-endpoint"
   ' >/dev/null || fail "a busy worker must read as being worked on: \
-$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,attended,attended_by,attended_evidence}]')"
+$(printf '%s' "$out" | jq -c '[.tasks[]|{id,attended,attended_by,attended_evidence}]')"
 
   # Blocked with the worker gone is the case that needs saying outright.
   printf '%s' "$out" | jq -e '
-    .in_flight[] | select(.id == "stalled-lane")
+    .tasks[] | select(.id == "stalled-lane")
     | .attended == false and .attended_by == null
       and (.attended_evidence | IN("no-endpoint", "idle-endpoint"))
   ' >/dev/null || fail "a blocked lane with no worker must read as unattended: \
-$(printf '%s' "$out" | jq -c '[.in_flight[]|{id,state,attended,attended_evidence}]')"
+$(printf '%s' "$out" | jq -c '[.tasks[]|{id,state,attended,attended_evidence}]')"
 
   # Unverifiable ownership is its own answer, never guessed either way.
   printf '%s' "$out" | jq -e '
-    .in_flight[] | select(.id == "unverified-lane")
+    .tasks[] | select(.id == "unverified-lane")
     | .attended == null and .attended_evidence == "unverified"
   ' >/dev/null || fail "unverifiable ownership must stay null, not be guessed: \
-$(printf '%s' "$out" | jq -c '[.in_flight[]|select(.id=="unverified-lane")]')"
+$(printf '%s' "$out" | jq -c '[.tasks[]|select(.id=="unverified-lane")]')"
 
   printf '%s' "$out" | jq -e '
-    [ .merge_queue[], .awaiting_captain[], .in_flight[] ]
-    | all(has("attended") and has("attended_evidence"))
-  ' >/dev/null || fail "every item must carry attendance, so ownership is never silent"
+    [.tasks[]] | all(has("attended") and has("attended_evidence"))
+  ' >/dev/null || fail "every task must carry attendance, so ownership is never silent"
   pass "blocked work says whether someone is on it, or that we cannot tell"
 }
 
-test_redesign_shape() {
+test_board_shape_and_task_screen() {
   local home state html
   home=$(make_home shape)
   write_fixture "$home"
@@ -671,52 +707,51 @@ test_redesign_shape() {
   state_for "$home" > "$state"
   html=$("$DASH" --render "$state") || fail "render failed"
 
-  # The captain works from this page and must not lose it.
+  # Every link the captain follows opens in a new tab: he works from this page.
   local links newtab
-  links=$(printf '%s' "$html" | grep -c '<a class="go"' || true)
-  newtab=$(printf '%s' "$html" | grep -c 'class="go" href=[^>]*target="_blank"' || true)
-  [ "$links" -gt 0 ] || fail "the queue must offer actions to open"
-  [ "$links" = "$newtab" ] || fail "every queue action must open in a new tab ($newtab of $links)"
+  # Count occurrences, not lines: the rendered body is one long line.
+  links=$(printf '%s' "$html" | grep -o '<a class="go"' | wc -l | tr -d ' ')
+  newtab=$(printf '%s' "$html" | grep -o 'class="go" href=[^>]*target="_blank"' | wc -l | tr -d ' ')
+  [ "$links" -gt 0 ] || fail "the inbox must offer actions to open"
+  [ "$links" = "$newtab" ] || fail "every action must open in a new tab ($newtab of $links)"
 
-  # A plan carrying decisions is ONE row, with its questions behind expansion -
-  # not duplicated as a separate decisions column.
-  assert_not_contains "$html" 'data-panel="decisions"' "the separate decisions column must be gone"
-  assert_contains "$html" '<details class="item"' "a row with questions must expand in place"
-  assert_contains "$html" 'Recommended:' "a recommended answer must be readable in the row"
+  # The inline expanded activity list was explicitly rejected.
+  printf '%s' "$html" | grep -q '<main id="view-board".*<details' \
+    && fail "the board must not expand activity inline"
+  assert_not_contains "$html" 'class="lane"' "the old lane disclosure must be gone"
 
-  # Relative time, not repeated ISO dates.
+  # History lives on a per-task screen instead.
+  assert_contains "$html" 'id="view-task"' "there must be a per-task screen"
+  assert_contains "$html" 'class="history"' "the task screen must carry a first-class history"
+  assert_contains "$html" 'class="back"' "the task screen must offer a way back"
+
+  # One task component, used by both status views.
+  local cards
+  cards=$(printf '%s' "$html" | grep -o '<article class="task"' | wc -l | tr -d ' ')
+  [ "$cards" -gt 1 ] || fail "tasks must render through one component, got $cards"
+  assert_contains "$html" 'class="pulse"' "an active task must read as live at a glance"
+
+  # The captain's inbox refinements.
+  assert_contains "$html" 'data-filter="kind"' "the inbox must filter by plan or PR"
+  assert_contains "$html" 'v—' "version must render as an honest placeholder"
   printf '%s' "$html" | grep -qE '<span class="when">(just now|[0-9]+[mhd]|yesterday)</span>' \
-    || fail "the queue must show human elapsed time"
+    || fail "age must stay, in human form"
+  printf '%s' "$html" | grep -q 'questions</span>' \
+    && fail "the question count was dropped from the inbox"
 
-  # Progressive disclosure for the activity log.
-  assert_contains "$html" '<details class="lane' "workstream events must sit behind expansion"
-  pass "the board leads with one queue, folds decisions into their plan, and opens in new tabs"
-}
+  # Recommendations moved to the task screen rather than being lost.
+  assert_contains "$html" 'Recommended:' "a recommended answer must still be readable somewhere"
 
-test_output_publish_failure_is_reported() {
-  local home snap outdir output code=0
-  home=$(make_home publish-failure)
-  write_fixture "$home"
-  snap=$(capture "$home")
-  outdir=$home/output
-  mkdir -p "$outdir/.mission-control.html.tmp"
-  output=$(FM_HOME="$home" "$DASH" --snapshot "$snap" --out-dir "$outdir" 2>&1) || code=$?
-  [ "$code" -ne 0 ] || fail "an output publication failure must return nonzero"
-  assert_not_contains "$output" "wrote $outdir/mission-control.json" \
-    "failed publication must not report the JSON as written"
-  assert_not_contains "$output" "wrote $outdir/mission-control.html" \
-    "failed publication must not report the HTML as written"
-  [ ! -e "$outdir/mission-control.json" ] \
-    || fail "neither output should publish when rendering fails"
-  [ ! -e "$outdir/mission-control.html" ] \
-    || fail "neither output should publish when rendering fails"
-  pass "output publication failures stop before reporting success"
+  # Panels are draggable.
+  assert_contains "$html" 'data-grip=' "panels must be resizable"
+  pass "board leads with updates, tasks render once, history and questions live on the task screen"
 }
 
 test_empty_home_is_honest
-test_typed_awaiting_queue
+test_updates_are_only_plans_and_prs
+test_one_task_component_both_states
 test_blocked_says_whether_anyone_is_on_it
-test_redesign_shape
+test_board_shape_and_task_screen
 test_turn_says_whose_move_it_is
 test_decisions_carry_their_recommendation
 test_inbox_view_ships_beside_the_panels

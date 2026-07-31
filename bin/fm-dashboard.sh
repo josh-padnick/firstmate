@@ -179,7 +179,7 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 PR_CACHE="$STATE/dashboard-prs.json"
-SCHEMA="fm-mission-control.v1"
+SCHEMA="fm-mission-control.v2"
 
 PR_TTL=${FM_DASHBOARD_PR_TTL:-900}
 COMPLETED_MAX=${FM_DASHBOARD_COMPLETED:-20}
@@ -568,7 +568,7 @@ def since_of($backlog_date; $id):
          since_epoch: $mtimes[0][$id]}
    else {since: null, since_source: null, since_epoch: null} end)
   | . + {age_seconds: (if .since_epoch == null then null
-                       else ($now_epoch - .since_epoch) end)};
+                       else ([$now_epoch - .since_epoch, 0] | max) end)};
 
 $snap[0] as $s
 | $prs[0] as $prcache
@@ -870,6 +870,8 @@ $snap[0] as $s
         project: (($t.backlog.repo | nn) // ($t.project | nn)),
         kind: (.kind // "ship"),
         mode: (.mode // null),
+        # Which agent is on it - the captain asked for this by name.
+        agent_harness: (.harness // null),
         state: $st,
         state_source: (.current_state.source // "none"),
         detail: (.current_state.detail | nn | clip(200)),
@@ -951,6 +953,90 @@ $snap[0] as $s
      else empty end)
   ]) as $notices
 
+# ---- the two first-class concepts -------------------------------------------
+# A TASK is a unit of work - one object, one shape, whether it is running or
+# landed. "Active work" and "Recently landed" are status filters over this one
+# collection, never two hand-built lists.
+# An UPDATE is something needing the captain's attention. It is NOT a task: it
+# is a plan or a pull request awaiting him, and it points AT a task.
+
+# Task type. Scout work is genuinely an investigation, and a conventional-commit
+# prefix genuinely names its type; anything else is not in the data yet, so it
+# stays null and renders as an honest placeholder rather than a guess.
+| def task_type($kind; $title):
+    (($title // "") | ascii_downcase) as $t
+    | if ($t | test("^feat(\\(|:| )")) then "feature"
+      elif ($t | test("^fix(\\(|:| )")) then "bug fix"
+      elif ($t | test("^docs(\\(|:| )")) then "docs"
+      elif ($t | test("^refactor(\\(|:| )")) then "refactor"
+      elif $kind == "scout" then "investigation"
+      else null end;
+
+# The agent actually running it, named as the captain names them.
+  def agent_name($harness):
+    if $harness == null or $harness == "" then null
+    else ($harness | split("-")[0] | (.[0:1] | ascii_upcase) + .[1:]) end;
+
+  ([ ($in_flight[]
+      | . as $t
+      | {id, title, project,
+         type: task_type(.kind; .title),
+         dispatch_kind: .kind,
+         agent: agent_name(.agent_harness),
+         status: (if .stuck or ((.state // "") | IN("blocked", "failed")) then "blocked"
+                  elif .turn == "captain" then "needs you"
+                  elif (.state // "") == "working" then "running"
+                  elif (.state // "") == "paused" then "waiting"
+                  elif .live then "running"
+                  else "finished" end),
+         live: .live, activity: .activity, age_seconds, since, since_source,
+         turn, headline, attended, attended_by, attended_evidence, stuck,
+         pr: .pr, url: (.pr.url // null),
+         history: .feed}),
+     ($completed[]
+      | {id, title, project,
+         type: task_type("ship"; .title),
+         dispatch_kind: null,
+         # A landed task has no live worker to name, and its history was torn
+         # down with its lane. Null, not invented.
+         agent: null,
+         status: "landed",
+         live: false,
+         activity: {text: ("\(.verb)\(if .when != null then " \(.when)" else "" end)"),
+                    source: "backlog", state: "landed"},
+         age_seconds: (if .when != null
+                       then ([$now_epoch - ($dates[0][.when] // $now_epoch), 0] | max)
+                       else null end),
+         since: .when, since_source: "backlog",
+         turn: "worker", headline: "Landed", attended: false, attended_by: null,
+         attended_evidence: "landed", stuck: false,
+         pr: (if .url != null then {url: .url, number: null} else null end),
+         url: .url,
+         history: []}) ]) as $tasks
+
+| ([ ($merge_queue[]
+      | {id: ("pr:" + (.url // .id)), kind: "pr", task_id: .id,
+         title, url: .url, number, link: null, project: (.repo // .project),
+         # Versions do not exist in the product yet. Forward-wired deliberately
+         # as null so the page can render a placeholder instead of a fiction.
+         version: null,
+         age_seconds, since, since_source, turn, headline, action, waiting_for,
+         stuck: (.stuck // false),
+         checks: .checks, blockers: .blockers}),
+     ($awaiting[]
+      | {id: ("plan:" + .id), kind: "plan", task_id: .id,
+         # The captain's model gives the inbox exactly two kinds, plan and PR.
+         # The finer read-vs-look distinction he valued earlier is preserved
+         # here rather than discarded, without competing as a third kind.
+         detail_type: .type,
+         title, url: null, number: null, link, project,
+         version: null,
+         age_seconds, since, since_source, turn, headline, action, waiting_for,
+         stuck: (.stuck // false),
+         decisions, decision_count, recommended_count}) ]
+   | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
+              (0 - (.age_seconds // 0))])) as $updates
+
 | {
     schema: $schema,
     generated: $generated,
@@ -964,31 +1050,23 @@ $snap[0] as $s
     counts: {
       # The inbox size: everything that is the captain's turn, counted once per
       # item id, because one lane blocked on one question is one thing to do.
-      inbox: ([ ($merge_queue[] | select(.turn == "captain") | .id),
-                ($awaiting[] | select(.turn == "captain") | .id),
-                ($in_flight[] | select(.turn == "captain") | .id) ]
-              | unique | length),
-      mine: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
-             | map(select(.turn == "captain")) | length),
-      worker_turn: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
-                    | map(select(.turn == "worker")) | length),
-      external_turn: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
-                      | map(select(.turn == "external")) | length),
-      merge_queue: ($merge_queue | length),
-      awaiting_captain: ($awaiting | length),
-      ui: ([$awaiting[] | select(.type == "ui")] | length),
-      plan: ([$awaiting[] | select(.type == "plan")] | length),
-      decision: ([$awaiting[] | select(.type == "decision")] | length),
-      decisions: ([$awaiting[] | .decision_count] | add // 0),
-      in_flight: ($in_flight | length),
-      in_flight_live: ([$in_flight[] | select(.live)] | length),
-      completed: ($completed | length),
+      inbox: ([$updates[] | select(.turn == "captain")] | length),
+      updates: ($updates | length),
+      updates_mine: ([$updates[] | select(.turn == "captain")] | length),
+      plans: ([$updates[] | select(.kind == "plan")] | length),
+      prs: ([$updates[] | select(.kind == "pr")] | length),
+      tasks: ($tasks | length),
+      tasks_active: ([$tasks[] | select(.status != "landed")] | length),
+      tasks_running: ([$tasks[] | select(.live)] | length),
+      tasks_blocked: ([$tasks[] | select(.status == "blocked")] | length),
+      tasks_landed: ([$tasks[] | select(.status == "landed")] | length),
       notices: ($notices | length)
     },
-    merge_queue: $merge_queue,
-    awaiting_captain: $awaiting,
-    in_flight: $in_flight,
-    completed: $completed,
+    # The two first-class collections. Everything the page draws comes from
+    # these: the inbox is updates, and Active work / Recently landed are status
+    # filters over tasks rendered by one component.
+    updates: $updates,
+    tasks: $tasks,
     notices: $notices
   }
 JQ
@@ -1021,9 +1099,9 @@ document_title() {  # <path>
 
 enrich_titles() {  # <state-json> - rewrite in place
   local pairs id link title patch=$TMPWORK/titles.json
-  pairs=$(jq -r '.awaiting_captain[]
-    | select(.title == .id and .link != null and (.link | startswith("file://")))
-    | "\(.id)\t\(.link)"' "$1")
+  pairs=$(jq -r '.updates[]
+    | select(.title == .task_id and .link != null and (.link | startswith("file://")))
+    | "\(.task_id)\t\(.link)"' "$1")
   [ -n "$pairs" ] || return 0
   printf '{}' > "$patch"
   while IFS=$'\t' read -r id link; do
@@ -1035,8 +1113,11 @@ enrich_titles() {  # <state-json> - rewrite in place
   done <<EOF
 $pairs
 EOF
+  # An update and the task it points at are the same work, so a title recovered
+  # from the artifact must land on both or the two views would disagree.
   jq --slurpfile patch "$patch" '
-    .awaiting_captain |= map(. + {title: ($patch[0][.id] // .title)})' "$1" > "$1.tmp" \
+    .updates |= map(. + {title: (($patch[0][.task_id // ""] // .title))})
+    | .tasks |= map(. + {title: (($patch[0][.id // ""] // .title))})' "$1" > "$1.tmp" \
     && mv "$1.tmp" "$1"
 }
 
@@ -1213,14 +1294,24 @@ render_css() {
   .banner code[hidden] { display: none; }
 
   main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
-         gap: var(--gap); padding: var(--gap) var(--gap) var(--gap); }
+         gap: 0; padding: var(--gap); }
   main[hidden] { display: none; }
 
-  /* --- STAMP-S: the queue dominates; everything else is a secondary rail --- */
-  .attention { flex: 2.1 1 0; min-height: 0; }
-  .lower { flex: 1 1 0; min-height: 0; display: grid; gap: var(--gap);
-           grid-template-columns: 1.45fr 1fr; }
-  @media (max-width: 900px) { .lower { grid-template-columns: 1fr; } }
+  #pane-updates { flex: 2 1 0; min-height: 6rem; }
+  .lower { flex: 1 1 0; min-height: 6rem; display: flex; gap: 0; }
+  #pane-active { flex: 1.5 1 0; min-width: 12rem; }
+  #pane-landed { flex: 1 1 0; min-width: 10rem; }
+
+  /* --- draggable grips: the captain asked to pull a panel open --- */
+  .grip { flex: 0 0 var(--gap); position: relative; }
+  .grip[data-grip="v"] { cursor: row-resize; }
+  .grip[data-grip="h"] { cursor: col-resize; }
+  .grip::after {
+    content: ""; position: absolute; inset: 45% 25%; border-radius: 2px;
+    background: var(--line); opacity: 0; transition: opacity .12s;
+  }
+  .grip[data-grip="h"]::after { inset: 25% 45%; }
+  .grip:hover::after, .grip.dragging::after { opacity: 1; }
 
   .card { background: var(--surface); border-radius: 10px; min-height: 0;
           display: flex; flex-direction: column; overflow: hidden; }
@@ -1235,108 +1326,108 @@ render_css() {
   .scroll::-webkit-scrollbar { width: 8px; }
   .scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
 
-  /* --- the queue row: aligned columns, one obvious action --- */
+  /* --- update rows: only ever a plan or a PR --- */
+  .items { list-style: none; }
   .item { border-top: 1px solid var(--hair); }
   .item:first-child { border-top: none; }
-  .item > summary, .item > .line {
+  .item[hidden] { display: none; }
+  .item .line {
     display: grid; align-items: baseline; gap: .75rem;
-    grid-template-columns: 5.75rem minmax(0, 1fr) minmax(0, 15rem) 5.5rem 5.25rem;
-    padding: .7rem .35rem .75rem; cursor: pointer; list-style: none;
-    border-radius: 7px;
+    grid-template-columns: 4rem minmax(0, 1fr) 3.5rem 4.5rem 5rem;
+    padding: .7rem .35rem .75rem; border-radius: 7px;
   }
-  .item > summary::-webkit-details-marker { display: none; }
-  .item > summary:hover, .item > .line:hover { background: var(--bg); }
-  .item > summary:focus-visible, .item > .line:focus-visible,
-  .item.here > summary, .item.here > .line {
-    background: var(--bg); outline: 2px solid var(--info); outline-offset: -2px;
-  }
+  .item .line:hover { background: var(--bg); }
+  .item.here .line { background: var(--bg); outline: 2px solid var(--info); outline-offset: -2px; }
   .item .title { font-size: .9375rem; font-weight: 600; line-height: 1.35; }
   .item .title a { text-decoration: none; }
   .item .title a:hover { text-decoration: underline; text-underline-offset: 2px; }
-  .item .why, .item .when { font-size: .8125rem; color: var(--muted); line-height: 1.45; }
-  .item .when { text-align: right; font-variant-numeric: tabular-nums; }
+  .item .when { font-size: .8125rem; color: var(--muted); text-align: right;
+                font-variant-numeric: tabular-nums; }
+  .item .ver { font-size: .8125rem; }
+  .item .why { font-size: .8125rem; color: var(--muted); padding: 0 .35rem .6rem 4.75rem; }
   .item .go {
     justify-self: end; font-size: .8125rem; font-weight: 600; color: var(--go);
     border: 1px solid var(--go); border-radius: 6px; padding: .12rem .5rem;
     text-decoration: none; white-space: nowrap;
   }
   .item .go:hover { background: var(--go-soft); }
-  .item[open] > summary { background: var(--bg); }
-  .detail { padding: .1rem .35rem .8rem 6.5rem; }
-  @media (max-width: 1100px) {
-    .item > summary, .item > .line { grid-template-columns: 5.75rem minmax(0,1fr) 4.5rem 5.25rem; }
-    .item .why { grid-column: 2 / -1; grid-row: 2; }
-    .detail { padding-left: .35rem; }
+
+  /* --- THE TASK COMPONENT: identical whether running or landed --- */
+  .task {
+    border-top: 1px solid var(--hair); padding: .6rem .4rem .65rem;
+    cursor: pointer; border-radius: 7px;
+  }
+  .task:first-child { border-top: none; }
+  .task:hover { background: var(--bg); }
+  .task:focus-visible, .task.here { background: var(--bg);
+    outline: 2px solid var(--info); outline-offset: -2px; }
+  .task .row1 { display: flex; align-items: baseline; gap: .5rem; }
+  .task h3 { font-size: .9375rem; font-weight: 600; line-height: 1.35; flex: 1 1 auto; }
+  .task .when { font-size: .8125rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .task .row2 { display: flex; align-items: center; gap: .35rem; margin-top: .28rem; flex-wrap: wrap; }
+  .task .did { font-size: .8125rem; color: var(--muted); line-height: 1.45; margin-top: .25rem; }
+  .task .agent {
+    font-size: .78125rem; font-weight: 600; color: var(--info);
+    background: var(--info-soft); border-radius: 5px; padding: .1rem .4rem;
   }
 
-  /* --- STAMP-P: a word first, a tone second --- */
-  .chip {
-    justify-self: start; font-size: .75rem; font-weight: 650; letter-spacing: .01em;
-    padding: .12rem .45rem .16rem; border-radius: 5px; white-space: nowrap;
-    background: var(--info-soft); color: var(--info);
+  /* live indicator: an active task reads as active without reading words */
+  .pulse { flex: 0 0 auto; width: .5rem; height: .5rem; border-radius: 50%;
+           background: var(--go); box-shadow: 0 0 0 0 var(--go);
+           animation: pulse 2s ease-out infinite; }
+  .pulse.off { background: var(--line); animation: none; box-shadow: none; }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 55%, transparent); }
+    70%  { box-shadow: 0 0 0 .38rem color-mix(in srgb, var(--go) 0%, transparent); }
+    100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--go) 0%, transparent); }
   }
-  .chip.merge { background: var(--go-soft); color: var(--go); }
-  .chip.decide { background: var(--warn-soft); color: var(--warn); }
-  .chip.blocked { background: var(--stop-soft); color: var(--stop); }
-  .chip.working { background: var(--bg); color: var(--muted); box-shadow: inset 0 0 0 1px var(--line); }
-  .chip.done { background: transparent; color: var(--faint); box-shadow: inset 0 0 0 1px var(--line); }
+  @media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
 
-  /* --- blocked is three states, never one amber chip --- */
-  .att { font-size: .8125rem; line-height: 1.45; }
-  .item .att { grid-column: 2 / -1; margin-top: .18rem; }
+  /* honest placeholder for data the product does not carry yet */
+  .ph { font-size: .78125rem; color: var(--faint); border: 1px dashed var(--line);
+        border-radius: 5px; padding: .04rem .35rem; }
+  .phq { font-size: .78125rem; color: var(--faint); }
+  .att { font-size: .8125rem; line-height: 1.45; margin-top: .2rem; }
   .att .dot { display: inline-block; width: .45rem; height: .45rem; border-radius: 50%;
               margin-right: .35rem; vertical-align: .04em; background: currentColor; }
   .att.fixing { color: var(--muted); }
   .att.stalled { color: var(--stop); font-weight: 600; }
   .att.unverified { color: var(--warn); }
 
-  /* --- decisions live inside their plan's row --- */
-  .qs { list-style: none; }
-  .qs li { padding: .3rem 0 .35rem; border-top: 1px solid var(--hair); }
+  /* --- the per-task screen: history lives here, not in a panel disclosure --- */
+  #view-task { padding: var(--gap); overflow-y: auto; }
+  .screen[hidden] { display: none; }
+  .screen { background: var(--surface); border-radius: 10px; padding: var(--pad);
+            max-width: 62rem; margin: 0 auto; }
+  .screen-head { display: flex; align-items: center; gap: .8rem; margin-bottom: .5rem; }
+  .screen-head h2 { font-size: 1.0625rem; font-weight: 650; line-height: 1.3; }
+  .back { font: inherit; font-size: .8125rem; font-weight: 600; cursor: pointer;
+          background: var(--bg); border: 1px solid var(--line); border-radius: 6px;
+          padding: .18rem .55rem; color: var(--ink); }
+  .screen-meta { display: flex; align-items: center; gap: .4rem; flex-wrap: wrap;
+                 margin-bottom: .6rem; }
+  .screen-meta .muted, .muted { font-size: .8125rem; color: var(--muted); }
+  .screen-now { font-size: .875rem; line-height: 1.5; padding: .5rem .7rem;
+                background: var(--bg); border-radius: 7px; margin-bottom: 1rem; }
+  .screen h4 { font-size: .8125rem; font-weight: 650; color: var(--muted); margin-bottom: .3rem; }
+  .qs { list-style: none; margin-bottom: 1rem; }
+  .qs li { padding: .35rem 0; border-top: 1px solid var(--hair); }
   .qs li:first-child { border-top: none; }
-  .qs .q { font-size: .875rem; color: var(--ink); line-height: 1.4; }
-  .qs .rec, .qs .because {
-    display: block; font-size: .8125rem; line-height: 1.45; margin-top: .15rem;
-    padding-left: .6rem; border-left: 2px solid var(--go-soft); color: var(--muted);
-  }
-  .qs .rec { border-left-color: var(--go); color: var(--ink); }
-  .next { font-size: .8125rem; color: var(--muted); line-height: 1.45; }
-
-  /* --- active work: one row per workstream, timeline behind expansion --- */
-  .lane { border-top: 1px solid var(--hair); }
-  .lane:first-child { border-top: none; }
-  .lane > summary {
-    padding: .6rem .35rem .65rem; cursor: pointer; list-style: none; border-radius: 7px;
-  }
-  .lane > summary::-webkit-details-marker { display: none; }
-  .lane > summary:hover { background: var(--bg); }
-  .lane .name { font-size: .9375rem; font-weight: 600; line-height: 1.35; }
-  .lane .sub { font-size: .8125rem; color: var(--muted); line-height: 1.45; margin-top: .12rem;
-               display: flex; flex-wrap: wrap; gap: .4rem; align-items: baseline; }
-  .lane.quiet .name { color: var(--muted); font-weight: 500; }
-  .feed { list-style: none; padding: 0 .35rem .7rem 1rem; }
-  .feed li { display: flex; gap: .6rem; align-items: baseline; padding: .18rem 0;
-             font-size: .8125rem; color: var(--muted); line-height: 1.45; }
-  .feed .v { flex: 0 0 5rem; color: var(--faint); font-weight: 600; text-align: right; }
-  .feed .v.done { color: var(--go); }
-  .feed .v.decision, .feed .v.paused { color: var(--warn); }
-  .feed .v.blocked, .feed .v.failed { color: var(--stop); }
-
-  /* --- landed --- */
-  .landed { border-top: 1px solid var(--hair); padding: .5rem .35rem .55rem; }
-  .landed:first-child { border-top: none; }
-  .landed .t { font-size: .875rem; line-height: 1.4; }
-  .landed .t a { text-decoration: none; }
-  .landed .m { font-size: .8125rem; color: var(--muted); margin-top: .1rem; }
-  .older > summary { cursor: pointer; list-style: none; font-size: .8125rem;
-                     font-weight: 600; color: var(--info); padding: .5rem .35rem; }
-  .older > summary::-webkit-details-marker { display: none; }
-
-  .sep { color: var(--faint); }
-  .empty { padding: 1.6rem .35rem; text-align: center; }
-  .empty .big { font-size: 1.0625rem; font-weight: 650; color: var(--go); }
-  .empty .small { font-size: .875rem; color: var(--muted); margin-top: .25rem; }
-  .hint { font-size: .78125rem; color: var(--faint); padding: .45rem .35rem 0; }
+  .qs .q { font-size: .875rem; color: var(--ink); line-height: 1.45; }
+  .qs .rec, .qs .because { display: block; font-size: .8125rem; line-height: 1.45;
+    margin-top: .15rem; padding-left: .6rem; border-left: 2px solid var(--go); color: var(--ink); }
+  .qs .because { border-left-color: var(--line); color: var(--muted); }
+  .history { list-style: none; }
+  .history li { display: flex; gap: .7rem; align-items: baseline;
+                padding: .35rem 0; border-top: 1px solid var(--hair);
+                font-size: .875rem; line-height: 1.5; }
+  .history li:first-child { border-top: none; }
+  .history .v { flex: 0 0 5.5rem; font-size: .78125rem; font-weight: 650;
+                color: var(--faint); text-align: right; }
+  .history .v.done { color: var(--go); }
+  .history .v.decision, .history .v.paused { color: var(--warn); }
+  .history .v.blocked, .history .v.failed { color: var(--stop); }
+  .history .n { flex: 1 1 auto; min-width: 0; color: var(--muted); }
 
   /* --- inbox --- */
   .filters { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center;
@@ -1377,7 +1468,6 @@ def clip($n):
   elif (. | length) <= $n then .
   else (.[0:$n] | sub("[[:space:]][^[:space:]]*$"; "")) + "…" end;
 
-# Null-tolerant on purpose: one odd record must never blank the whole page.
 def shorten($t; $projects; $n):
   (($t // "") | tostring) as $t
   | ([ $projects[]? | select(. != null) | split("/") | last | norm ]) as $ps
@@ -1395,7 +1485,6 @@ def readable:
         "\(.file)")
   | sub("^[[:space:]]+"; "");
 
-# Human elapsed time. The captain reads "2d", not an ISO date.
 def ago($s):
   if $s == null then "-"
   elif $s < 90 then "just now"
@@ -1404,147 +1493,136 @@ def ago($s):
   elif $s < 172800 then "yesterday"
   else "\(($s / 86400) | floor)d" end;
 
-# Every link the captain follows from the queue opens in a new tab: he works
-# from this page and must not lose it.
+# Everything the captain follows opens in a new tab: he works from this page.
 def link($href; $text):
   if $href == null then ($text | e)
   else "<a href=\"\($href | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\" target=\"_blank\" rel=\"noopener\">\($text | e)</a>"
   end;
 
-def action_word:
-  if . == "merge" then "Merge" elif . == "look" then "Review"
-  elif . == "read" then "Review" elif . == "decide" then "Decide"
-  else "Waiting" end;
-def action_class:
-  if . == "merge" then "merge" elif . == "decide" then "decide"
-  elif . == null then "working" else "" end;
+# A field the product does not have yet renders as a visible placeholder, never
+# as an omission and never as an invented value.
+def placeholder($text): "<span class=\"ph\" title=\"not tracked yet\">\($text)</span>";
+# The same honesty, quieter: used where the field repeats on every row, so a
+# missing value stays visible without 25 dashed boxes shouting it.
+def placeholder_quiet($text): "<span class=\"phq\" title=\"not tracked yet\">\($text)</span>";
 
-# Blocked is three states, and the unattended one must be said outright.
+def type_chip:
+  if . == null then placeholder_quiet("type —")
+  else "<span class=\"chip type\">\(. | e)</span>" end;
+
+def status_chip:
+  . as $s
+  | (if $s == "blocked" then "blocked"
+     elif $s == "needs you" then "decide"
+     elif $s == "running" then "run"
+     elif $s == "waiting" then "wait"
+     elif $s == "landed" then "done"
+     else "done" end) as $cls
+  | "<span class=\"chip \($cls)\">\($s | e)</span>";
+
+# Blocked is three states, never one chip: being worked, nobody on it, or
+# ownership we could not verify - which is said outright rather than guessed.
 def attention_line:
   if .attended == true
-  then "<div class=\"att fixing\"><span class=\"dot\"></span>Being worked on now"
-       + "<span class=\"sep\"> · </span>\(.activity.text | readable | clip(90) | e)</div>"
+  then "<div class=\"att fixing\"><span class=\"dot\"></span>Being worked on now</div>"
   elif .attended == false
   then "<div class=\"att stalled\"><span class=\"dot\"></span>Nobody is working on this"
        + (if .age_seconds != null then " · unattended \(ago(.age_seconds))" else "" end)
        + "</div>"
-  else "<div class=\"att unverified\"><span class=\"dot\"></span>Ownership unverified"
-       + "<span class=\"sep\"> · </span>could not confirm whether anyone is on it</div>"
+  else "<div class=\"att unverified\"><span class=\"dot\"></span>Ownership unverified</div>"
   end;
 
-def why_now($fetched):
-  if .row == "pr"
-  then (if .turn == "captain" and .action != "merge"
-        then (.waiting_for | e)
-        elif .turn == "captain"
-        then (if ($fetched | not) then "checks not fetched"
-              elif .checks.state == "passing" then "checks passing"
-              elif .checks.state == "none" then "no checks"
-              else "checks \(.checks.state)" end)
-        else (.waiting_for | e) end)
-  elif (.decision_count // 0) > 0
-  then "\(.decision_count) question\(if .decision_count == 1 then "" else "s" end)"
-       + (if (.recommended_count // 0) > 0 then " · \(.recommended_count) recommended" else "" end)
-  else (.waiting_for | e) end;
-
-def type_label:
-  if .row == "pr" then "PR" elif .row == "ui" then "UI"
-  elif .row == "plan" then "Plan" elif .row == "decision" then "Decision"
-  else "Lane" end;
-
-# The questions inside a plan, shown only when the row is opened: the dashboard
-# summarises state, it does not reproduce everything at rest.
-def questions_block:
-  "<div class=\"detail\"><ul class=\"qs\">"
-  + ([ .decisions[]
-       | "<li><span class=\"q\">\(.question | readable | clip(180) | e)</span>"
-         + (if .recommendation != null
-            then "<span class=\"rec\">Recommended: \(.recommendation | readable | clip(220) | e)</span>"
-            elif .reasoning != null
-            then "<span class=\"because\">\(.reasoning | readable | clip(220) | e)</span>"
-            else "" end)
-         + "</li>" ] | join(""))
-  + "</ul></div>";
-
-# One row per item. A plan carrying decisions is ONE row - the plan - with its
-# questions folded in behind expansion, never duplicated as separate decision
-# rows.
-def queue_row($names; $fetched):
-  . as $it
-  | (if (.decisions | length) > 0 then "details" else "div" end) as $tag
-  | (if $tag == "details" then "summary" else "div" end) as $inner
-  | "<\($tag) class=\"item\" data-item-id=\"\(.id | e)\" data-open-key=\"item.\(.id | e)\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\" data-priority=\"\(if (.stuck // false) then 0 else 1 end)\">"
-  + "<\($inner) class=\"\(if $inner == "div" then "line" else "" end)\" tabindex=\"0\">"
-  + "<span class=\"chip \(.action | action_class)\">\(.action | action_word)</span>"
-  + "<span class=\"title\">\(link(.link // .url; (if .row == "pr" then "#\(.number) " else "" end) + shorten(.title; $names + [.project, .repo]; 92)))</span>"
-  + "<span class=\"why\">\(why_now($fetched))</span>"
+# ---------------------------------------------------------------------------
+# THE TASK COMPONENT. One shape, whether the task is running or landed - the
+# view chooses which tasks to show, never how a task looks.
+# ---------------------------------------------------------------------------
+def task_card($names):
+  "<article class=\"task\" data-task=\"\(.id | e)\" data-status=\"\(.status | e)\""
+  + " data-live=\"\(if .live then "1" else "0" end)\" tabindex=\"0\">"
+  + "<div class=\"row1\">"
+  + (if .live then "<span class=\"pulse\" aria-label=\"live\"></span>" else "<span class=\"pulse off\"></span>" end)
+  + "<h3>\(shorten(.title; $names + [.project]; 78) | e)</h3>"
   + "<span class=\"when\">\(ago(.age_seconds))</span>"
-  + (if .link != null or .url != null
-     then "<a class=\"go\" href=\"\((.link // .url) | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\" target=\"_blank\" rel=\"noopener\">\(.action | action_word) →</a>"
-     else "<span></span>" end)
-  # Blocked work is where "is anyone on it?" decides whether the captain steps
-  # in, so it is answered on the row itself rather than behind expansion. A PR
-  # that is simply his to merge needs no such line.
-  + (if (.stuck // false) or ((.state // "") | IN("blocked", "failed")) or .turn != "captain"
-     then attention_line else "" end)
-  + "</\($inner)>"
-  + (if $tag == "details" then questions_block else "" end)
-  + "</\($tag)>";
-
-def lane_row($names):
-  "<details class=\"lane\(if .live then "" else " quiet" end)\" data-lane=\"\(.id)\" data-open-key=\"lane.\(.id | e)\">"
-  + "<summary tabindex=\"0\"><div class=\"name\">\(shorten(.title; $names + [.project]; 74) | e)</div>"
-  + "<div class=\"sub\">"
-  # The vocabulary the captain reads is Blocked / Working / Waiting / Complete.
-  # Raw lane states like `unknown` are internal and never surface here.
-  + (if .state == "blocked" or .state == "failed" then "<span class=\"chip blocked\">Blocked</span>"
-     elif .turn == "captain" then "<span class=\"chip decide\">Needs you</span>"
-     elif .state == "working" then "<span class=\"chip working\">Working</span>"
-     elif .state == "paused" then "<span class=\"chip working\">Waiting</span>"
-     elif .live then "<span class=\"chip working\">Working</span>"
-     else "<span class=\"chip done\">Complete</span>" end)
-  + "<span>\(.activity.text | readable | clip(80) | e)</span>"
-  + "<span class=\"sep\">·</span><span>\(ago(.age_seconds))</span>"
   + "</div>"
-  + (if .state == "blocked" or .turn == "captain" then attention_line else "" end)
-  + "</summary>"
-  + (if (.feed | length) == 0 then "<div class=\"hint\">No activity recorded yet.</div>"
-     else "<ul class=\"feed\">"
-          + ([ .feed[] | "<li><span class=\"v \(.state | e)\">\(if .state == "needs-decision" then "decision" else .state end | e)</span>"
-               + "<span>\(.note | readable | clip(150) | e)</span></li>" ] | join(""))
-          + "</ul>" end)
-  + "</details>";
+  + "<div class=\"row2\">"
+  + (.type | type_chip)
+  + (.status | status_chip)
+  + (if .agent != null then "<span class=\"agent\">\(.agent | e)</span>"
+     else placeholder_quiet("agent —") end)
+  + "</div>"
+  + "<div class=\"did\">\(.activity.text | readable | clip(96) | e)</div>"
+  + (if .status == "blocked" then attention_line else "" end)
+  + "</article>";
 
-def landed_row($names):
-  "<div class=\"landed\"><div class=\"t\">\(link(.url; shorten(.title; $names + [.project]; 84)))</div>"
-  + "<div class=\"m\">\(.verb | e)\(if .when != null then " \(.when | e)" else "" end)"
-  + (if .source != "main" then "<span class=\"sep\"> · </span>\(.source | e)" else "" end)
-  + "</div></div>";
+# ---------------------------------------------------------------------------
+# THE UPDATE ROW. Only ever a plan or a pull request.
+# ---------------------------------------------------------------------------
+def update_row($names):
+  "<li class=\"item\" data-kind=\"\(.kind)\" data-turn=\"\(.turn)\" data-age=\"\(.age_seconds // 0)\""
+  + " data-priority=\"\(if .stuck then 0 elif .turn == "captain" then 1 else 2 end)\""
+  + " data-task=\"\(.task_id | e)\">"
+  + "<div class=\"line\">"
+  + "<span class=\"chip \(if .kind == "pr" then "merge" else "plan" end)\">\(if .kind == "pr" then "PR" else "Plan" end)</span>"
+  + "<span class=\"title\">\(link(.link // .url; (if .kind == "pr" and .number != null then "#\(.number) " else "" end) + shorten(.title; $names + [.project]; 88)))</span>"
+  + "<span class=\"ver\">\(placeholder("v—"))</span>"
+  + "<span class=\"when\">\(ago(.age_seconds))</span>"
+  + (if (.link // .url) != null
+     then "<a class=\"go\" href=\"\((.link // .url) | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\" target=\"_blank\" rel=\"noopener\">Open →</a>"
+     else "<span></span>" end)
+  + "</div>"
+  + (if .turn != "captain"
+     then "<div class=\"why\">\(.headline | e)</div>" else "" end)
+  + "</li>";
+
+# The per-task screen: the task, its live state, and a first-class history.
+def task_screen($names; $updates):
+  "<section class=\"screen\" data-screen=\"\(.id | e)\" hidden>"
+  + "<div class=\"screen-head\">"
+  + "<button type=\"button\" class=\"back\">← Back</button>"
+  + "<h2>\(shorten(.title; $names + [.project]; 90) | e)</h2>"
+  + "</div>"
+  + "<div class=\"screen-meta\">"
+  + (.type | type_chip) + (.status | status_chip)
+  + (if .agent != null then "<span class=\"agent\">\(.agent | e)</span>" else placeholder("agent —") end)
+  # A worktree path is a location, not a project name the captain reads.
+  + (if .project != null
+     then "<span class=\"muted\">\(.project | split("/") | last | e)</span>" else "" end)
+  + "<span class=\"muted\">\(ago(.age_seconds)) old</span>"
+  + (if .url != null then " " + link(.url; "open pull request") else "" end)
+  + "</div>"
+  + "<div class=\"screen-now\"><b>Now:</b> \(.activity.text | readable | e)</div>"
+  # Open questions and the answers already recommended live here, where there is
+  # room for them - not crammed into a board row the captain only wanted to scan.
+  + (($updates | map(.decisions // []) | flatten) as $ds
+     | if ($ds | length) == 0 then ""
+       else "<h4>Open questions</h4><ul class=\"qs\">"
+            + ([ $ds[]
+                 | "<li><span class=\"q\">\(.question | readable | e)</span>"
+                   + (if .recommendation != null
+                      then "<span class=\"rec\">Recommended: \(.recommendation | readable | e)</span>"
+                      elif .reasoning != null
+                      then "<span class=\"because\">\(.reasoning | readable | e)</span>"
+                      else "" end)
+                   + "</li>" ] | join(""))
+            + "</ul>" end)
+  + "<h4>History</h4>"
+  + (if (.history | length) == 0
+     then "<p class=\"hint\">No recorded history for this task.</p>"
+     else "<ol class=\"history\">"
+          + ([ .history[]
+               | "<li><span class=\"v \(.state | e)\">\(if .state == "needs-decision" then "decision" else .state end | e)</span>"
+                 + "<span class=\"n\">\(.note | readable | e)</span></li>" ] | join(""))
+          + "</ol>" end)
+  + "</section>";
 
 . as $d
-| ([ $d.awaiting_captain[].project, $d.merge_queue[].repo,
-     $d.in_flight[].project, $d.completed[].project ]
-   | map(select(. != null)) | unique) as $names
-| ($d.source.pr_data.present) as $fetched
-| ([ (.merge_queue[] | . + {row: "pr"}),
-     (.awaiting_captain[] | . + {row: .type}),
-     (.in_flight[] | . + {row: "lane", decisions: [], decision_count: 0}) ]
-   # One lane blocked on one question is one thing to do: the specific ask wins
-   # over the pull request or lane waiting on it.
-   | group_by(.id)
-   | map(sort_by(if .row == "pr" then 1 elif .row == "lane" then 2 else 0 end) | .[0])
-   # Whose turn first, then work that is actually stuck, then age. Blocked work
-   # outranks merely old work, which is what "sort by blocked, then age" means.
-   | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
-              (if (.stuck // false) then 0 else 1 end),
-              (0 - (.age_seconds // 0))])) as $all
-| ([ $all[] | select(.turn == "captain") ]) as $mine
-| ([ $d.in_flight[] | select(.turn != "captain") ]) as $lanes
+| ([ $d.tasks[].project, $d.updates[].project ] | map(select(. != null)) | unique) as $names
+| ([ $d.updates[] | select(.turn == "captain") ]) as $mine
 
 | "<header class=\"bar\"><h1>Mission control</h1>"
   + "<nav class=\"views\">"
-  + "<button type=\"button\" data-view=\"panels\" class=\"on\">Board</button>"
-  + "<button type=\"button\" data-view=\"inbox\">Inbox<span class=\"badge\" id=\"inbox-count\">\($mine | length)</span></button>"
+  + "<button type=\"button\" data-view=\"board\" class=\"on\">Board</button>"
+  + "<button type=\"button\" data-view=\"inbox\">Inbox<span class=\"badge\">\($mine | length)</span></button>"
   + "</nav>"
   + "<p class=\"stamp\" title=\"Regenerated by fm-dashboard.sh; the page reloads itself every \($d.refresh_seconds)s\">"
   + "updated \($d.generated_display | e)<span class=\"sep\"> · </span><span id=\"next\"></span></p></header>"
@@ -1560,78 +1638,79 @@ def landed_row($names):
         + "</div>"
    else "" end)
 
-+ "<main id=\"view-panels\">"
-+ "<section class=\"card attention\"><h2>Needs your attention"
-  + "<span class=\"count\"><b>\($mine | length)</b> item\(if ($mine | length) == 1 then "" else "s" end)</span></h2>"
-  + "<div class=\"scroll\" data-scroll=\"attention\" id=\"queue\">"
++ "<main id=\"view-board\">"
++ "<section class=\"card\" id=\"pane-updates\"><h2>Needs your attention"
+  + "<span class=\"count\"><b>\($mine | length)</b> update\(if ($mine | length) == 1 then "" else "s" end)"
+  + "<span class=\"sep\"> · </span>\([$mine[] | select(.kind == "plan")] | length) plans"
+  + "<span class=\"sep\"> · </span>\([$mine[] | select(.kind == "pr")] | length) PRs</span></h2>"
+  + "<div class=\"scroll\" data-scroll=\"updates\">"
   + (if ($mine | length) == 0
      then "<div class=\"empty\"><div class=\"big\">All caught up</div>"
-          + "<div class=\"small\">Nothing is waiting on you. \($lanes | length) workstream\(if ($lanes | length) == 1 then " is" else "s are" end) still running.</div></div>"
-     else ([ $mine[] | queue_row($names; $fetched) ] | join("")) end)
+          + "<div class=\"small\">Nothing is waiting on you.</div></div>"
+     else "<ul class=\"items\">" + ([ $mine[] | update_row($names) ] | join("")) + "</ul>" end)
   + "</div></section>"
 
++ "<div class=\"grip\" data-grip=\"v\" title=\"Drag to resize\"></div>"
+
+# Active work and Recently landed are STATUS FILTERS over one task collection,
+# drawn by one component.
 + "<div class=\"lower\">"
-+ "<section class=\"card\"><h2>Active work"
-  # Only work that is actually stuck earns an alarm count. Calling every quiet
-  # finished lane "unattended" would cry wolf, which is the same failure as
-  # staying silent about the one that really is stalled.
-  + "<span class=\"count\">"
-  + (([ $lanes[] | select(.attended == false and (.state | IN("blocked", "failed"))) ] | length) as $stuck
-     | if $stuck > 0 then "<b>\($stuck)</b> stuck<span class=\"sep\"> · </span>" else "" end)
-  + "\([ $lanes[] | select(.live) ] | length) running</span></h2>"
-  + "<div class=\"scroll\" data-scroll=\"lanes\">"
-  + (if ($lanes | length) == 0 then "<div class=\"hint\">No workstreams running.</div>"
-     else ([ $lanes[] | lane_row($names) ] | join("")) end)
++ "<section class=\"card\" id=\"pane-active\"><h2>Active work"
+  + "<span class=\"count\">\($d.counts.tasks_running) running"
+  + (if $d.counts.tasks_blocked > 0 then "<span class=\"sep\"> · </span><b>\($d.counts.tasks_blocked)</b> blocked" else "" end)
+  + "</span></h2>"
+  + "<div class=\"scroll\" data-scroll=\"active\">"
+  + (([ $d.tasks[] | select(.status != "landed") ]) as $active
+     | if ($active | length) == 0 then "<div class=\"hint\">No tasks running.</div>"
+       else ([ $active[] | task_card($names) ] | join("")) end)
   + "</div></section>"
-+ "<section class=\"card\"><h2>Recently landed"
-  + "<span class=\"count\">\($d.completed | length)</span></h2>"
++ "<div class=\"grip\" data-grip=\"h\" title=\"Drag to resize\"></div>"
++ "<section class=\"card\" id=\"pane-landed\"><h2>Recently landed"
+  + "<span class=\"count\">\($d.counts.tasks_landed)</span></h2>"
   + "<div class=\"scroll\" data-scroll=\"landed\">"
-  + (if ($d.completed | length) == 0 then "<div class=\"hint\">Nothing landed yet.</div>"
-     else ([ $d.completed[0:6][] | landed_row($names) ] | join(""))
-          + (if ($d.completed | length) > 6
-             then "<details class=\"older\" data-open-key=\"older\"><summary>View \(($d.completed | length) - 6) older</summary>"
-                  + ([ $d.completed[6:][] | landed_row($names) ] | join(""))
-                  + "</details>"
-             else "" end) end)
+  + (([ $d.tasks[] | select(.status == "landed") ]) as $landed
+     | if ($landed | length) == 0 then "<div class=\"hint\">Nothing landed yet.</div>"
+       else ([ $landed[] | task_card($names) ] | join("")) end)
   + "</div></section>"
 + "</div></main>"
 
 + "<main id=\"view-inbox\" hidden><section class=\"card\">"
   + "<h2>Inbox<span class=\"count\" id=\"inbox-shown\"></span></h2>"
   + "<div class=\"filters\">"
-  + "<div class=\"fset\"><span class=\"lab\">Whose turn</span><div class=\"fgroup\" data-filter=\"turn\">"
-  + ([ {v: "captain", l: "Mine"}, {v: "external", l: "External"},
-       {v: "worker", l: "Worker"}, {v: "all", l: "Everything"} ]
+  + "<div class=\"fset\"><span class=\"lab\">Kind</span><div class=\"fgroup\" data-filter=\"kind\">"
+  + ([ {v: "all", l: "All"}, {v: "plan", l: "Plans"}, {v: "pr", l: "PRs"} ]
      | map(. as $f
-       | ($all | map(select($f.v == "all" or .turn == $f.v)) | length) as $n
-       | "<button type=\"button\" data-turn=\"\($f.v)\"\(if $f.v == "captain" then " class=\"on\"" else "" end)>\($f.l)<span class=\"n\">\($n)</span></button>")
-     | join(""))
-  + "</div></div>"
-  + "<div class=\"fset\"><span class=\"lab\">Type</span><div class=\"fgroup\" data-filter=\"kind\">"
-  + ([ {v: "all", l: "All"}, {v: "pr", l: "PRs"}, {v: "ui", l: "UI"},
-       {v: "plan", l: "Plans"}, {v: "decision", l: "Decisions"}, {v: "lane", l: "Lanes"} ]
-     | map(. as $f
-       | ($all | map(select($f.v == "all" or .row == $f.v)) | length) as $n
+       | ($d.updates | map(select($f.v == "all" or .kind == $f.v)) | length) as $n
        | "<button type=\"button\" data-kind=\"\($f.v)\"\(if $f.v == "all" then " class=\"on\"" else "" end)>\($f.l)<span class=\"n\">\($n)</span></button>")
      | join(""))
   + "</div></div>"
-  + "<div class=\"fset\"><span class=\"lab\">Sort</span><div class=\"fgroup\" data-filter=\"sort\">"
-  + ([ {v: "priority", l: "Priority"}, {v: "oldest", l: "Oldest"}, {v: "recent", l: "Recently updated"} ]
-     | map("<button type=\"button\" data-sort=\"\(.v)\"\(if .v == "priority" then " class=\"on\"" else "" end)>\(.l)</button>")
+  + "<div class=\"fset\"><span class=\"lab\">Whose turn</span><div class=\"fgroup\" data-filter=\"turn\">"
+  + ([ {v: "captain", l: "Mine"}, {v: "worker", l: "Worker"},
+       {v: "external", l: "External"}, {v: "all", l: "Everything"} ]
+     | map(. as $f
+       | ($d.updates | map(select($f.v == "all" or .turn == $f.v)) | length) as $n
+       | "<button type=\"button\" data-turn=\"\($f.v)\"\(if $f.v == "captain" then " class=\"on\"" else "" end)>\($f.l)<span class=\"n\">\($n)</span></button>")
      | join(""))
   + "</div></div>"
-  + "</div>"
-  + "<div class=\"scroll\" data-scroll=\"inbox\" id=\"inbox-list\">"
-  + "<div class=\"group-head\" data-group=\"captain\">Needs action</div>"
-  + ([ $all[] | select(.turn == "captain") | queue_row($names; $fetched) ] | join(""))
-  + "<div class=\"group-head\" data-group=\"other\">For awareness</div>"
-  + ([ $all[] | select(.turn != "captain") | queue_row($names; $fetched) ] | join(""))
+  + "<div class=\"fset\"><span class=\"lab\">Sort</span><div class=\"fgroup\" data-filter=\"sort\">"
+  + ([ {v: "priority", l: "Priority"}, {v: "oldest", l: "Oldest"}, {v: "recent", l: "Recent"} ]
+     | map("<button type=\"button\" data-sort=\"\(.v)\"\(if .v == "priority" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | join(""))
+  + "</div></div></div>"
+  + "<div class=\"scroll\" data-scroll=\"inbox\"><ul class=\"items\" id=\"inbox-list\">"
+  + ([ $d.updates[] | update_row($names) ] | join(""))
+  + "</ul>"
   + "<div class=\"empty\" id=\"inbox-empty\" hidden><div class=\"big\">Nothing here</div>"
   + "<div class=\"small\">Pick another filter.</div></div>"
   + "</div></section></main>"
+
++ "<main id=\"view-task\" hidden>"
+  + ([ $d.tasks[] as $t | $t | task_screen($names; [$d.updates[] | select(.task_id == $t.id)]) ] | join(""))
+  + "</main>"
 JQ
   printf '%s' "$prog"
 }
+
 render_tail() {  # <state-json>
   printf '<script type="application/json" id="mission-control-state">\n'
   # The embedded copy is the exact document this page renders. `<` is escaped so
@@ -1663,25 +1742,81 @@ render_tail() {  # <state-json>
   });
 
   // Expanded rows are the captain's own progressive-disclosure choices; keep them.
-  document.querySelectorAll('details[data-open-key]').forEach(function (d) {
-    var key = 'open.' + d.getAttribute('data-open-key');
-    if (load(key, '') === '1') { d.open = true; }
-    d.addEventListener('toggle', function () { save(key, d.open ? '1' : '0'); });
-  });
 
-  var views = { panels: document.getElementById('view-panels'),
-                inbox: document.getElementById('view-inbox') };
+  var views = { board: document.getElementById('view-board'),
+                inbox: document.getElementById('view-inbox'),
+                task:  document.getElementById('view-task') };
+  var lastView = 'board';
   var showView = function (name) {
-    if (!views[name]) { name = 'panels'; }
+    if (!views[name]) { name = 'board'; }
     Object.keys(views).forEach(function (k) { if (views[k]) views[k].hidden = (k !== name); });
     document.querySelectorAll('.views button').forEach(function (b) {
       b.classList.toggle('on', b.getAttribute('data-view') === name);
     });
-    save('view', name);
+    if (name !== 'task') { lastView = name; save('view', name); }
     setCursor(-1);
   };
   document.querySelectorAll('.views button').forEach(function (b) {
     b.addEventListener('click', function () { showView(b.getAttribute('data-view')); });
+  });
+
+  // One click on a task opens that task's own screen with its full history.
+  var openTask = function (id) {
+    var found = false;
+    document.querySelectorAll('.screen').forEach(function (sc) {
+      var match = sc.getAttribute('data-screen') === id;
+      sc.hidden = !match;
+      if (match) { found = true; }
+    });
+    if (found) { showView('task'); }
+  };
+  document.addEventListener('click', function (ev) {
+    var back = ev.target.closest && ev.target.closest('.back');
+    if (back) { showView(lastView); return; }
+    if (ev.target.closest && ev.target.closest('a')) { return; }
+    var card = ev.target.closest && ev.target.closest('.task');
+    if (card) { openTask(card.getAttribute('data-task')); }
+  });
+  document.querySelectorAll('.task').forEach(function (c) {
+    c.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') { ev.preventDefault(); openTask(c.getAttribute('data-task')); }
+    });
+  });
+
+  // --- draggable panel sizes, remembered across the self-refresh ---
+  document.querySelectorAll('.grip').forEach(function (grip, gi) {
+    var vertical = grip.getAttribute('data-grip') === 'v';
+    var prev = grip.previousElementSibling, next = grip.nextElementSibling;
+    var key = 'grip.' + gi;
+    var saved = load(key, '');
+    if (saved && prev && next) {
+      var parts = saved.split(',');
+      prev.style.flex = parts[0]; next.style.flex = parts[1];
+    }
+    grip.addEventListener('mousedown', function (ev) {
+      if (!prev || !next) { return; }
+      ev.preventDefault();
+      grip.classList.add('dragging');
+      var startPos = vertical ? ev.clientY : ev.clientX;
+      var pRect = prev.getBoundingClientRect(), nRect = next.getBoundingClientRect();
+      var pSize = vertical ? pRect.height : pRect.width;
+      var nSize = vertical ? nRect.height : nRect.width;
+      var total = pSize + nSize;
+      var move = function (e) {
+        var delta = (vertical ? e.clientY : e.clientX) - startPos;
+        var p = Math.max(80, Math.min(total - 80, pSize + delta));
+        var pf = (p / total) * 2, nf = ((total - p) / total) * 2;
+        prev.style.flex = pf + ' 1 0'; next.style.flex = nf + ' 1 0';
+      };
+      var up = function () {
+        document.removeEventListener('mousemove', move);
+        document.removeEventListener('mouseup', up);
+        grip.classList.remove('dragging');
+        save(key, prev.style.flex + ',' + next.style.flex);
+      };
+      document.addEventListener('mousemove', move);
+      document.addEventListener('mouseup', up);
+    });
   });
 
   // --- inbox filters and sort ---
@@ -1694,25 +1829,18 @@ render_tail() {  # <state-json>
 
   var applySort = function () {
     if (!list) { return; }
-    ['captain', 'other'].forEach(function (group) {
-      var head = list.querySelector('[data-group="' + group + '"]');
-      if (!head) { return; }
-      var rows = [], n = head.nextElementSibling;
-      while (n && !n.classList.contains('group-head') && n.id !== 'inbox-empty') {
-        rows.push(n); n = n.nextElementSibling;
-      }
-      rows.sort(function (a, b) {
-        var aa = parseInt(a.getAttribute('data-age') || '0', 10);
-        var bb = parseInt(b.getAttribute('data-age') || '0', 10);
-        if (filters.sort === 'oldest') { return bb - aa; }
-        if (filters.sort === 'recent') { return aa - bb; }
-        var ap = parseInt(a.getAttribute('data-priority') || '1', 10);
-        var bp = parseInt(b.getAttribute('data-priority') || '1', 10);
-        if (ap !== bp) { return ap - bp; }
-        return bb - aa;
-      });
-      rows.forEach(function (r) { head.parentNode.insertBefore(r, n); });
+    var rows = Array.prototype.slice.call(list.children);
+    rows.sort(function (a, b) {
+      var aa = parseInt(a.getAttribute('data-age') || '0', 10);
+      var bb = parseInt(b.getAttribute('data-age') || '0', 10);
+      if (filters.sort === 'recent') { return aa - bb; }
+      if (filters.sort === 'oldest') { return bb - aa; }
+      // Urgency first, then age: an older routine item must never outrank a
+      // newer blocker just because it is older.
+      var rank = function (el) { return parseInt(el.getAttribute('data-priority') || '9', 10); };
+      return (rank(a) - rank(b)) || (bb - aa);
     });
+    rows.forEach(function (r) { list.appendChild(r); });
   };
 
   var applyFilters = function () {
@@ -1724,15 +1852,6 @@ render_tail() {  # <state-json>
             && (filters.kind === 'all' || el.getAttribute('data-kind') === filters.kind);
       el.hidden = !ok;
       if (ok) { visible += 1; }
-    });
-    // A group heading with nothing under it is noise.
-    list.querySelectorAll('.group-head').forEach(function (h) {
-      var any = false, n = h.nextElementSibling;
-      while (n && !n.classList.contains('group-head') && n.id !== 'inbox-empty') {
-        if (n.classList.contains('item') && !n.hidden) { any = true; }
-        n = n.nextElementSibling;
-      }
-      h.hidden = !any;
     });
     if (shown) { shown.textContent = visible + ' of ' + total; }
     if (emptyNote) { emptyNote.hidden = visible !== 0; }
@@ -1753,17 +1872,17 @@ render_tail() {  # <state-json>
     });
   });
 
-  // --- j/k between items, Enter to open ---
+  // --- j/k between rows, Enter to open ---
   var cursor = -1;
   var rows = function () {
-    var view = views.inbox && !views.inbox.hidden ? views.inbox : views.panels;
+    var view = null;
+    Object.keys(views).forEach(function (k) { if (views[k] && !views[k].hidden) view = views[k]; });
     if (!view) { return []; }
-    return Array.prototype.filter.call(view.querySelectorAll('.item'), function (el) {
-      return !el.hidden;
-    });
+    return Array.prototype.filter.call(view.querySelectorAll('.item, .task'),
+      function (el) { return !el.hidden; });
   };
   function setCursor(i) {
-    document.querySelectorAll('.item.here').forEach(function (el) { el.classList.remove('here'); });
+    document.querySelectorAll('.here').forEach(function (el) { el.classList.remove('here'); });
     var all = rows();
     if (i < 0 || i >= all.length) { cursor = -1; return; }
     cursor = i;
@@ -1773,17 +1892,20 @@ render_tail() {  # <state-json>
   document.addEventListener('keydown', function (ev) {
     var tag = (ev.target && ev.target.tagName) || '';
     if (ev.metaKey || ev.ctrlKey || ev.altKey || tag === 'INPUT' || tag === 'TEXTAREA') { return; }
+    if (ev.key === 'Escape' && views.task && !views.task.hidden) { showView(lastView); return; }
     var all = rows();
     if (ev.key === 'j') { ev.preventDefault(); setCursor(Math.min(cursor + 1, all.length - 1)); }
     else if (ev.key === 'k') { ev.preventDefault(); setCursor(Math.max(cursor - 1, 0)); }
     else if (ev.key === 'Enter' && cursor >= 0 && all[cursor]) {
-      var a = all[cursor].querySelector('a.go') || all[cursor].querySelector('a');
-      if (a) { ev.preventDefault(); window.open(a.href, '_blank', 'noopener'); }
+      var el = all[cursor];
+      if (el.classList.contains('task')) { ev.preventDefault(); openTask(el.getAttribute('data-task')); }
+      else {
+        var a = el.querySelector('a.go') || el.querySelector('a');
+        if (a) { ev.preventDefault(); window.open(a.href, '_blank', 'noopener'); }
+      }
     }
   });
 
-  // The banner offers the way out; an offline page cannot run it, so it reveals
-  // the exact command instead of pretending to have acted.
   document.querySelectorAll('[data-reveal]').forEach(function (b) {
     b.addEventListener('click', function () {
       var code = document.getElementById(b.getAttribute('data-reveal'));
@@ -1801,7 +1923,7 @@ render_tail() {  # <state-json>
 
   applySort();
   applyFilters();
-  showView(load('view', 'panels'));
+  showView(load('view', 'board'));
 
   // A visible countdown, so a page that looks static is provably still live.
   var meta = document.querySelector('meta[http-equiv="refresh"]');
