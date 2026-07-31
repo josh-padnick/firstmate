@@ -693,6 +693,26 @@ test_redesign_shape() {
   pass "the board leads with one queue, folds decisions into their plan, and opens in new tabs"
 }
 
+test_output_publish_failure_is_reported() {
+  local home snap outdir output code=0
+  home=$(make_home publish-failure)
+  write_fixture "$home"
+  snap=$(capture "$home")
+  outdir=$home/output
+  mkdir -p "$outdir/.mission-control.html.tmp"
+  output=$(FM_HOME="$home" "$DASH" --snapshot "$snap" --out-dir "$outdir" 2>&1) || code=$?
+  [ "$code" -ne 0 ] || fail "an output publication failure must return nonzero"
+  assert_not_contains "$output" "wrote $outdir/mission-control.json" \
+    "failed publication must not report the JSON as written"
+  assert_not_contains "$output" "wrote $outdir/mission-control.html" \
+    "failed publication must not report the HTML as written"
+  [ ! -e "$outdir/mission-control.json" ] \
+    || fail "neither output should publish when rendering fails"
+  [ ! -e "$outdir/mission-control.html" ] \
+    || fail "neither output should publish when rendering fails"
+  pass "output publication failures stop before reporting success"
+}
+
 test_empty_home_is_honest
 test_typed_awaiting_queue
 test_blocked_says_whether_anyone_is_on_it
@@ -711,3 +731,4 @@ test_pr_cache_ages_and_is_local_only
 test_page_is_self_contained_and_escapes_hostile_text
 test_render_refuses_a_foreign_document
 test_html_is_a_rendering_of_the_written_document
+test_output_publish_failure_is_reported

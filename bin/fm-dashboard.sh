@@ -1840,11 +1840,17 @@ generate_once() {  # -> state document path
 
 write_outputs() {  # <state-json>
   local state=$1
-  mkdir -p "$OUT_DIR"
-  cp "$state" "$OUT_DIR/.mission-control.json.tmp" \
-    && mv "$OUT_DIR/.mission-control.json.tmp" "$OUT_DIR/mission-control.json"
-  render_html "$state" > "$OUT_DIR/.mission-control.html.tmp" \
-    && mv "$OUT_DIR/.mission-control.html.tmp" "$OUT_DIR/mission-control.html"
+  local json_tmp=$OUT_DIR/.mission-control.json.tmp
+  local html_tmp=$OUT_DIR/.mission-control.html.tmp
+  mkdir -p "$OUT_DIR" || return 1
+  cp "$state" "$json_tmp" || return 1
+  render_html "$state" > "$html_tmp" || {
+    rm -f "$json_tmp"
+    [ ! -f "$html_tmp" ] || rm -f "$html_tmp"
+    return 1
+  }
+  mv "$json_tmp" "$OUT_DIR/mission-control.json" || return 1
+  mv "$html_tmp" "$OUT_DIR/mission-control.html" || return 1
 }
 
 case "$MODE" in
@@ -1863,13 +1869,13 @@ esac
 
 if [ "$WATCH" -eq 1 ]; then
   while :; do
-    write_outputs "$(generate_once)"
+    write_outputs "$(generate_once)" || die "dashboard output publication failed"
     printf '%s  updated %s\n' "$(display_stamp "$(now_utc)")" "$OUT_DIR/mission-control.html"
     sleep "$WATCH_SECS"
   done
 fi
 
-write_outputs "$(generate_once)"
+write_outputs "$(generate_once)" || die "dashboard output publication failed"
 printf 'wrote %s\n' "$OUT_DIR/mission-control.json"
 printf 'wrote %s\n' "$OUT_DIR/mission-control.html"
 printf 'open  file://%s\n' "$OUT_DIR/mission-control.html"
