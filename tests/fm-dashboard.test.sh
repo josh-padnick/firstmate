@@ -54,16 +54,24 @@ record_idle() {  # <home> <id>
     --source claude-hook --event stop
 }
 
+record_busy() {  # <home> <id>
+  local gen
+  gen=$("$ROOT/bin/fm-busy-event.sh" arm "$1/state" "$2")
+  "$ROOT/bin/fm-busy-event.sh" apply "$1/state" "$2" busy --gen "$gen" \
+    --source claude-hook --event user-prompt-submit
+}
+
 # One fixture covering every branch the projection has to decide:
 #   ship-ui     ship lane, rendered page in its own directory  -> ui
 #   scout-plan  scout lane, rendered page in its own directory -> plan (kind wins
 #               over the .html extension)
 #   ask-only    an open question with no artifact at all       -> decision
 #   held-pr     an open PR whose lane is blocked               -> merge_queue held
+#   busy-pr     an open PR whose lane is still running          -> the WORKER's turn
 write_fixture() {  # <home>
   local home=$1
   mkdir -p "$home/projects/wt-ship" "$home/projects/wt-scout" "$home/projects/wt-ask" \
-    "$home/projects/wt-held" "$home/data/ship-ui" "$home/data/scout-plan"
+    "$home/projects/wt-held" "$home/projects/wt-busy" "$home/data/ship-ui" "$home/data/scout-plan"
   printf '<html><head><title>The rendered table demo</title></head><body></body></html>\n' \
     > "$home/data/ship-ui/demo.html"
   printf '<html><head><title>Styling consolidation</title></head><body></body></html>\n' \
@@ -75,9 +83,10 @@ write_fixture() {  # <home>
 - [ ] ship-ui - Demo: interactive table component (repo: owner/demo) (kind: ship) (since 2026-07-20)
 - [ ] scout-plan - Demo: styling consolidation architecture (repo: owner/demo) (kind: scout) (since 2026-07-21)
 - [ ] held-pr - Demo: held pull request lane https://github.com/owner/demo/pull/9 (repo: owner/demo) (kind: ship) (since 2026-07-22)
+- [ ] busy-pr - Demo: pull request still being validated https://github.com/owner/demo/pull/12 (repo: owner/demo) (kind: ship) (since 2026-07-24)
 
 ## Queued
-- [ ] scout-plan-decision-type-ladder - Which type ladder ships (repo: owner/demo) (kind: captain) (since 2026-07-21) (hold: Four steps or three.) (hold-kind: captain)
+- [ ] scout-plan-decision-type-ladder - Which type ladder ships (repo: owner/demo) (kind: captain) (since 2026-07-21) (hold: The ladder can carry four steps or three, and the fourth is unused today. Option A, recommended: three steps, because the fourth is never used. Option B: keep four for headroom.) (hold-kind: captain)
   Origin: scout-plan
   Decision key: type-ladder
 - [ ] ask-only-decision-naming - What the component is called (repo: owner/demo) (kind: captain) (since 2026-07-23) (hold: Table versus DataTable.) (hold-kind: captain)
@@ -124,10 +133,19 @@ needs-decision [key=scope]: confirm the migration scope before merge
 paused: standing by before merging
 EOF
 
+  # The captain's own example: an open pull request whose lane is mid-pipeline.
+  # It is open, it has no blocker, and it is still not his to merge.
+  fm_write_meta "$home/state/busy-pr.meta" \
+    "window=firstmate:fm-busy-pr" "worktree=$home/projects/wt-busy" \
+    "project=owner/demo" "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off" \
+    "pr=https://github.com/owner/demo/pull/12"
+  printf 'working: validation running\n' > "$home/state/busy-pr.status"
+
   record_idle "$home" ship-ui
   record_idle "$home" scout-plan
   record_idle "$home" ask-only
   record_idle "$home" held-pr
+  record_busy "$home" busy-pr
 }
 
 capture() {  # <home> -> snapshot path
@@ -267,11 +285,11 @@ test_activity_feed_is_newest_first() {
 
   printf '%s' "$out" | jq -e '
     .in_flight[] | select(.id == "ship-ui")
-    | (.activity | length) == 3
-      and (.activity | map(.state)) == ["paused", "needs-decision", "working"]
-      and (.activity[2].note == "started on the table component")
+    | (.feed | length) == 3
+      and (.feed | map(.state)) == ["paused", "needs-decision", "working"]
+      and (.feed[2].note == "started on the table component")
   ' >/dev/null || fail "each lane carries its own newest-first feed: \
-$(printf '%s' "$out" | jq -c '[.in_flight[]|select(.id=="ship-ui")|.activity]')"
+$(printf '%s' "$out" | jq -c '[.in_flight[]|select(.id=="ship-ui")|.feed]')"
 
   printf '%s' "$out" | jq -e '
     [ .in_flight[] | .kind ] | index("secondmate") == null
@@ -397,8 +415,106 @@ test_html_is_a_rendering_of_the_written_document() {
   pass "the page is exactly a rendering of the state document that ships with it"
 }
 
+test_turn_says_whose_move_it_is() {
+  local home out
+  home=$(make_home turns)
+  write_fixture "$home"
+  out=$(state_for "$home") || fail "turn projection failed"
+
+  # The captain's own case: open, unblocked, and still not his, because the lane
+  # that owns it has not finished.
+  printf '%s' "$out" | jq -e '
+    .merge_queue[] | select(.number == 12)
+    | .turn == "worker" and .action == null
+      and (.headline | startswith("Blocked on"))
+      and (.activity.text | test("validation running"))
+  ' >/dev/null || fail "a pull request whose lane is still running is not the captain's turn: \
+$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,turn,headline}]')"
+
+  # A question of his is his turn, and says so outright.
+  printf '%s' "$out" | jq -e '
+    .merge_queue[] | select(.number == 9)
+    | .turn == "captain" and .action == "decide" and .headline == "Yours to decide"
+  ' >/dev/null || fail "a PR held on the captain's decision must read as his turn"
+
+  printf '%s' "$out" | jq -e '
+    [ .merge_queue[], .awaiting_captain[], .in_flight[] ]
+    | all(.turn | IN("captain", "worker", "external"))
+      and all(.headline != null and .headline != "")
+      and all(.activity.text != null and .activity.source != null)
+      and all(if .turn == "captain" then .action != null else .action == null end)
+  ' >/dev/null || fail "every item must carry a turn, a headline, an activity, and an action only when it is the captain's"
+
+  # A busy pane is evidence the worker is busy, not evidence about validation.
+  printf '%s' "$out" | jq -e '
+    .merge_queue[] | select(.number == 12) | .activity.source == "status-log"
+  ' >/dev/null || fail "activity must name the evidence it came from"
+
+  printf '%s' "$out" | jq -e '
+    .counts.inbox == ([ .merge_queue[], .awaiting_captain[], .in_flight[] ]
+                      | map(select(.turn == "captain") | .id) | unique | length)
+  ' >/dev/null || fail "the inbox count must be the deduped captain-turn set"
+  pass "every item says whose turn it is, what it is waiting for, and what is happening now"
+}
+
+test_decisions_carry_their_recommendation() {
+  local home out
+  home=$(make_home recs)
+  write_fixture "$home"
+  out=$(state_for "$home")
+
+  # Stated by the plan, in the phrasing real holds use, and recovered from the
+  # raw row because the canonical parser truncates hold_reason at a comma.
+  printf '%s' "$out" | jq -e '
+    .awaiting_captain[] | select(.id == "scout-plan") | .decisions[0]
+    | .recommendation == "Option A: three steps, because the fourth is never used."
+      and .recommendation_source == "hold"
+      and .reasoning == null
+  ' >/dev/null || fail "a stated recommendation must be carried inline: \
+$(printf '%s' "$out" | jq -c '[.awaiting_captain[]|select(.id=="scout-plan")|.decisions]')"
+
+  # None stated: the reasoning stands in so the row is still answerable.
+  printf '%s' "$out" | jq -e '
+    .awaiting_captain[] | select(.id == "ask-only") | .decisions[0]
+    | .recommendation == null and .reasoning == "Table versus DataTable."
+  ' >/dev/null || fail "with no recommendation the hold reasoning must stand in: \
+$(printf '%s' "$out" | jq -c '[.awaiting_captain[]|select(.id=="ask-only")|.decisions]')"
+
+  printf '%s' "$out" | jq -e '
+    .awaiting_captain[] | select(.id == "scout-plan") | .recommended_count == 1
+  ' >/dev/null || fail "recommended_count must count decisions that carry one"
+  pass "decisions carry the recommended answer, or the reasoning when none was stated"
+}
+
+test_inbox_view_ships_beside_the_panels() {
+  local home state html
+  home=$(make_home inbox)
+  write_fixture "$home"
+  state=$TMP_ROOT/inbox-state.json
+  state_for "$home" > "$state"
+  html=$("$DASH" --render "$state") || fail "render failed"
+
+  # Both views, in one artifact, so the captain can compare them.
+  assert_contains "$html" 'id="view-panels"' "the panel view must still ship"
+  assert_contains "$html" 'id="view-inbox"' "the inbox view must ship beside it"
+  assert_contains "$html" 'data-view="inbox"' "there must be a way to switch to it"
+  assert_contains "$html" 'data-filter="turn"' "the inbox must filter by turn"
+  assert_contains "$html" 'data-filter="kind"' "the inbox must filter by type"
+  assert_contains "$html" 'data-turn="captain"' "inbox rows must be filterable by turn"
+
+  # The badge is the inbox size, taken from the document rather than counted in
+  # the page, so the two can never drift.
+  local inbox
+  inbox=$(jq -r '.counts.inbox' "$state")
+  assert_contains "$html" ">$inbox</span>" "the inbox badge must show the document's own count"
+  pass "the experimental inbox ships alongside the panels, filtered by type and turn"
+}
+
 test_empty_home_is_honest
 test_typed_awaiting_queue
+test_turn_says_whose_move_it_is
+test_decisions_carry_their_recommendation
+test_inbox_view_ships_beside_the_panels
 test_titles_and_links_are_real
 test_decision_queue_dedupes_against_status
 test_merge_queue_names_its_blockers

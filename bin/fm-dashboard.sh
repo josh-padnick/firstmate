@@ -65,14 +65,48 @@
 #     fleet_snapshot: {schema, generated},
 #     pr_data: {present, fetched, age_seconds, stale, ttl_seconds, records}
 #   },
-#   counts: {merge_queue, awaiting_captain, ui, plan, decision, decisions,
-#            in_flight, completed, notices},
+#   counts: {inbox, mine, worker_turn, external_turn, merge_queue,
+#            awaiting_captain, ui, plan, decision, decisions, in_flight,
+#            in_flight_live, completed, notices},
 #
-#   merge_queue[]: one open pull request the captain could land.
+# The page renders this document TWICE, as two views the captain can switch
+# between: the panel board, and an experimental inbox - one list of what is his
+# turn, filtered by type and by turn, whose count is the size of the queue and
+# shrinks as he works through it. Both views read the same arrays, so they can
+# never disagree about what is waiting.
+#
+#   TURN - carried by every merge_queue, awaiting_captain and in_flight item:
+#     {turn: captain|worker|external, waiting_for, turn_reason, headline,
+#      action: merge|look|read|decide|null, since, since_source: backlog|status-log|null,
+#      activity: {text, source: run-step|status-log|state, state}}
+#     `headline` is the one line that says which of the two situations this is -
+#     "Yours to review and merge" or "Blocked on <the concrete thing>" - so the
+#     difference is read, never inferred.
+#     `activity` is what is happening to this work right now, in the captain's
+#     nouns. Its preference order is most-specific-first: an attributed pipeline
+#     step, then the worker's own latest status words (which is where rebasing,
+#     fixing conflicts and answering review comments actually come from), then
+#     the bare state. `source` says which, so a busy pane is never reported as
+#     validation. Phase 2 pushes transitions of this field as events.
+#     `turn` is whose move it is, derived from what the fleet actually shows and
+#     never from which list the item sits in. An open pull request whose lane is
+#     still running its pipeline is the WORKER's turn; checks that have not
+#     reported are EXTERNAL; a parked lane or an open question is the CAPTAIN's.
+#     Putting something in the captain's queue that he cannot act on is the one
+#     failure this field exists to prevent.
+#     `action` is what he would do about it, and is null unless it is his turn.
+#     `since` prefers the durable backlog date and falls back to when the status
+#     event was recorded; `since_source` says which, so neither is mistaken for
+#     the other.
+#     THE INBOX is derived, not stored: every item across those three arrays
+#     whose turn is `captain`, deduped by id (one lane blocked on one question is
+#     one thing to do). counts.inbox is its size.
+#
+#   merge_queue[]: one open pull request, whoever's turn it is.
 #     {id, title, url, number, repo, project, status: ready|held,
 #      checks: {state: passing|failing|pending|none|unknown, summary, source},
 #      blockers[]: {kind: checks|decision|worker|depends-on|hold|draft, text},
-#      source: task-meta|backlog}
+#      source: task-meta|backlog|forge, + TURN}
 #     status is `held` exactly when blockers is non-empty, so "what blocks it"
 #     is never a colour the captain has to interpret.
 #
@@ -80,9 +114,18 @@
 #     because reading a plan, looking at a UI, and answering a question are
 #     different work.
 #     {id, type: ui|plan|decision, kind, title, note, link,
-#      link_kind: file|http|null, project, since,
+#      link_kind: file|http|null, project,
 #      source: status-decision|backlog-hold|scout-report,
-#      decisions[]: {id, key, question}, decision_count, evidence}
+#      decisions[]: {id, key, question, recommendation, recommendation_source,
+#                    reasoning},
+#      decision_count, recommended_count, evidence, + TURN}
+#     Every decision carries the answer a plan already recommended, so it can be
+#     answered here instead of hunted for. `recommendation` is parsed from the
+#     hold text a plan wrote ("Option A, recommended: ..."), read from the raw
+#     backlog row because the canonical parser stops hold_reason at the first
+#     comma. Where no recommendation is extractable, `reasoning` carries the
+#     hold's own argument so the item is still actionable rather than a prompt
+#     to go research.
 #     Typing rule, in order: no artifact at all is a `decision`; a .md document
 #     is a `plan`; scout work is a `plan` even when its deliverable renders as a
 #     page, because scouts produce knowledge to read; a rendered page from ship
@@ -94,9 +137,12 @@
 #     than deriving two sets that can disagree.
 #
 #   in_flight[]: one live lane and its own activity feed.
-#     {id, title, project, kind, mode, state, state_source, detail,
+#     {id, title, project, kind, mode, state, state_source, detail, live,
 #      needs_captain, pr: {url, number}|null,
-#      activity[]: {state, note, raw} newest first}
+#      feed[]: {state, note, raw} newest first, + TURN}
+#     `feed` is the history - "we did this, then that" - while `activity` from
+#     TURN is the single thing happening now. Both come from the same status
+#     event stream and neither is current-state truth on its own.
 #     Persistent secondmate lanes are deliberately excluded: an idle secondmate
 #     is healthy, and drawing it as a stalled lane would misreport it.
 #
@@ -195,12 +241,16 @@ now_utc() {
   fi
 }
 
-# Parsed with jq, not date(1): BSD date's `-j -f` applies local daylight rules to
-# an input it was told is UTC, which puts the captain's stamp an hour out. jq is
-# already required here and its fromdateiso8601 is correct on every platform.
+# TZ=UTC is load-bearing, and so is not using jq here. BSD date's `-j -f` parses
+# in the zone from the environment - `-u` only affects output - and jq 1.6's
+# fromdateiso8601 applies local daylight rules to a Z timestamp. Either one puts
+# the captain's stamp an hour out during DST. Setting TZ for the parse is the one
+# form that agrees with the wall clock on both platforms.
 iso_to_epoch() {  # <iso8601-utc> -> epoch seconds, or empty
   [ -n "${1:-}" ] || return 0
-  jq -rn --arg s "$1" '($s | fromdateiso8601? // empty)' 2>/dev/null || true
+  TZ=UTC date -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null \
+    || date -u -d "$1" +%s 2>/dev/null \
+    || true
 }
 
 # Human stamp in the captain's own timezone, derived from the same instant as
@@ -399,6 +449,65 @@ def as_file_url($link):
   elif ($link | startswith("http")) then $link
   else "file://" + $link end;
 
+# Whose turn it is, and when it became that turn. Derived from what the fleet
+# actually shows, never from which list an item happens to sit in: an open pull
+# request whose lane is still running its pipeline is the WORKER's turn, and
+# saying otherwise puts something in the captain's queue that he cannot act on.
+def turn_of($who; $waiting; $reason; $action):
+  {turn: $who, waiting_for: $waiting, turn_reason: $reason, action: $action}
+  # One line that says which of the two situations this is, so the captain never
+  # has to infer "mine" from "not blocked". Rendered as-is.
+  + {headline:
+      (if $who == "captain"
+       then (if $action == "merge" then "Yours to review and merge"
+             elif $action == "look" then "Yours to look at"
+             elif $action == "read" then "Yours to read"
+             else "Yours to decide" end)
+       else "Blocked on " + $waiting end)};
+
+# The concrete thing happening to this work right now, in the captain's nouns.
+# Preference order is most-specific-first: the pipeline's own step when a run is
+# attributed, then the worker's latest words - which is where "rebasing",
+# "fixing merge conflicts" and "responding to review comments" actually come
+# from - and only then the bare state word.
+def activity_of($task):
+  ($task.current_state.state // "unknown") as $st
+  | ($task.current_state.source // "none") as $src
+  | ($task.current_state.detail // "") as $detail
+  | (($task.paths.status_log.events // [])[0] // null) as $latest
+  | if $src == "run-step" and $st == "working"
+    then {text: (if ($detail | test("ci|check"; "i"))
+                 then "waiting on CI checks" else "running validation" end),
+          source: "run-step"}
+    elif $src == "run-step" and $st == "parked"
+    then {text: "waiting on a decision at a review gate", source: "run-step"}
+    elif $latest != null and ($latest.note // "") != ""
+    then {text: ($latest.note | clip(160)), source: "status-log"}
+    elif $st == "done" then {text: "finished, waiting to land", source: "state"}
+    else {text: ("no recent activity recorded"), source: "state"} end
+  | . + {state: $st};
+
+# The recommended answer a plan already stated, so a decision can be answered
+# here instead of hunted for. Real holds phrase it as "Option A, recommended: X",
+# and anything after the next option label belongs to that other option.
+def recommendation_of($text):
+  ($text // "")
+  | if (test("recommend(ed|ation)?s?:"; "i") | not) then null
+    else
+      ((capture("(Option[[:space:]]+(?<label>[A-Za-z0-9]+)[,:]?[[:space:]]*)?recommend(ed|ation)?s?:[[:space:]]*(?<rec>.+)$"; "i")) // null)
+      | if . == null then null
+        else ((if (.label // "") != "" then "Option " + .label + ": " else "" end)
+              + (.rec | sub("[[:space:]]+Option[[:space:]]+[A-Za-z0-9]+[:,].*$"; "")))
+        end
+    end;
+
+def since_of($backlog_date; $id):
+  if ($backlog_date // "") != ""
+  then {since: $backlog_date, since_source: "backlog"}
+  elif ($mtimes[0][$id] // null) != null
+  then {since: ($mtimes[0][$id] | todate), since_source: "status-log"}
+  else {since: null, since_source: null} end;
+
 $snap[0] as $s
 | $prs[0] as $prcache
 | $artifacts[0] as $index
@@ -407,8 +516,7 @@ $snap[0] as $s
 | ($prcache.records // []) as $prrecords
 
 # ---- PR data freshness ------------------------------------------------------
-| (if $prcache.fetched == null then null
-   else ($now_epoch - ($prcache.fetched | fromdateiso8601? // $now_epoch)) end) as $pr_age
+| (if $prcache.fetched == null then null else ($now_epoch - $fetched_epoch) end) as $pr_age
 | {
     present: ($prcache.fetched != null),
     fetched: $prcache.fetched,
@@ -427,9 +535,22 @@ $snap[0] as $s
      | ((($r.body_lines // [])[] | capture("^Decision key:[[:space:]]*(?<k>[^[:space:]]+)").k)
         // ($r.id | capture("-decision-(?<k>.*)$").k)
         // "default") as $key
+     # The canonical backlog parser stops hold_reason at the first comma, which
+     # is exactly where a stated recommendation usually still lies ahead. The
+     # raw row keeps the whole hold, so the full text is recovered from there
+     # and hold_reason is only the fallback.
+     | ((($r.raw // "")
+         | (capture("\\(hold:[[:space:]]*(?<h>.*?)\\)[[:space:]]*\\(hold-kind"; "") // null)
+         | if . == null then null else .h end)
+        // ($r.hold_reason | nn)
+        // "") as $hold
+     | ([$hold, ($r.body_lines // [] | join(" "))]
+        | map(select(. != null and . != "")) | join(" ")) as $text
      | {origin: $origin, key: $key, id: $r.id,
         question: (($r.title | nn) // ($r.hold_reason | nn) // $r.id),
-        context: ($r.hold_reason | nn),
+        recommendation: recommendation_of($text),
+        recommendation_source: (if recommendation_of($text) == null then null else "hold" end),
+        context: (($hold | nn) // ($r.hold_reason | nn)),
         since: ($r.since | nn),
         repo: ($r.repo | nn)}
    ]) as $held
@@ -440,6 +561,8 @@ $snap[0] as $s
      | (.hints.open_decisions // [])[]
      | {origin: $t.id, key: .key, id: ($t.id + ":" + .key),
         question: (.summary | trim | clip(240)),
+        recommendation: recommendation_of(.summary),
+        recommendation_source: (if recommendation_of(.summary) == null then null else "status" end),
         context: null, since: null, repo: ($t.backlog.repo | nn)}
    ]
    # A decision firstmate already filed as a durable captain hold is the same
@@ -478,14 +601,36 @@ $snap[0] as $s
         link: as_file_url($link),
         link_kind: link_kind($link),
         project: (($task.backlog.repo | nn) // ($brec.repo | nn) // ($ds[0].repo | nn)),
-        since: (($ds | map(.since) | map(select(. != null)) | first)
-                // ($brec.since | nn) // null),
         source: (if ($ds | any(.context != null or (.id | test(":") | not)))
                  then "backlog-hold" else "status-decision" end),
-        decisions: [ $ds[] | {id: .id, key: .key, question: .question} ],
+        decisions: [ $ds[] | {id: .id, key: .key, question: .question,
+                              recommendation: .recommendation,
+                              recommendation_source: .recommendation_source,
+                              # With no stated recommendation, the reasoning that
+                              # raised the question is what keeps the item
+                              # answerable in place rather than research to do.
+                              reasoning: (if .recommendation == null then (.context | nn) else null end)} ],
         decision_count: ($ds | length),
+        recommended_count: ([ $ds[] | select(.recommendation != null) ] | length),
         evidence: (($task.hints.last_event_text | nn) // ($brec.raw | nn) // null)
       }
+    # An ask whose lane went back to work is not the captain's turn yet, however
+    # it is listed: the worker has moved past it.
+    + {activity: activity_of($task)}
+    + (if ($task.current_state.state // "") == "working"
+       then turn_of("worker"; "the worker finishing this pass";
+                    "its lane is working again"; null)
+       else turn_of("captain";
+                    (if $link == null then "your decision"
+                     elif type_for($link; $kind) == "ui" then "you to look at it"
+                     else "you to read it" end);
+                    "waiting on you since it was raised";
+                    (if $link == null then "decide"
+                     elif type_for($link; $kind) == "ui" then "look"
+                     else "read" end))
+       end)
+    + since_of((($ds | map(.since) | map(select(. != null)) | first)
+                // ($brec.since | nn)); $origin)
   ] as $decision_items
 
 # ---- finished work whose deliverable is a document nobody has read yet ------
@@ -511,12 +656,19 @@ $snap[0] as $s
         link: as_file_url($link),
         link_kind: link_kind($link),
         project: ($t.backlog.repo | nn),
-        since: ($t.backlog.since | nn),
         source: "scout-report",
         decisions: [],
         decision_count: 0,
+        recommended_count: 0,
         evidence: ($t.hints.last_event_text | nn)
       }
+    + {activity: activity_of($t)}
+    + turn_of("captain";
+              (if type_for($link; $kind) == "ui" then "you to look at it"
+               else "you to read it" end);
+              "its deliverable is finished and unread";
+              (if type_for($link; $kind) == "ui" then "look" else "read" end))
+    + since_of(($t.backlog.since | nn); $t.id)
   ] as $report_items
 
 | (($decision_items + $report_items)
@@ -584,8 +736,47 @@ $snap[0] as $s
         blockers: $blockers,
         source: $ref.source
       }
+    + {activity: activity_of($task)}
+    # Whose turn a pull request is has nothing to do with it being open. A lane
+    # still running its pipeline owes the next move, checks that have not
+    # reported are owed by CI, and only a PR nobody else is working on is
+    # actually the captain's to land.
+    + (if ($blockers | any(.kind == "checks" and (.text | test("failing"))))
+       then turn_of("worker"; "the worker fixing failing checks";
+                    "its checks are failing"; null)
+       elif ($blockers | any(.kind == "draft"))
+       then turn_of("worker"; "the worker finishing a draft"; "it is still a draft"; null)
+       elif ($blockers | any(.kind == "decision"))
+       then turn_of("captain"; "your decision"; "its lane is waiting on you"; "decide")
+       elif ($blockers | any(.kind == "checks"))
+       then turn_of("external"; "CI checks"; "its checks are still running"; null)
+       elif (($task.current_state.state // "") | IN("working", "parked"))
+       # Only an attributed pipeline run is evidence that VALIDATION is what is
+       # happening; a busy worker is evidence only that the worker is busy, and
+       # the activity line below carries its own latest words either way.
+       then (if ($task.current_state.source // "") == "run-step"
+             then turn_of("worker"; "validation finishing";
+                          "its pipeline is still running"; null)
+             else turn_of("worker"; "the worker, still active on it";
+                          "its lane is still working"; null) end)
+       elif ($blockers | any(.kind == "depends-on"))
+       then turn_of("captain";
+                    ("you to land " + ([$blockers[] | select(.kind == "depends-on")
+                                        | .text | sub("^waits on "; "")] | join(", "))
+                     + " first");
+                    "it stacks on work that has not landed"; "merge")
+       elif ($blockers | any(.kind == "hold"))
+       then turn_of("captain"; "your call on the hold"; "it is held"; "decide")
+       elif ($blockers | any(.kind == "worker"))
+       then turn_of("worker"; "the worker recovering"; "its lane stopped"; null)
+       else turn_of("captain"; "your merge"; "nothing else is blocking it"; "merge")
+       end)
+    + since_of(($brec.since | nn); $ref.id)
   ]
-  | sort_by([(if .status == "ready" then 0 else 1 end), .number]) as $merge_queue
+  # The captain's own turn first, then what someone else owes: the top of this
+  # list is the next thing he can actually do.
+  | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
+             (if .status == "ready" then 0 else 1 end), .number]) as $merge_queue
 
 # ---- live lanes and their own activity feeds --------------------------------
 | [ $tasks[]
@@ -611,9 +802,25 @@ $snap[0] as $s
              then {url: .pr.url,
                    number: ((.pr.url | capture("/(?<n>[0-9]+)$").n // "0") | tonumber)}
              else null end),
-        activity: [ (.paths.status_log.events // [])[]
-                    | {state: .state, note: (.note | trim | clip(220)), raw: .raw} ]
+        feed: [ (.paths.status_log.events // [])[]
+                | {state: .state, note: (.note | trim | clip(220)), raw: .raw} ]
       }
+    + {activity: activity_of($t)}
+    + (if ((($t.hints.open_decisions // []) | length) > 0)
+       then turn_of("captain"; "your decision"; "it asked you a question"; "decide")
+       elif $st == "parked"
+       then turn_of("captain"; "your decision at a gate"; "its run is parked"; "decide")
+       elif $st == "blocked"
+       then turn_of("captain"; "help getting unblocked"; "it reported a blocker"; "decide")
+       elif $st == "paused"
+       then turn_of("external"; "a declared external wait"; "it is standing by"; null)
+       elif $st == "working"
+       then turn_of("worker"; "the worker"; "it is working"; null)
+       elif $st == "failed"
+       then turn_of("worker"; "the worker recovering"; "it failed"; null)
+       else turn_of("worker"; "cleanup"; "it has finished its work"; null)
+       end)
+    + since_of(($t.backlog.since | nn); $t.id)
     | . + {rank: (if (.live | not) then 5
                   elif .needs_captain then 0
                   elif .state == "working" then 1
@@ -673,6 +880,18 @@ $snap[0] as $s
       pr_data: $pr_data
     },
     counts: {
+      # The inbox size: everything that is the captain's turn, counted once per
+      # item id, because one lane blocked on one question is one thing to do.
+      inbox: ([ ($merge_queue[] | select(.turn == "captain") | .id),
+                ($awaiting[] | select(.turn == "captain") | .id),
+                ($in_flight[] | select(.turn == "captain") | .id) ]
+              | unique | length),
+      mine: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
+             | map(select(.turn == "captain")) | length),
+      worker_turn: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
+                    | map(select(.turn == "worker")) | length),
+      external_turn: ([ ($merge_queue[]), ($awaiting[]), ($in_flight[]) ]
+                      | map(select(.turn == "external")) | length),
       merge_queue: ($merge_queue | length),
       awaiting_captain: ($awaiting | length),
       ui: ([$awaiting[] | select(.type == "ui")] | length),
@@ -739,17 +958,41 @@ EOF
     && mv "$1.tmp" "$1"
 }
 
+# When an item's only evidence is a status event, the log's own last-modified
+# time is when that event was recorded - the honest answer to "how long has this
+# been sitting". Durable backlog dates are preferred where they exist; this is
+# the fallback, and the document says which of the two it used.
+status_mtimes() {  # -> path to {id: epoch} JSON
+  local out=$TMPWORK/mtimes.json f id epoch
+  printf '{}' > "$out"
+  for f in "$STATE"/*.status; do
+    [ -e "$f" ] || continue
+    id=$(basename "$f" .status)
+    epoch=$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null) || continue
+    [ -n "$epoch" ] || continue
+    jq --arg id "$id" --argjson m "$epoch" '. + {($id): $m}' "$out" > "$out.tmp" \
+      && mv "$out.tmp" "$out"
+  done
+  printf '%s' "$out"
+}
+
 build_state() {  # <snapshot> <prs> <artifacts> -> state document on stdout
-  local snap=$1 prs=$2 artifacts=$3 generated display epoch prog
+  local snap=$1 prs=$2 artifacts=$3 generated display epoch fetched_epoch prog mtimes
   generated=$(now_utc)
   display=$(display_stamp "$generated")
   epoch=$(iso_to_epoch "$generated")
   [ -n "$epoch" ] || epoch=0
+  # Parsed with the same converter as the generated stamp, so the age between
+  # them is a difference of two comparable instants.
+  fetched_epoch=$(iso_to_epoch "$(jq -r '.fetched // ""' "$prs")")
+  [ -n "$fetched_epoch" ] || fetched_epoch=0
+  mtimes=$(status_mtimes)
   prog=$(write_projection_program)
   jq -n \
     --slurpfile snap "$snap" \
     --slurpfile prs "$prs" \
     --slurpfile artifacts "$artifacts" \
+    --slurpfile mtimes "$mtimes" \
     --arg schema "$SCHEMA" \
     --arg generated "$generated" \
     --arg display "$display" \
@@ -758,6 +1001,7 @@ build_state() {  # <snapshot> <prs> <artifacts> -> state document on stdout
     --argjson ttl "$PR_TTL" \
     --argjson completed_max "$COMPLETED_MAX" \
     --argjson now_epoch "$epoch" \
+    --argjson fetched_epoch "$fetched_epoch" \
     -f "$prog"
 }
 
@@ -834,6 +1078,53 @@ render_css() {
   .bar .stamp { font-size: .6875rem; color: var(--faint); margin-left: auto; }
   .bar .stamp b { font-weight: 600; color: var(--muted); }
 
+  /* --- view switch: two ways to read the same state --- */
+  .views { display: flex; gap: .1rem; }
+  .views button {
+    font: inherit; font-size: .6875rem; font-weight: 600; color: var(--muted);
+    background: none; border: 0; border-radius: 5px; padding: .12rem .45rem;
+    cursor: pointer; display: flex; align-items: center; gap: .3rem;
+  }
+  .views button:hover { color: var(--ink); }
+  .views button.on { background: var(--bg); color: var(--ink); }
+  .views .badge {
+    font-size: .625rem; font-weight: 700; background: var(--go-soft); color: var(--go);
+    border-radius: 8px; padding: 0 .3rem; min-width: 1.1rem; text-align: center;
+  }
+
+  /* --- inbox: one list to pick the next thing off --- */
+  .inbox { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+           padding: var(--gap) var(--gap) 0; }
+  .inbox[hidden] { display: none; }
+  .filters {
+    flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
+    padding: 0 var(--pad) .5rem;
+  }
+  .fgroup { display: flex; gap: .1rem; background: var(--surface); border-radius: 6px; padding: .12rem; }
+  .fgroup button {
+    font: inherit; font-size: .6875rem; font-weight: 600; color: var(--muted);
+    background: none; border: 0; border-radius: 4px; padding: .16rem .5rem; cursor: pointer;
+  }
+  .fgroup button:hover { color: var(--ink); }
+  .fgroup button.on { background: var(--bg); color: var(--ink); }
+  .filters .shown { font-size: .6875rem; color: var(--faint); margin-left: auto; }
+  .items {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; list-style: none;
+    background: var(--surface); border-radius: 8px; padding: .2rem var(--pad) .6rem;
+  }
+  .items::-webkit-scrollbar { width: 7px; }
+  .items::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
+  .item { padding: .5rem 0 .55rem; border-top: 1px solid var(--hair); }
+  .item[hidden] { display: none; }
+  .item:first-child { border-top: none; }
+  /* Someone else's turn stays readable but stops competing with the captain's */
+  .item[data-turn="worker"] .t, .item[data-turn="external"] .t {
+    color: var(--muted); font-weight: 500;
+  }
+  .cleared { padding: 1rem var(--pad); color: var(--faint); font-size: .8125rem; }
+  .cleared[hidden] { display: none; }
+  .grid[hidden] { display: none; }
+
   /* --- notices: the honesty line, only present when there is something --- */
   .notices {
     flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: .25rem 1rem;
@@ -908,6 +1199,14 @@ render_css() {
   .m .sep { color: var(--faint); padding: 0 .3rem; }
   .why { font-size: .71875rem; color: var(--warn); line-height: 1.4; margin-top: .12rem; }
   .why.stop { color: var(--stop); }
+  /* whose move it is, stated rather than implied */
+  .mine { font-size: .71875rem; color: var(--go); font-weight: 600; margin-top: .12rem; }
+  /* the recommended answer, so a decision can be answered without leaving */
+  .rec, .because {
+    display: block; font-size: .71875rem; line-height: 1.4; margin-top: .1rem;
+    padding-left: .55rem; border-left: 2px solid var(--go-soft); color: var(--ink);
+  }
+  .because { border-left-color: var(--line); color: var(--muted); }
 
   /* --- chips: the state is a word first; tone only reinforces it --- */
   .chip {
@@ -931,12 +1230,14 @@ render_css() {
   .group ol { list-style: none; counter-reset: d; }
   .group li {
     font-size: .71875rem; color: var(--muted); line-height: 1.4;
-    padding: .1rem 0 .1rem 1.1rem; text-indent: -1.1rem;
+    padding: .16rem 0 .22rem 1.1rem; text-indent: -1.1rem;
   }
   .group li::before {
     counter-increment: d; content: counter(d) ". ";
     color: var(--faint); font-variant-numeric: tabular-nums;
   }
+  .group li .q { color: var(--ink); }
+  .group li .rec, .group li .because { text-indent: 0; margin-left: 0; }
 
   /* --- lanes and their activity feeds --- */
   .lane { padding: .45rem 0 .5rem; border-top: 1px solid var(--hair); }
@@ -1036,11 +1337,22 @@ def review_row($multi; $names):
   + "</div>";
 
 def merge_row($multi; $fetched; $names):
-  "<div class=\"row \(if .status == "ready" then "act" else "held" end)\">"
+  # The chip says whose move it is, not merely that the PR is open. Calling a
+  # mid-pipeline PR "ready" is the exact lie this replaces.
+  "<div class=\"row \(if .turn == "captain" then "act" elif .turn == "external" then "" else "held" end)\">"
   + "<div class=\"t\">"
-  + (if .status == "ready" then chip("go"; "ready") else chip("warn"; "held") end)
+  + (if .turn == "captain" and .action == "merge" then chip("go"; "yours")
+     elif .turn == "captain" then chip("warn"; "your call")
+     elif .turn == "external" then chip("quiet"; "checks")
+     else chip("quiet"; "working") end)
   + link(.url; "#\(.number) \(shorten(.title; $names + [.repo]; 68))")
   + "</div>"
+  # Whose move it is, said outright, then the concrete thing happening to it -
+  # the difference between "mine to review" and "blocked on something" is what
+  # the captain reads first.
+  + "<div class=\"\(if .turn == "captain" then "mine" else "why" end)\">\(.headline | e)</div>"
+  + (if .turn == "captain" then ""
+     else "<div class=\"m\">\(.activity.text | readable | clip(110) | e)</div>" end)
   # With no fetched PR data at all, the notice bar already says so once; saying
   # it again on every row would be repetition without information.
   + meta_line([
@@ -1054,9 +1366,19 @@ def merge_row($multi; $fetched; $names):
   + ([ .blockers[] | "<div class=\"why\(if .kind == "checks" or .kind == "worker" then " stop" else "" end)\">\(.text | e)</div>" ] | join(""))
   + "</div>";
 
+# A decision is answerable here only if the recommendation is here. Where a plan
+# stated one it is shown outright; where it did not, the reasoning that raised
+# the question stands in, so the row is never just a prompt to go research.
 def decision_group($names):
   "<div class=\"group\"><h3>\(link(.link; shorten(.title; $names + [.project]; 84)))</h3><ol>"
-  + ([ .decisions[] | "<li>\(.question | readable | clip(150) | e)</li>" ] | join(""))
+  + ([ .decisions[]
+       | "<li><span class=\"q\">\(.question | readable | clip(150) | e)</span>"
+         + (if .recommendation != null
+            then "<span class=\"rec\">\(.recommendation | readable | clip(190) | e)</span>"
+            elif .reasoning != null
+            then "<span class=\"because\">\(.reasoning | readable | clip(190) | e)</span>"
+            else "" end)
+         + "</li>" ] | join(""))
   + "</ol></div>";
 
 def lane_row($names):
@@ -1067,15 +1389,74 @@ def lane_row($names):
      elif .state == "working" then chip("go"; .state)
      else chip("quiet"; .state) end)
   + (shorten(.title; $names + [.project]; 62) | e) + "</h3>"
-  + (if (.activity | length) == 0
+  + (if (.feed | length) == 0
      then "<div class=\"m\">no activity recorded yet</div>"
      else "<ul class=\"feed\">"
-          + ([ .activity[]
+          + ([ .feed[]
                | "<li><span class=\"v \(.state | e)\">\(.state | verb_label | e)</span>"
                  + "<span class=\"n\">\(.note | readable | e)</span></li>" ] | join(""))
           + "</ul>"
      end)
   + "</div>";
+
+# --- the experimental inbox view -------------------------------------------
+# One list, not five panels: the next thing to pick off, with filters. Built
+# from the same three arrays the panels use, so the two views can never disagree
+# about what is waiting.
+def inbox_rows:
+  ([ (.merge_queue[] | . + {row: "pr", label: "Pull request"}),
+     (.awaiting_captain[] | . + {row: .type,
+        label: (if .type == "ui" then "UI preview"
+                elif .type == "plan" then "Plan" else "Decision" end)}),
+     (.in_flight[] | . + {row: "lane", label: "Lane"}) ]
+   # One lane blocked on one question is one thing to do, so the more specific
+   # ask wins over the pull request or lane that is waiting on it.
+   | group_by(.id)
+   | map(sort_by(if .row == "pr" then 1 elif .row == "lane" then 2 else 0 end) | .[0])
+   | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
+              (.since // "0000"), .id])
+   | reverse
+   | sort_by(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end));
+
+def action_chip:
+  if . == "merge" then chip("go"; "merge")
+  elif . == "look" then chip("go"; "look")
+  elif . == "read" then chip("info"; "read")
+  elif . == "decide" then chip("warn"; "decide")
+  else chip("quiet"; "waiting") end;
+
+def inbox_row($names):
+  "<li class=\"item\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\">"
+  + "<div class=\"t\">\(.action | action_chip)"
+  + link(.link // .url;
+         (if .row == "pr" then "#\(.number) " else "" end)
+         + shorten(.title; $names + [.project, .repo]; 88))
+  + "</div>"
+  + "<div class=\"\(if .turn == "captain" then "mine" else "why" end)\">\(.headline | e)</div>"
+  + (if .turn == "captain" then ""
+     else "<div class=\"m\">\(.activity.text | readable | clip(110) | e)</div>" end)
+  # One decision with a recommendation is answerable right here; several are
+  # counted, with how many already carry one.
+  + (if (.decisions | length) == 1 and .decisions[0].recommendation != null
+     then "<div class=\"rec\">\(.decisions[0].recommendation | readable | clip(140) | e)</div>"
+     elif (.decisions | length) == 1 and .decisions[0].reasoning != null
+     then "<div class=\"because\">\(.decisions[0].reasoning | readable | clip(140) | e)</div>"
+     else "" end)
+  + meta_line([
+      (.label | e),
+      (if .since != null
+       then (.since | split("T")[0] | e)
+            + (if .since_source == "status-log" then " (last update)" else "" end)
+       else empty end),
+      # Say how many are already answerable here; saying "0 recommended" would
+      # only add a negative where the questions themselves are the information.
+      (if (.decision_count // 0) > 1
+       then "\(.decision_count) questions"
+            + (if (.recommended_count // 0) > 0
+               then ", \(.recommended_count) recommended" else "" end)
+       else empty end)
+    ])
+  + "</li>";
 
 def landed_row($names):
   "<div class=\"row\"><div class=\"t\">\(link(.url; shorten(.title; $names + [.project]; 84)))</div>"
@@ -1104,7 +1485,12 @@ def panel($key; $heading; $count; $body):
 | (([ $d.merge_queue[].repo ] | map(select(. != null) | split("/") | last)
     | unique | length) > 1) as $multi_merge
 | ($d.source.pr_data.present) as $fetched
+| ($d | inbox_rows) as $inbox
 | "<header class=\"bar\"><h1>Mission control</h1>"
+  + "<nav class=\"views\" role=\"tablist\">"
+  + "<button type=\"button\" data-view=\"panels\" class=\"on\">Panels</button>"
+  + "<button type=\"button\" data-view=\"inbox\">Inbox<span class=\"badge\" id=\"inbox-count\">\($d.counts.inbox)</span></button>"
+  + "</nav>"
   + "<p class=\"stamp\">updated <b>\($d.generated_display | e)</b>"
   + "<span class=\"sep\">·</span>refreshes every \($d.refresh_seconds)s"
   + "<span class=\"sep\">·</span><span id=\"next\"></span></p></header>"
@@ -1113,15 +1499,39 @@ def panel($key; $heading; $count; $body):
         + ([ $d.notices[] | "<span>\(.text | e)</span>" ] | join(""))
         + "</div>"
    else "" end)
-+ "<div class=\"grid\">"
++ "<section class=\"inbox\" id=\"view-inbox\" hidden>"
+  + "<div class=\"filters\">"
+  + "<div class=\"fgroup\" data-filter=\"turn\">"
+  + ([ {v: "captain", l: "Mine"}, {v: "external", l: "External"},
+       {v: "worker", l: "Worker"}, {v: "all", l: "Everything"} ]
+     | map("<button type=\"button\" data-turn=\"\(.v)\"\(if .v == "captain" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | join(""))
+  + "</div>"
+  + "<div class=\"fgroup\" data-filter=\"kind\">"
+  + ([ {v: "all", l: "All"}, {v: "pr", l: "PRs"}, {v: "ui", l: "UI"},
+       {v: "plan", l: "Plans"}, {v: "decision", l: "Decisions"}, {v: "lane", l: "Lanes"} ]
+     | map("<button type=\"button\" data-kind=\"\(.v)\"\(if .v == "all" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | join(""))
+  + "</div>"
+  + "<span class=\"shown\" id=\"inbox-shown\"></span>"
+  + "</div>"
+  + "<ol class=\"items\" id=\"inbox-list\">"
+  + ([ $inbox[] | inbox_row($names) ] | join(""))
+  + "</ol>"
+  + "<p class=\"cleared\" id=\"inbox-empty\" hidden>Nothing here. Pick another filter.</p>"
+  + "</section>"
++ "<div class=\"grid\" id=\"view-panels\">"
 + panel("review"; "Waiting on you";
     "\($d.counts.ui) to look at, \($d.counts.plan) to read, \($d.counts.decision) to decide";
     ([ $d.awaiting_captain[] | review_row($multi_review; $names) ] | join("")))
 + panel("merge"; "Waiting to merge";
-    "\([$d.merge_queue[] | select(.status == "ready")] | length) ready, \([$d.merge_queue[] | select(.status == "held")] | length) held";
+    "\([$d.merge_queue[] | select(.turn == "captain")] | length) yours, \([$d.merge_queue[] | select(.turn != "captain")] | length) elsewhere";
     ([ $d.merge_queue[] | merge_row($multi_merge; $fetched; $names) ] | join("")))
 + panel("decisions"; "Decisions";
-    "\($d.counts.decisions) open";
+    "\($d.counts.decisions) open"
+    + (if ([$d.awaiting_captain[] | .recommended_count // 0] | add // 0) > 0
+       then ", \([$d.awaiting_captain[] | .recommended_count // 0] | add) recommended"
+       else "" end);
     ([ $with_decisions[] | decision_group($names) ] | join("")))
 + panel("flight"; "In flight";
     "\($d.counts.in_flight_live) working, \($d.counts.in_flight - $d.counts.in_flight_live) finished";
@@ -1162,6 +1572,62 @@ render_tail() {  # <state-json>
       }, { passive: true });
     }
   });
+
+  // Two views over one state document: the panel board, and the experimental
+  // inbox. The choice, and the inbox filters, survive the refresh reload so a
+  // reload never drops the captain back into a view he did not pick.
+  var remember = function (key, value) {
+    try { if (store) { store.setItem('mc.' + key, value); } } catch (e) {}
+  };
+  var recall = function (key, fallback) {
+    try { return (store && store.getItem('mc.' + key)) || fallback; } catch (e) { return fallback; }
+  };
+
+  var views = { panels: document.getElementById('view-panels'),
+                inbox: document.getElementById('view-inbox') };
+  var showView = function (name) {
+    if (!views[name]) { name = 'panels'; }
+    Object.keys(views).forEach(function (k) {
+      if (views[k]) { views[k].hidden = (k !== name); }
+    });
+    document.querySelectorAll('.views button').forEach(function (b) {
+      b.classList.toggle('on', b.getAttribute('data-view') === name);
+    });
+    remember('view', name);
+  };
+  document.querySelectorAll('.views button').forEach(function (b) {
+    b.addEventListener('click', function () { showView(b.getAttribute('data-view')); });
+  });
+
+  var filters = { turn: recall('filter.turn', 'captain'), kind: recall('filter.kind', 'all') };
+  var shown = document.getElementById('inbox-shown');
+  var emptyNote = document.getElementById('inbox-empty');
+  var applyFilters = function () {
+    var visible = 0, total = 0;
+    document.querySelectorAll('#inbox-list .item').forEach(function (li) {
+      total += 1;
+      var okTurn = filters.turn === 'all' || li.getAttribute('data-turn') === filters.turn;
+      var okKind = filters.kind === 'all' || li.getAttribute('data-kind') === filters.kind;
+      li.hidden = !(okTurn && okKind);
+      if (!li.hidden) { visible += 1; }
+    });
+    if (shown) { shown.textContent = visible + ' of ' + total; }
+    if (emptyNote) { emptyNote.hidden = visible !== 0; }
+    document.querySelectorAll('.fgroup button').forEach(function (b) {
+      var group = b.parentNode.getAttribute('data-filter');
+      b.classList.toggle('on', b.getAttribute('data-' + group) === filters[group]);
+    });
+  };
+  document.querySelectorAll('.fgroup button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var group = b.parentNode.getAttribute('data-filter');
+      filters[group] = b.getAttribute('data-' + group);
+      remember('filter.' + group, filters[group]);
+      applyFilters();
+    });
+  });
+  applyFilters();
+  showView(recall('view', 'panels'));
 
   // A visible countdown, so a page that looks static is provably still live.
   var meta = document.querySelector('meta[http-equiv="refresh"]');
