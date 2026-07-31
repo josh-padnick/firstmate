@@ -52,7 +52,8 @@
 #
 # Environment:
 #   FM_DASHBOARD_PR_TTL       seconds before cached PR data reads stale (900)
-#   FM_DASHBOARD_COMPLETED    completed rows to keep (8)
+#   FM_DASHBOARD_COMPLETED    landed rows the document carries (20); the page
+#                             shows six and puts the rest behind "View N older"
 #   FM_DASHBOARD_NOW          ISO-8601 UTC override for a deterministic stamp
 #
 # ---------------------------------------------------------------------------
@@ -70,7 +71,9 @@
 #            in_flight_live, completed, notices},
 #
 # The page renders this document TWICE, as two views the captain can switch
-# between: the panel board, and an experimental inbox - one list of what is his
+# between: the BOARD - one dominant "Needs your attention" queue over compact
+# active-work and landed summaries, with detail behind expansion - and an
+# experimental inbox - one list of what is his
 # turn, filtered by type and by turn, whose count is the size of the queue and
 # shrinks as he works through it. Both views read the same arrays, so they can
 # never disagree about what is waiting.
@@ -78,7 +81,23 @@
 #   TURN - carried by every merge_queue, awaiting_captain and in_flight item:
 #     {turn: captain|worker|external, waiting_for, turn_reason, headline,
 #      action: merge|look|read|decide|null, since, since_source: backlog|status-log|null,
-#      activity: {text, source: run-step|status-log|state, state}}
+#      since_epoch, age_seconds,
+#      activity: {text, source: run-step|status-log|state, state},
+#      attended: true|false|null, attended_by: pipeline|worker|null,
+#      attended_evidence: run-step|live-endpoint|no-endpoint|idle-endpoint|unverified}
+#     ATTENDANCE answers "is a fix actually in progress?", because blocked-and-
+#     being-worked and blocked-and-stalled are different situations for the
+#     captain. `true` needs positive evidence - an attributed pipeline run that
+#     is running, or a worker the backend reports busy; a session that merely
+#     exists is not someone working. `false` means nobody is on it, which is
+#     said outright rather than implied by silence. `null` means we could not
+#     verify, and is rendered as its own state so neither answer is guessed.
+#     Items also carry `stuck`: true when a worker reported `blocked:` (it needs
+#     help) as opposed to `needs-decision:` (it is waiting on the captain by
+#     design). Stuck work sorts ahead of merely old work.
+#     `age_seconds` exists so a renderer can say "12 min ago" without parsing
+#     dates: jq 1.6's own date functions are an hour out under daylight time, so
+#     every epoch here is resolved in shell.
 #     `headline` is the one line that says which of the two situations this is -
 #     "Yours to review and merge" or "Blocked on <the concrete thing>" - so the
 #     difference is read, never inferred.
@@ -163,7 +182,7 @@ PR_CACHE="$STATE/dashboard-prs.json"
 SCHEMA="fm-mission-control.v1"
 
 PR_TTL=${FM_DASHBOARD_PR_TTL:-900}
-COMPLETED_MAX=${FM_DASHBOARD_COMPLETED:-8}
+COMPLETED_MAX=${FM_DASHBOARD_COMPLETED:-20}
 
 MODE=files
 OUT_DIR=""
@@ -470,22 +489,57 @@ def turn_of($who; $waiting; $reason; $action):
 # attributed, then the worker's latest words - which is where "rebasing",
 # "fixing merge conflicts" and "responding to review comments" actually come
 # from - and only then the bare state word.
+#
+# The run-step phrases match the detail vocabulary bin/fm-crew-state.sh actually
+# emits ("validating (fixing)", "ci running", "parked at <gate>") rather than
+# invented labels, so "a fix is running" is never guessed from a busy pane.
 def activity_of($task):
   ($task.current_state.state // "unknown") as $st
   | ($task.current_state.source // "none") as $src
   | ($task.current_state.detail // "") as $detail
   | (($task.paths.status_log.events // [])[0] // null) as $latest
   | if $src == "run-step" and $st == "working"
-    then {text: (if ($detail | test("ci|check"; "i"))
-                 then "waiting on CI checks" else "running validation" end),
+    then {text: (if ($detail | test("fixing"; "i"))
+                 then "fixing the defects review found"
+                 elif ($detail | test("^ci |ci running|checks"; "i"))
+                 then "waiting on CI checks"
+                 else "running validation" end),
           source: "run-step"}
     elif $src == "run-step" and $st == "parked"
-    then {text: "waiting on a decision at a review gate", source: "run-step"}
+    then {text: (if ($detail | test("ask-user"; "i"))
+                 then "waiting on a decision only you can make"
+                 else "waiting at a review gate" end),
+          source: "run-step"}
+    elif $src == "run-step" and $st == "failed"
+    then {text: "validation stopped", source: "run-step"}
     elif $latest != null and ($latest.note // "") != ""
     then {text: ($latest.note | clip(160)), source: "status-log"}
     elif $st == "done" then {text: "finished, waiting to land", source: "state"}
     else {text: ("no recent activity recorded"), source: "state"} end
   | . + {state: $st};
+
+# Is anyone actually on this right now? Blocked-and-being-fixed and
+# blocked-and-stalled are different situations for the captain, and silence
+# about ownership is the failure mode - so `attended: null` means we could not
+# verify and must SAY so, never quietly imply either answer.
+#
+# Positive attendance needs positive evidence: an attributed pipeline run that
+# is actually running, or a worker the backend reports busy. A session that
+# merely exists is not someone working.
+def attendance_of($task):
+  ($task.current_state.state // "unknown") as $st
+  | ($task.current_state.source // "none") as $src
+  | ($task.endpoint.exists) as $endpoint
+  | if $src == "run-step" and $st == "working"
+    then {attended: true, attended_by: "pipeline", attended_evidence: "run-step"}
+    elif $src == "pane" and $st == "working"
+    then {attended: true, attended_by: "worker", attended_evidence: "live-endpoint"}
+    elif $endpoint == false
+    then {attended: false, attended_by: null, attended_evidence: "no-endpoint"}
+    elif $endpoint == null
+    then {attended: null, attended_by: null, attended_evidence: "unverified"}
+    else {attended: false, attended_by: null, attended_evidence: "idle-endpoint"}
+    end;
 
 # The recommended answer a plan already stated, so a decision can be answered
 # here instead of hunted for. Real holds phrase it as "Option A, recommended: X",
@@ -501,12 +555,20 @@ def recommendation_of($text):
         end
     end;
 
+# How long this has been waiting, plus the age the renderer turns into "12 min
+# ago" or "yesterday". Epochs are resolved in bash, never in jq: jq 1.6's
+# strptime/mktime and fromdateiso8601 both apply local daylight rules, which is
+# the same hour-out bug already recorded for the generated stamp.
 def since_of($backlog_date; $id):
-  if ($backlog_date // "") != ""
-  then {since: $backlog_date, since_source: "backlog"}
-  elif ($mtimes[0][$id] // null) != null
-  then {since: ($mtimes[0][$id] | todate), since_source: "status-log"}
-  else {since: null, since_source: null} end;
+  (if ($backlog_date // "") != ""
+   then {since: $backlog_date, since_source: "backlog",
+         since_epoch: ($dates[0][$backlog_date] // null)}
+   elif ($mtimes[0][$id] // null) != null
+   then {since: ($mtimes[0][$id] | todate), since_source: "status-log",
+         since_epoch: $mtimes[0][$id]}
+   else {since: null, since_source: null, since_epoch: null} end)
+  | . + {age_seconds: (if .since_epoch == null then null
+                       else ($now_epoch - .since_epoch) end)};
 
 $snap[0] as $s
 | $prs[0] as $prcache
@@ -548,6 +610,7 @@ $snap[0] as $s
         | map(select(. != null and . != "")) | join(" ")) as $text
      | {origin: $origin, key: $key, id: $r.id,
         question: (($r.title | nn) // ($r.hold_reason | nn) // $r.id),
+        stuck: false,
         recommendation: recommendation_of($text),
         recommendation_source: (if recommendation_of($text) == null then null else "hold" end),
         context: (($hold | nn) // ($r.hold_reason | nn)),
@@ -563,7 +626,11 @@ $snap[0] as $s
         question: (.summary | trim | clip(240)),
         recommendation: recommendation_of(.summary),
         recommendation_source: (if recommendation_of(.summary) == null then null else "status" end),
-        context: null, since: null, repo: ($t.backlog.repo | nn)}
+        context: null, since: null, repo: ($t.backlog.repo | nn),
+        # A `blocked:` report means the worker is stuck and needs help; a
+        # `needs-decision:` is waiting on the captain by design. Only the
+        # former makes "is anyone on it?" the deciding question.
+        stuck: (.verb == "blocked")}
    ]
    # A decision firstmate already filed as a durable captain hold is the same
    # decision; the durable record wins so the queue never double-counts it.
@@ -611,12 +678,14 @@ $snap[0] as $s
                               # answerable in place rather than research to do.
                               reasoning: (if .recommendation == null then (.context | nn) else null end)} ],
         decision_count: ($ds | length),
+        stuck: (($ds | map(.stuck // false) | any)),
         recommended_count: ([ $ds[] | select(.recommendation != null) ] | length),
         evidence: (($task.hints.last_event_text | nn) // ($brec.raw | nn) // null)
       }
     # An ask whose lane went back to work is not the captain's turn yet, however
     # it is listed: the worker has moved past it.
     + {activity: activity_of($task)}
+    + attendance_of($task)
     + (if ($task.current_state.state // "") == "working"
        then turn_of("worker"; "the worker finishing this pass";
                     "its lane is working again"; null)
@@ -663,6 +732,7 @@ $snap[0] as $s
         evidence: ($t.hints.last_event_text | nn)
       }
     + {activity: activity_of($t)}
+    + attendance_of($t)
     + turn_of("captain";
               (if type_for($link; $kind) == "ui" then "you to look at it"
                else "you to read it" end);
@@ -737,6 +807,7 @@ $snap[0] as $s
         source: $ref.source
       }
     + {activity: activity_of($task)}
+    + attendance_of($task)
     # Whose turn a pull request is has nothing to do with it being open. A lane
     # still running its pipeline owes the next move, checks that have not
     # reported are owed by CI, and only a PR nobody else is working on is
@@ -806,6 +877,7 @@ $snap[0] as $s
                 | {state: .state, note: (.note | trim | clip(220)), raw: .raw} ]
       }
     + {activity: activity_of($t)}
+    + attendance_of($t)
     + (if ((($t.hints.open_decisions // []) | length) > 0)
        then turn_of("captain"; "your decision"; "it asked you a question"; "decide")
        elif $st == "parked"
@@ -832,13 +904,13 @@ $snap[0] as $s
 
 # ---- recently landed --------------------------------------------------------
 | ([ ($backlog[] | select(.state == "done")
-      | {id: .id, title: (.title | nn // .id),
+      | {id: .id, title: ((.title | nn) // .id),
          when: ((.completion.date | nn) // (.merged | nn) // (.done | nn) // (.reported | nn)),
          verb: ((.completion.verb | nn) // "done"),
          project: (.repo | nn),
          url: (.pr_url | nn), source: "main"}),
      (($s.secondmate_landed.records // [])[]
-      | {id: .id, title: (.title | nn // .id),
+      | {id: .id, title: ((.title | nn) // .id),
          when: ((.completion.date | nn) // (.merged | nn) // (.done | nn)),
          verb: ((.completion.verb | nn) // "done"),
          project: (.repo | nn),
@@ -962,6 +1034,27 @@ EOF
 # time is when that event was recorded - the honest answer to "how long has this
 # been sitting". Durable backlog dates are preferred where they exist; this is
 # the fallback, and the document says which of the two it used.
+# Backlog dates are plain calendar days, so their epochs are resolved here for
+# the same reason status mtimes are: jq's own date parsing is an hour out under
+# daylight time. The set is small - a handful of distinct days across a backlog.
+date_epochs() {  # <snapshot> -> path to {"YYYY-MM-DD": epoch} JSON
+  local snap=$1 out=$TMPWORK/dates.json d epoch
+  printf '{}' > "$out"
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    epoch=$(TZ=UTC date -j -f '%Y-%m-%d %H:%M:%S' "$d 00:00:00" +%s 2>/dev/null \
+      || date -u -d "$d" +%s 2>/dev/null) || continue
+    [ -n "$epoch" ] || continue
+    jq --arg d "$d" --argjson e "$epoch" '. + {($d): $e}' "$out" > "$out.tmp" \
+      && mv "$out.tmp" "$out"
+  done <<EOF
+$(jq -r '[ .backlog.records[]? | .since, .merged, .done, .reported ]
+         | map(select(. != null and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")))
+         | unique | .[]' "$snap" 2>/dev/null)
+EOF
+  printf '%s' "$out"
+}
+
 status_mtimes() {  # -> path to {id: epoch} JSON
   local out=$TMPWORK/mtimes.json f id epoch
   printf '{}' > "$out"
@@ -977,7 +1070,7 @@ status_mtimes() {  # -> path to {id: epoch} JSON
 }
 
 build_state() {  # <snapshot> <prs> <artifacts> -> state document on stdout
-  local snap=$1 prs=$2 artifacts=$3 generated display epoch fetched_epoch prog mtimes
+  local snap=$1 prs=$2 artifacts=$3 generated display epoch fetched_epoch prog mtimes dates
   generated=$(now_utc)
   display=$(display_stamp "$generated")
   epoch=$(iso_to_epoch "$generated")
@@ -987,12 +1080,14 @@ build_state() {  # <snapshot> <prs> <artifacts> -> state document on stdout
   fetched_epoch=$(iso_to_epoch "$(jq -r '.fetched // ""' "$prs")")
   [ -n "$fetched_epoch" ] || fetched_epoch=0
   mtimes=$(status_mtimes)
+  dates=$(date_epochs "$snap")
   prog=$(write_projection_program)
   jq -n \
     --slurpfile snap "$snap" \
     --slurpfile prs "$prs" \
     --slurpfile artifacts "$artifacts" \
     --slurpfile mtimes "$mtimes" \
+    --slurpfile dates "$dates" \
     --arg schema "$SCHEMA" \
     --arg generated "$generated" \
     --arg display "$display" \
@@ -1046,222 +1141,219 @@ render_css() {
   cat <<'CSS'
   :root {
     color-scheme: light dark;
-    --bg:#f6f5f1; --surface:#fffefb; --ink:#1a1a17; --muted:#6b6a63; --faint:#96958c;
-    --line:#e2e0d8; --hair:#eceae2;
-    --go:#1f6b3f; --go-soft:#e8f0e9; --warn:#8a5a12; --warn-soft:#f6efe1;
-    --stop:#8f2f24; --stop-soft:#f7e8e6; --info:#2b5b8a; --info-soft:#e7eef6;
-    --gap:.55rem; --pad:.8rem;
+    --bg:#f6f5f1; --surface:#fffefb; --ink:#171714; --muted:#56554e; --faint:#7d7c74;
+    --line:#dedcd3; --hair:#e9e7de;
+    --go:#186238; --go-soft:#e6efe8; --warn:#7d500c; --warn-soft:#f6edda;
+    --stop:#8a2b20; --stop-soft:#f8e6e3; --info:#1f5385; --info-soft:#e4edf6;
+    --gap:.7rem; --pad:1rem;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#16161a; --surface:#1e1e23; --ink:#ecebe6; --muted:#9a998f; --faint:#77766e;
-      --line:#33333a; --hair:#2a2a31;
-      --go:#6fbf8b; --go-soft:#1d2f24; --warn:#d6a95c; --warn-soft:#2e2617;
-      --stop:#e08a7d; --stop-soft:#331e1b; --info:#7fb0e0; --info-soft:#1a2632;
+      --bg:#16161a; --surface:#1e1e23; --ink:#f0efea; --muted:#adaca2; --faint:#8a8980;
+      --line:#35353d; --hair:#2b2b32;
+      --go:#7fcb9b; --go-soft:#1c3025; --warn:#e0b46a; --warn-soft:#302718;
+      --stop:#ec9689; --stop-soft:#37201c; --info:#8dbbe8; --info-soft:#1b2836;
     }
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   html, body { height: 100%; }
   body {
     background: var(--bg); color: var(--ink); overflow: hidden;
-    font: 15px/1.5 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
-    display: flex; flex-direction: column;
-    -webkit-font-smoothing: antialiased;
+    font: 15px/1.45 ui-sans-serif, -apple-system, "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column; -webkit-font-smoothing: antialiased;
   }
+  a { color: inherit; }
 
-  /* --- top bar: chrome, deliberately quieter than any panel heading --- */
+  /* --- chrome: quieter than any content --- */
   .bar {
-    flex: 0 0 auto; display: flex; align-items: baseline; gap: .75rem;
-    padding: .5rem .9rem .45rem; border-bottom: 1px solid var(--line);
+    flex: 0 0 auto; display: flex; align-items: center; gap: .9rem;
+    padding: .55rem var(--pad); border-bottom: 1px solid var(--line);
   }
-  .bar h1 { font-size: .8125rem; font-weight: 700; letter-spacing: -.005em; }
-  .bar .stamp { font-size: .6875rem; color: var(--faint); margin-left: auto; }
-  .bar .stamp b { font-weight: 600; color: var(--muted); }
-
-  /* --- view switch: two ways to read the same state --- */
-  .views { display: flex; gap: .1rem; }
+  .bar h1 { font-size: .875rem; font-weight: 700; letter-spacing: -.005em; }
+  .bar .stamp { font-size: .8125rem; color: var(--faint); margin-left: auto; }
+  .views { display: flex; gap: .15rem; }
   .views button {
-    font: inherit; font-size: .6875rem; font-weight: 600; color: var(--muted);
-    background: none; border: 0; border-radius: 5px; padding: .12rem .45rem;
-    cursor: pointer; display: flex; align-items: center; gap: .3rem;
+    font: inherit; font-size: .8125rem; font-weight: 600; color: var(--muted);
+    background: none; border: 0; border-radius: 6px; padding: .2rem .6rem;
+    cursor: pointer; display: flex; align-items: center; gap: .35rem;
   }
-  .views button:hover { color: var(--ink); }
-  .views button.on { background: var(--bg); color: var(--ink); }
+  .views button:hover { color: var(--ink); background: var(--surface); }
+  .views button.on { background: var(--surface); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line); }
   .views .badge {
-    font-size: .625rem; font-weight: 700; background: var(--go-soft); color: var(--go);
-    border-radius: 8px; padding: 0 .3rem; min-width: 1.1rem; text-align: center;
+    font-size: .75rem; font-weight: 700; background: var(--go-soft); color: var(--go);
+    border-radius: 9px; padding: 0 .35rem; min-width: 1.25rem; text-align: center;
   }
 
-  /* --- inbox: one list to pick the next thing off --- */
-  .inbox { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
-           padding: var(--gap) var(--gap) 0; }
-  .inbox[hidden] { display: none; }
-  .filters {
-    flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center; gap: .5rem;
-    padding: 0 var(--pad) .5rem;
+  /* --- banner: says what is wrong AND offers the way out --- */
+  .banner {
+    flex: 0 0 auto; display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap;
+    padding: .5rem var(--pad); border-bottom: 1px solid var(--line);
+    background: var(--warn-soft); color: var(--warn); font-size: .8125rem;
   }
-  .fgroup { display: flex; gap: .1rem; background: var(--surface); border-radius: 6px; padding: .12rem; }
-  .fgroup button {
-    font: inherit; font-size: .6875rem; font-weight: 600; color: var(--muted);
-    background: none; border: 0; border-radius: 4px; padding: .16rem .5rem; cursor: pointer;
+  .banner .act {
+    font: inherit; font-size: .78125rem; font-weight: 600; cursor: pointer;
+    background: transparent; color: var(--warn); border: 1px solid currentColor;
+    border-radius: 5px; padding: .1rem .5rem;
   }
-  .fgroup button:hover { color: var(--ink); }
-  .fgroup button.on { background: var(--bg); color: var(--ink); }
-  .filters .shown { font-size: .6875rem; color: var(--faint); margin-left: auto; }
-  .items {
-    flex: 1 1 auto; min-height: 0; overflow-y: auto; list-style: none;
-    background: var(--surface); border-radius: 8px; padding: .2rem var(--pad) .6rem;
+  .banner code {
+    font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: .75rem; background: var(--surface); color: var(--ink);
+    padding: .1rem .35rem; border-radius: 4px; user-select: all;
   }
-  .items::-webkit-scrollbar { width: 7px; }
-  .items::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
-  .item { padding: .5rem 0 .55rem; border-top: 1px solid var(--hair); }
-  .item[hidden] { display: none; }
-  .item:first-child { border-top: none; }
-  /* Someone else's turn stays readable but stops competing with the captain's */
-  .item[data-turn="worker"] .t, .item[data-turn="external"] .t {
-    color: var(--muted); font-weight: 500;
-  }
-  .cleared { padding: 1rem var(--pad); color: var(--faint); font-size: .8125rem; }
-  .cleared[hidden] { display: none; }
-  .grid[hidden] { display: none; }
+  .banner code[hidden] { display: none; }
 
-  /* --- notices: the honesty line, only present when there is something --- */
-  .notices {
-    flex: 0 0 auto; display: flex; flex-wrap: wrap; gap: .25rem 1rem;
-    padding: .3rem .9rem; border-bottom: 1px solid var(--line);
-    background: var(--warn-soft); font-size: .6875rem; color: var(--warn);
-  }
+  main { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+         gap: var(--gap); padding: var(--gap) var(--gap) var(--gap); }
+  main[hidden] { display: none; }
 
-  /* --- the console grid: one viewport, panels scroll internally --- */
-  .grid {
-    flex: 1 1 auto; min-height: 0; display: grid; gap: var(--gap); padding: var(--gap);
-    grid-template-columns: 1.32fr 1.04fr 1fr;
-    grid-template-rows: minmax(0, 1.35fr) minmax(0, 1fr);
-    grid-template-areas:
-      "review decisions flight"
-      "merge  decisions landed";
-  }
-  [data-panel="review"]    { grid-area: review; }
-  [data-panel="merge"]     { grid-area: merge; }
-  [data-panel="decisions"] { grid-area: decisions; }
-  [data-panel="flight"]    { grid-area: flight; }
-  [data-panel="landed"]    { grid-area: landed; }
+  /* --- STAMP-S: the queue dominates; everything else is a secondary rail --- */
+  .attention { flex: 2.1 1 0; min-height: 0; }
+  .lower { flex: 1 1 0; min-height: 0; display: grid; gap: var(--gap);
+           grid-template-columns: 1.45fr 1fr; }
+  @media (max-width: 900px) { .lower { grid-template-columns: 1fr; } }
 
-  @media (max-width: 1180px) {
-    .grid {
-      grid-template-columns: 1.25fr 1fr;
-      grid-template-rows: repeat(3, minmax(0, 1fr));
-      grid-template-areas:
-        "review    decisions"
-        "merge     decisions"
-        "flight    landed";
-    }
+  .card { background: var(--surface); border-radius: 10px; min-height: 0;
+          display: flex; flex-direction: column; overflow: hidden; }
+  .card > h2 {
+    flex: 0 0 auto; display: flex; align-items: baseline; gap: .5rem;
+    padding: .6rem var(--pad) .45rem; font-size: .875rem; font-weight: 650;
+    letter-spacing: -.005em; color: var(--ink);
   }
-  @media (max-width: 760px), (max-height: 560px) {
-    body { overflow: auto; }
-    .grid {
-      grid-template-columns: 1fr; grid-template-rows: none;
-      grid-template-areas: none; height: auto;
-    }
-    .grid > * { grid-area: auto !important; min-height: 14rem; }
-  }
-
-  /* --- a panel groups by its heading and its space; the surface exists to
-         say "this region scrolls on its own", not to draw a card --- */
-  .panel {
-    background: var(--surface); border-radius: 8px; min-height: 0;
-    display: flex; flex-direction: column; overflow: hidden;
-  }
-  .panel > h2 {
-    flex: 0 0 auto; display: flex; align-items: baseline; gap: .4rem;
-    padding: .55rem var(--pad) .4rem;
-    font-size: .6875rem; font-weight: 700; text-transform: uppercase;
-    letter-spacing: .07em; color: var(--muted);
-  }
-  .panel > h2 .count { margin-left: auto; font-weight: 500; color: var(--faint);
-                       letter-spacing: 0; text-transform: none; font-size: .6875rem; }
-  .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 var(--pad) .6rem; }
-  .scroll::-webkit-scrollbar { width: 7px; }
+  .card > h2 .count { margin-left: auto; font-size: .8125rem; font-weight: 500; color: var(--muted); }
+  .card > h2 .count b { font-weight: 650; color: var(--ink); }
+  .scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 0 var(--pad) .7rem; }
+  .scroll::-webkit-scrollbar { width: 8px; }
   .scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 4px; }
-  .scroll::-webkit-scrollbar-track { background: transparent; }
 
-  /* --- rows: hairline rhythm, no boxes; the accent edge is spent only on
-         something the captain must act on --- */
-  .row { padding: .42rem 0 .45rem; border-top: 1px solid var(--hair); }
-  .row:first-child { border-top: none; }
-  .row.act { border-left: 2px solid var(--go); padding-left: .5rem; margin-left: -.5rem; }
-  .row.held { border-left: 2px solid var(--warn); padding-left: .5rem; margin-left: -.5rem; }
-  .row.stopped { border-left: 2px solid var(--stop); padding-left: .5rem; margin-left: -.5rem; }
-  .t { font-size: .8125rem; font-weight: 600; line-height: 1.35; }
-  .t a { color: inherit; text-decoration: none; }
-  .t a:hover { text-decoration: underline; text-underline-offset: 2px; }
-  .m { font-size: .71875rem; color: var(--muted); line-height: 1.4; margin-top: .1rem; }
-  .m .sep { color: var(--faint); padding: 0 .3rem; }
-  .why { font-size: .71875rem; color: var(--warn); line-height: 1.4; margin-top: .12rem; }
-  .why.stop { color: var(--stop); }
-  /* whose move it is, stated rather than implied */
-  .mine { font-size: .71875rem; color: var(--go); font-weight: 600; margin-top: .12rem; }
-  /* the recommended answer, so a decision can be answered without leaving */
-  .rec, .because {
-    display: block; font-size: .71875rem; line-height: 1.4; margin-top: .1rem;
-    padding-left: .55rem; border-left: 2px solid var(--go-soft); color: var(--ink);
+  /* --- the queue row: aligned columns, one obvious action --- */
+  .item { border-top: 1px solid var(--hair); }
+  .item:first-child { border-top: none; }
+  .item > summary, .item > .line {
+    display: grid; align-items: baseline; gap: .75rem;
+    grid-template-columns: 5.75rem minmax(0, 1fr) minmax(0, 15rem) 5.5rem 5.25rem;
+    padding: .7rem .35rem .75rem; cursor: pointer; list-style: none;
+    border-radius: 7px;
   }
-  .because { border-left-color: var(--line); color: var(--muted); }
+  .item > summary::-webkit-details-marker { display: none; }
+  .item > summary:hover, .item > .line:hover { background: var(--bg); }
+  .item > summary:focus-visible, .item > .line:focus-visible,
+  .item.here > summary, .item.here > .line {
+    background: var(--bg); outline: 2px solid var(--info); outline-offset: -2px;
+  }
+  .item .title { font-size: .9375rem; font-weight: 600; line-height: 1.35; }
+  .item .title a { text-decoration: none; }
+  .item .title a:hover { text-decoration: underline; text-underline-offset: 2px; }
+  .item .why, .item .when { font-size: .8125rem; color: var(--muted); line-height: 1.45; }
+  .item .when { text-align: right; font-variant-numeric: tabular-nums; }
+  .item .go {
+    justify-self: end; font-size: .8125rem; font-weight: 600; color: var(--go);
+    border: 1px solid var(--go); border-radius: 6px; padding: .12rem .5rem;
+    text-decoration: none; white-space: nowrap;
+  }
+  .item .go:hover { background: var(--go-soft); }
+  .item[open] > summary { background: var(--bg); }
+  .detail { padding: .1rem .35rem .8rem 6.5rem; }
+  @media (max-width: 1100px) {
+    .item > summary, .item > .line { grid-template-columns: 5.75rem minmax(0,1fr) 4.5rem 5.25rem; }
+    .item .why { grid-column: 2 / -1; grid-row: 2; }
+    .detail { padding-left: .35rem; }
+  }
 
-  /* --- chips: the state is a word first; tone only reinforces it --- */
+  /* --- STAMP-P: a word first, a tone second --- */
   .chip {
-    display: inline-block; font-size: .5875rem; font-weight: 700; letter-spacing: .06em;
-    text-transform: uppercase; padding: .1rem .3rem .05rem; border-radius: 3px;
-    vertical-align: .08em; margin-right: .35rem;
+    justify-self: start; font-size: .75rem; font-weight: 650; letter-spacing: .01em;
+    padding: .12rem .45rem .16rem; border-radius: 5px; white-space: nowrap;
     background: var(--info-soft); color: var(--info);
   }
-  .chip.go { background: var(--go-soft); color: var(--go); }
-  .chip.warn { background: var(--warn-soft); color: var(--warn); }
-  .chip.stop { background: var(--stop-soft); color: var(--stop); }
-  .chip.quiet { background: transparent; color: var(--faint);
-                border: 1px solid var(--line); }
+  .chip.merge { background: var(--go-soft); color: var(--go); }
+  .chip.decide { background: var(--warn-soft); color: var(--warn); }
+  .chip.blocked { background: var(--stop-soft); color: var(--stop); }
+  .chip.working { background: var(--bg); color: var(--muted); box-shadow: inset 0 0 0 1px var(--line); }
+  .chip.done { background: transparent; color: var(--faint); box-shadow: inset 0 0 0 1px var(--line); }
 
-  /* --- decisions: grouped by the work they came from --- */
-  .group { padding: .45rem 0 .5rem; border-top: 1px solid var(--hair); }
-  .group:first-child { border-top: none; }
-  .group h3 { font-size: .75rem; font-weight: 600; margin-bottom: .15rem; }
-  .group h3 a { color: inherit; text-decoration: none; }
-  .group h3 a:hover { text-decoration: underline; text-underline-offset: 2px; }
-  .group ol { list-style: none; counter-reset: d; }
-  .group li {
-    font-size: .71875rem; color: var(--muted); line-height: 1.4;
-    padding: .16rem 0 .22rem 1.1rem; text-indent: -1.1rem;
-  }
-  .group li::before {
-    counter-increment: d; content: counter(d) ". ";
-    color: var(--faint); font-variant-numeric: tabular-nums;
-  }
-  .group li .q { color: var(--ink); }
-  .group li .rec, .group li .because { text-indent: 0; margin-left: 0; }
+  /* --- blocked is three states, never one amber chip --- */
+  .att { font-size: .8125rem; line-height: 1.45; }
+  .item .att { grid-column: 2 / -1; margin-top: .18rem; }
+  .att .dot { display: inline-block; width: .45rem; height: .45rem; border-radius: 50%;
+              margin-right: .35rem; vertical-align: .04em; background: currentColor; }
+  .att.fixing { color: var(--muted); }
+  .att.stalled { color: var(--stop); font-weight: 600; }
+  .att.unverified { color: var(--warn); }
 
-  /* --- lanes and their activity feeds --- */
-  .lane { padding: .45rem 0 .5rem; border-top: 1px solid var(--hair); }
+  /* --- decisions live inside their plan's row --- */
+  .qs { list-style: none; }
+  .qs li { padding: .3rem 0 .35rem; border-top: 1px solid var(--hair); }
+  .qs li:first-child { border-top: none; }
+  .qs .q { font-size: .875rem; color: var(--ink); line-height: 1.4; }
+  .qs .rec, .qs .because {
+    display: block; font-size: .8125rem; line-height: 1.45; margin-top: .15rem;
+    padding-left: .6rem; border-left: 2px solid var(--go-soft); color: var(--muted);
+  }
+  .qs .rec { border-left-color: var(--go); color: var(--ink); }
+  .next { font-size: .8125rem; color: var(--muted); line-height: 1.45; }
+
+  /* --- active work: one row per workstream, timeline behind expansion --- */
+  .lane { border-top: 1px solid var(--hair); }
   .lane:first-child { border-top: none; }
-  .lane h3 { font-size: .75rem; font-weight: 600; line-height: 1.35; }
-  /* a finished lane stays readable but stops competing with work under way */
-  .lane.quiet h3 { color: var(--muted); font-weight: 500; }
-  .lane.quiet .feed li:first-child .n { color: var(--muted); }
-  .feed { list-style: none; margin-top: .18rem; }
-  .feed li { display: flex; gap: .4rem; align-items: baseline; padding: .06rem 0; }
-  .feed .v {
-    flex: 0 0 4.1rem; font-size: .5875rem; font-weight: 700; text-transform: uppercase;
-    letter-spacing: .05em; color: var(--faint); text-align: right; white-space: nowrap;
+  .lane > summary {
+    padding: .6rem .35rem .65rem; cursor: pointer; list-style: none; border-radius: 7px;
   }
+  .lane > summary::-webkit-details-marker { display: none; }
+  .lane > summary:hover { background: var(--bg); }
+  .lane .name { font-size: .9375rem; font-weight: 600; line-height: 1.35; }
+  .lane .sub { font-size: .8125rem; color: var(--muted); line-height: 1.45; margin-top: .12rem;
+               display: flex; flex-wrap: wrap; gap: .4rem; align-items: baseline; }
+  .lane.quiet .name { color: var(--muted); font-weight: 500; }
+  .feed { list-style: none; padding: 0 .35rem .7rem 1rem; }
+  .feed li { display: flex; gap: .6rem; align-items: baseline; padding: .18rem 0;
+             font-size: .8125rem; color: var(--muted); line-height: 1.45; }
+  .feed .v { flex: 0 0 5rem; color: var(--faint); font-weight: 600; text-align: right; }
   .feed .v.done { color: var(--go); }
-  .feed .v.needs-decision, .feed .v.paused { color: var(--warn); }
+  .feed .v.decision, .feed .v.paused { color: var(--warn); }
   .feed .v.blocked, .feed .v.failed { color: var(--stop); }
-  .feed .n {
-    flex: 1 1 auto; min-width: 0; font-size: .6875rem; color: var(--muted);
-    line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .feed li:first-child .n { color: var(--ink); }
 
-  .empty { font-size: .75rem; color: var(--faint); padding: .5rem 0; }
+  /* --- landed --- */
+  .landed { border-top: 1px solid var(--hair); padding: .5rem .35rem .55rem; }
+  .landed:first-child { border-top: none; }
+  .landed .t { font-size: .875rem; line-height: 1.4; }
+  .landed .t a { text-decoration: none; }
+  .landed .m { font-size: .8125rem; color: var(--muted); margin-top: .1rem; }
+  .older > summary { cursor: pointer; list-style: none; font-size: .8125rem;
+                     font-weight: 600; color: var(--info); padding: .5rem .35rem; }
+  .older > summary::-webkit-details-marker { display: none; }
+
+  .sep { color: var(--faint); }
+  .empty { padding: 1.6rem .35rem; text-align: center; }
+  .empty .big { font-size: 1.0625rem; font-weight: 650; color: var(--go); }
+  .empty .small { font-size: .875rem; color: var(--muted); margin-top: .25rem; }
+  .hint { font-size: .78125rem; color: var(--faint); padding: .45rem .35rem 0; }
+
+  /* --- inbox --- */
+  .filters { flex: 0 0 auto; display: flex; flex-wrap: wrap; align-items: center;
+             gap: .5rem 1.1rem; padding: 0 var(--pad) .55rem; }
+  .fset { display: flex; align-items: center; gap: .4rem; }
+  .fset > .lab { font-size: .78125rem; color: var(--faint); font-weight: 600; }
+  .fgroup { display: flex; gap: .15rem; background: var(--bg); border-radius: 7px; padding: .15rem; }
+  .fgroup button {
+    font: inherit; font-size: .8125rem; font-weight: 600; color: var(--muted);
+    background: none; border: 0; border-radius: 5px; padding: .18rem .55rem; cursor: pointer;
+  }
+  .fgroup button:hover { color: var(--ink); }
+  .fgroup button.on { background: var(--surface); color: var(--ink);
+                      box-shadow: inset 0 0 0 1px var(--line); }
+  .fgroup button .n { color: var(--faint); font-weight: 500; margin-left: .25rem; }
+  .fgroup button.on .n { color: var(--muted); }
+  .filters .shown { margin-left: auto; font-size: .8125rem; color: var(--faint); }
+  .group-head { font-size: .78125rem; font-weight: 650; color: var(--muted);
+                padding: .8rem .35rem .3rem; }
+  .group-head:first-child { padding-top: .2rem; }
+
+  @media (max-width: 760px), (max-height: 560px) {
+    body { overflow: auto; }
+    main { height: auto; }
+    .attention, .lower { flex: none; }
+    .card { min-height: 12rem; }
+  }
 CSS
 }
 
@@ -1269,281 +1361,265 @@ write_render_program() {  # -> path to the jq render program
   local prog=$TMPWORK/render.jq
   cat > "$prog" <<'JQ'
 def e: (. // "") | tostring | @html;
-def chip($cls; $word): "<span class=\"chip \($cls)\">\($word | e)</span>";
-def sep: "<span class=\"sep\">·</span>";
 def norm: ascii_downcase | gsub("[^a-z0-9]"; "");
 def clip($n):
   if . == null then null
   elif (. | length) <= $n then .
   else (.[0:$n] | sub("[[:space:]][^[:space:]]*$"; "")) + "…" end;
 
-# The state document keeps the full backlog title; the page shows a label. A
-# leading project name repeated on every row of a single-project fleet is noise,
-# and a title that wraps to three lines costs a row the captain could have
-# scanned in one, so the prefix comes off and the rest is clipped.
+# Null-tolerant on purpose: one odd record must never blank the whole page.
 def shorten($t; $projects; $n):
-  ([ $projects[]? | select(. != null) | split("/") | last | norm ]) as $ps
+  (($t // "") | tostring) as $t
+  | ([ $projects[]? | select(. != null) | split("/") | last | norm ]) as $ps
   | (if ($t | test("^[^:]{1,40}:"))
         and (($t | split(":")[0] | norm) as $h | $ps | index($h)) != null
      then ($t | sub("^[^:]*:[[:space:]]*"; ""))
      else $t end)
   | clip($n);
 
-# A feed line is meant to read as prose. An absolute path or URL inside it is
-# navigation the captain cannot click here anyway, so it collapses to the file
-# name the worker was talking about.
 def readable:
   (. // "")
-  # A pull request URL reads as its number, which is how the captain refers to
-  # it; any other URL is not clickable from a feed line, so it just says so.
   | gsub("https?://[^[:space:],;)\\]\"'<>]*/(pull|merge_requests)/(?<n>[0-9]+)"; "#\(.n)")
   | gsub("https?://[^[:space:],;)\\]\"'<>]+"; "a link")
-  # Any token that carries a slash AND ends in a file extension is a path,
-  # absolute or relative, with or without a file:// prefix. Collapse it to the
-  # file name; leave owner/repo pairs and other slashed words alone.
   | gsub("(file://)?[^[:space:],;)\\]\"'<>]*/(?<file>[^[:space:]/,;)\\]\"'<>]+\\.[A-Za-z0-9]{1,6})";
         "\(.file)")
   | sub("^[[:space:]]+"; "");
 
-# needs-decision is the only verb that will not fit the feed's gutter, and the
-# thing it names to a captain is a decision.
-def verb_label: if . == "needs-decision" then "decision" else . end;
+# Human elapsed time. The captain reads "2d", not an ISO date.
+def ago($s):
+  if $s == null then "-"
+  elif $s < 90 then "just now"
+  elif $s < 3600 then "\(($s / 60) | floor)m"
+  elif $s < 86400 then "\(($s / 3600) | floor)h"
+  elif $s < 172800 then "yesterday"
+  else "\(($s / 86400) | floor)d" end;
+
+# Every link the captain follows from the queue opens in a new tab: he works
+# from this page and must not lose it.
 def link($href; $text):
   if $href == null then ($text | e)
-  else "<a href=\"\($href | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\">\($text | e)</a>"
+  else "<a href=\"\($href | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\" target=\"_blank\" rel=\"noopener\">\($text | e)</a>"
   end;
 
-def type_chip:
-  if . == "ui" then chip("go"; "look")
-  elif . == "plan" then chip("info"; "read")
-  else chip("warn"; "decide") end;
+def action_word:
+  if . == "merge" then "Merge" elif . == "look" then "Review"
+  elif . == "read" then "Review" elif . == "decide" then "Decide"
+  else "Waiting" end;
+def action_class:
+  if . == "merge" then "merge" elif . == "decide" then "decide"
+  elif . == null then "working" else "" end;
 
-# An empty metadata line still costs a row of height, so it is never emitted.
-def meta_line($parts):
-  ($parts | map(select(. != null and . != "")) | join("<span class=\"sep\">·</span>")) as $m
-  | if $m == "" then "" else "<div class=\"m\">\($m)</div>" end;
+# Blocked is three states, and the unattended one must be said outright.
+def attention_line:
+  if .attended == true
+  then "<div class=\"att fixing\"><span class=\"dot\"></span>Being worked on now"
+       + "<span class=\"sep\"> · </span>\(.activity.text | readable | clip(90) | e)</div>"
+  elif .attended == false
+  then "<div class=\"att stalled\"><span class=\"dot\"></span>Nobody is working on this"
+       + (if .age_seconds != null then " · unattended \(ago(.age_seconds))" else "" end)
+       + "</div>"
+  else "<div class=\"att unverified\"><span class=\"dot\"></span>Ownership unverified"
+       + "<span class=\"sep\"> · </span>could not confirm whether anyone is on it</div>"
+  end;
 
-def review_row($multi; $names):
-  "<div class=\"row act\">"
-  + "<div class=\"t\">\(.type | type_chip)\(link(.link; shorten(.title; $names + [.project]; 84)))</div>"
-  + meta_line([
-      (if .decision_count > 0
-       then "\(.decision_count) decision\(if .decision_count == 1 then "" else "s" end) open"
-       else empty end),
-      (if .link == null and .note != null then (.note | readable | clip(120) | e) else empty end),
-      (if $multi then (.project // empty | e) else empty end),
-      (if .link == null then "no artifact link recorded" else empty end)
-    ])
-  + "</div>";
+def why_now($fetched):
+  if .row == "pr"
+  then (if .turn == "captain"
+        then (if ($fetched | not) then "checks not fetched"
+              elif .checks.state == "passing" then "checks passing"
+              elif .checks.state == "none" then "no checks"
+              else "checks \(.checks.state)" end)
+        else (.waiting_for | e) end)
+  elif (.decision_count // 0) > 0
+  then "\(.decision_count) question\(if .decision_count == 1 then "" else "s" end)"
+       + (if (.recommended_count // 0) > 0 then " · \(.recommended_count) recommended" else "" end)
+  else (.waiting_for | e) end;
 
-def merge_row($multi; $fetched; $names):
-  # The chip says whose move it is, not merely that the PR is open. Calling a
-  # mid-pipeline PR "ready" is the exact lie this replaces.
-  "<div class=\"row \(if .turn == "captain" then "act" elif .turn == "external" then "" else "held" end)\">"
-  + "<div class=\"t\">"
-  + (if .turn == "captain" and .action == "merge" then chip("go"; "yours")
-     elif .turn == "captain" then chip("warn"; "your call")
-     elif .turn == "external" then chip("quiet"; "checks")
-     else chip("quiet"; "working") end)
-  + link(.url; "#\(.number) \(shorten(.title; $names + [.repo]; 68))")
-  + "</div>"
-  # Whose move it is, said outright, then the concrete thing happening to it -
-  # the difference between "mine to review" and "blocked on something" is what
-  # the captain reads first.
-  + "<div class=\"\(if .turn == "captain" then "mine" else "why" end)\">\(.headline | e)</div>"
-  + (if .turn == "captain" then ""
-     else "<div class=\"m\">\(.activity.text | readable | clip(110) | e)</div>" end)
-  # With no fetched PR data at all, the notice bar already says so once; saying
-  # it again on every row would be repetition without information.
-  + meta_line([
-      (if ($fetched | not) then empty
-       elif .checks.state == "passing" then "checks passing"
-       elif .checks.state == "none" then "no checks"
-       elif .checks.state == "unknown" then "checks unknown"
-       else "checks \(.checks.state)" end),
-      (if $multi then (.repo // empty | e) else empty end)
-    ])
-  + ([ .blockers[] | "<div class=\"why\(if .kind == "checks" or .kind == "worker" then " stop" else "" end)\">\(.text | e)</div>" ] | join(""))
-  + "</div>";
+def type_label:
+  if .row == "pr" then "PR" elif .row == "ui" then "UI"
+  elif .row == "plan" then "Plan" elif .row == "decision" then "Decision"
+  else "Lane" end;
 
-# A decision is answerable here only if the recommendation is here. Where a plan
-# stated one it is shown outright; where it did not, the reasoning that raised
-# the question stands in, so the row is never just a prompt to go research.
-def decision_group($names):
-  "<div class=\"group\"><h3>\(link(.link; shorten(.title; $names + [.project]; 84)))</h3><ol>"
+# The questions inside a plan, shown only when the row is opened: the dashboard
+# summarises state, it does not reproduce everything at rest.
+def questions_block:
+  "<div class=\"detail\"><ul class=\"qs\">"
   + ([ .decisions[]
-       | "<li><span class=\"q\">\(.question | readable | clip(150) | e)</span>"
+       | "<li><span class=\"q\">\(.question | readable | clip(180) | e)</span>"
          + (if .recommendation != null
-            then "<span class=\"rec\">\(.recommendation | readable | clip(190) | e)</span>"
+            then "<span class=\"rec\">Recommended: \(.recommendation | readable | clip(220) | e)</span>"
             elif .reasoning != null
-            then "<span class=\"because\">\(.reasoning | readable | clip(190) | e)</span>"
+            then "<span class=\"because\">\(.reasoning | readable | clip(220) | e)</span>"
             else "" end)
          + "</li>" ] | join(""))
-  + "</ol></div>";
+  + "</ul></div>";
+
+# One row per item. A plan carrying decisions is ONE row - the plan - with its
+# questions folded in behind expansion, never duplicated as separate decision
+# rows.
+def queue_row($names; $fetched):
+  . as $it
+  | (if (.decisions | length) > 0 then "details" else "div" end) as $tag
+  | (if $tag == "details" then "summary" else "div" end) as $inner
+  | "<\($tag) class=\"item\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\" data-age=\"\(.age_seconds // 0)\">"
+  + "<\($inner) class=\"\(if $inner == "div" then "line" else "" end)\" tabindex=\"0\">"
+  + "<span class=\"chip \(.action | action_class)\">\(.action | action_word)</span>"
+  + "<span class=\"title\">\(link(.link // .url; (if .row == "pr" then "#\(.number) " else "" end) + shorten(.title; $names + [.project, .repo]; 92)))</span>"
+  + "<span class=\"why\">\(why_now($fetched))</span>"
+  + "<span class=\"when\">\(ago(.age_seconds))</span>"
+  + (if .link != null or .url != null
+     then "<a class=\"go\" href=\"\((.link // .url) | @uri | gsub("%3A"; ":") | gsub("%2F"; "/"))\" target=\"_blank\" rel=\"noopener\">\(.action | action_word) →</a>"
+     else "<span></span>" end)
+  # Blocked work is where "is anyone on it?" decides whether the captain steps
+  # in, so it is answered on the row itself rather than behind expansion. A PR
+  # that is simply his to merge needs no such line.
+  + (if (.stuck // false) or ((.state // "") | IN("blocked", "failed")) or .turn != "captain"
+     then attention_line else "" end)
+  + "</\($inner)>"
+  + (if $tag == "details" then questions_block else "" end)
+  + "</\($tag)>";
 
 def lane_row($names):
-  "<div class=\"lane\(if .live then "" else " quiet" end)\">"
-  + "<h3>"
-  + (if .needs_captain then chip("warn"; (.state | verb_label))
-     elif (.live | not) then chip("quiet"; .state)
-     elif .state == "working" then chip("go"; .state)
-     else chip("quiet"; .state) end)
-  + (shorten(.title; $names + [.project]; 62) | e) + "</h3>"
-  + (if (.feed | length) == 0
-     then "<div class=\"m\">no activity recorded yet</div>"
-     else "<ul class=\"feed\">"
-          + ([ .feed[]
-               | "<li><span class=\"v \(.state | e)\">\(.state | verb_label | e)</span>"
-                 + "<span class=\"n\">\(.note | readable | e)</span></li>" ] | join(""))
-          + "</ul>"
-     end)
-  + "</div>";
-
-# --- the experimental inbox view -------------------------------------------
-# One list, not five panels: the next thing to pick off, with filters. Built
-# from the same three arrays the panels use, so the two views can never disagree
-# about what is waiting.
-def inbox_rows:
-  ([ (.merge_queue[] | . + {row: "pr", label: "Pull request"}),
-     (.awaiting_captain[] | . + {row: .type,
-        label: (if .type == "ui" then "UI preview"
-                elif .type == "plan" then "Plan" else "Decision" end)}),
-     (.in_flight[] | . + {row: "lane", label: "Lane"}) ]
-   # One lane blocked on one question is one thing to do, so the more specific
-   # ask wins over the pull request or lane that is waiting on it.
-   | group_by(.id)
-   | map(sort_by(if .row == "pr" then 1 elif .row == "lane" then 2 else 0 end) | .[0])
-   | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
-              (.since // "0000"), .id])
-   | reverse
-   | sort_by(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end));
-
-def action_chip:
-  if . == "merge" then chip("go"; "merge")
-  elif . == "look" then chip("go"; "look")
-  elif . == "read" then chip("info"; "read")
-  elif . == "decide" then chip("warn"; "decide")
-  else chip("quiet"; "waiting") end;
-
-def inbox_row($names):
-  "<li class=\"item\" data-turn=\"\(.turn)\" data-kind=\"\(.row)\">"
-  + "<div class=\"t\">\(.action | action_chip)"
-  + link(.link // .url;
-         (if .row == "pr" then "#\(.number) " else "" end)
-         + shorten(.title; $names + [.project, .repo]; 88))
+  "<details class=\"lane\(if .live then "" else " quiet" end)\" data-lane=\"\(.id)\">"
+  + "<summary tabindex=\"0\"><div class=\"name\">\(shorten(.title; $names + [.project]; 74) | e)</div>"
+  + "<div class=\"sub\">"
+  # The vocabulary the captain reads is Blocked / Working / Waiting / Complete.
+  # Raw lane states like `unknown` are internal and never surface here.
+  + (if .state == "blocked" or .state == "failed" then "<span class=\"chip blocked\">Blocked</span>"
+     elif .turn == "captain" then "<span class=\"chip decide\">Needs you</span>"
+     elif .state == "working" then "<span class=\"chip working\">Working</span>"
+     elif .state == "paused" then "<span class=\"chip working\">Waiting</span>"
+     elif .live then "<span class=\"chip working\">Working</span>"
+     else "<span class=\"chip done\">Complete</span>" end)
+  + "<span>\(.activity.text | readable | clip(80) | e)</span>"
+  + "<span class=\"sep\">·</span><span>\(ago(.age_seconds))</span>"
   + "</div>"
-  + "<div class=\"\(if .turn == "captain" then "mine" else "why" end)\">\(.headline | e)</div>"
-  + (if .turn == "captain" then ""
-     else "<div class=\"m\">\(.activity.text | readable | clip(110) | e)</div>" end)
-  # One decision with a recommendation is answerable right here; several are
-  # counted, with how many already carry one.
-  + (if (.decisions | length) == 1 and .decisions[0].recommendation != null
-     then "<div class=\"rec\">\(.decisions[0].recommendation | readable | clip(140) | e)</div>"
-     elif (.decisions | length) == 1 and .decisions[0].reasoning != null
-     then "<div class=\"because\">\(.decisions[0].reasoning | readable | clip(140) | e)</div>"
-     else "" end)
-  + meta_line([
-      (.label | e),
-      (if .since != null
-       then (.since | split("T")[0] | e)
-            + (if .since_source == "status-log" then " (last update)" else "" end)
-       else empty end),
-      # Say how many are already answerable here; saying "0 recommended" would
-      # only add a negative where the questions themselves are the information.
-      (if (.decision_count // 0) > 1
-       then "\(.decision_count) questions"
-            + (if (.recommended_count // 0) > 0
-               then ", \(.recommended_count) recommended" else "" end)
-       else empty end)
-    ])
-  + "</li>";
+  + (if .state == "blocked" or .turn == "captain" then attention_line else "" end)
+  + "</summary>"
+  + (if (.feed | length) == 0 then "<div class=\"hint\">No activity recorded yet.</div>"
+     else "<ul class=\"feed\">"
+          + ([ .feed[] | "<li><span class=\"v \(.state | e)\">\(if .state == "needs-decision" then "decision" else .state end | e)</span>"
+               + "<span>\(.note | readable | clip(150) | e)</span></li>" ] | join(""))
+          + "</ul>" end)
+  + "</details>";
 
 def landed_row($names):
-  "<div class=\"row\"><div class=\"t\">\(link(.url; shorten(.title; $names + [.project]; 84)))</div>"
+  "<div class=\"landed\"><div class=\"t\">\(link(.url; shorten(.title; $names + [.project]; 84)))</div>"
   + "<div class=\"m\">\(.verb | e)\(if .when != null then " \(.when | e)" else "" end)"
-  + (if .source != "main" then "<span class=\"sep\">·</span>\(.source | e)" else "" end)
+  + (if .source != "main" then "<span class=\"sep\"> · </span>\(.source | e)" else "" end)
   + "</div></div>";
 
-def panel($key; $heading; $count; $body):
-  "<section class=\"panel\" data-panel=\"\($key)\">"
-  + "<h2>\($heading)<span class=\"count\">\($count)</span></h2>"
-  + "<div class=\"scroll\" data-scroll=\"\($key)\">"
-  + (if ($body | length) == 0 then "<div class=\"empty\">Nothing waiting.</div>" else $body end)
-  + "</div></section>";
-
 . as $d
-| ([$d.awaiting_captain[] | select(.decision_count > 0)]) as $with_decisions
 | ([ $d.awaiting_captain[].project, $d.merge_queue[].repo,
      $d.in_flight[].project, $d.completed[].project ]
    | map(select(. != null)) | unique) as $names
-# One project inside a panel makes its name pure repetition on every row of that
-# panel; two or more make it the thing that tells two rows apart. Decided per
-# panel, and compared by repository name, so `big-plan` and `owner/big-plan` are
-# not counted as two.
-| (([ $d.awaiting_captain[].project ] | map(select(. != null) | split("/") | last)
-    | unique | length) > 1) as $multi_review
-| (([ $d.merge_queue[].repo ] | map(select(. != null) | split("/") | last)
-    | unique | length) > 1) as $multi_merge
 | ($d.source.pr_data.present) as $fetched
-| ($d | inbox_rows) as $inbox
+| ([ (.merge_queue[] | . + {row: "pr"}),
+     (.awaiting_captain[] | . + {row: .type}),
+     (.in_flight[] | . + {row: "lane", decisions: [], decision_count: 0}) ]
+   # One lane blocked on one question is one thing to do: the specific ask wins
+   # over the pull request or lane waiting on it.
+   | group_by(.id)
+   | map(sort_by(if .row == "pr" then 1 elif .row == "lane" then 2 else 0 end) | .[0])
+   # Whose turn first, then work that is actually stuck, then age. Blocked work
+   # outranks merely old work, which is what "sort by blocked, then age" means.
+   | sort_by([(if .turn == "captain" then 0 elif .turn == "external" then 1 else 2 end),
+              (if (.stuck // false) then 0 else 1 end),
+              (0 - (.age_seconds // 0))])) as $all
+| ([ $all[] | select(.turn == "captain") ]) as $mine
+| ([ $d.in_flight[] | select(.turn != "captain") ]) as $lanes
+
 | "<header class=\"bar\"><h1>Mission control</h1>"
-  + "<nav class=\"views\" role=\"tablist\">"
-  + "<button type=\"button\" data-view=\"panels\" class=\"on\">Panels</button>"
-  + "<button type=\"button\" data-view=\"inbox\">Inbox<span class=\"badge\" id=\"inbox-count\">\($d.counts.inbox)</span></button>"
+  + "<nav class=\"views\">"
+  + "<button type=\"button\" data-view=\"panels\" class=\"on\">Board</button>"
+  + "<button type=\"button\" data-view=\"inbox\">Inbox<span class=\"badge\" id=\"inbox-count\">\($mine | length)</span></button>"
   + "</nav>"
-  + "<p class=\"stamp\">updated <b>\($d.generated_display | e)</b>"
-  + "<span class=\"sep\">·</span>refreshes every \($d.refresh_seconds)s"
-  + "<span class=\"sep\">·</span><span id=\"next\"></span></p></header>"
+  + "<p class=\"stamp\" title=\"Regenerated by fm-dashboard.sh; the page reloads itself every \($d.refresh_seconds)s\">"
+  + "updated \($d.generated_display | e)<span class=\"sep\"> · </span><span id=\"next\"></span></p></header>"
+
 + (if ($d.notices | length) > 0
-   then "<div class=\"notices\">"
-        + ([ $d.notices[] | "<span>\(.text | e)</span>" ] | join(""))
+   then "<div class=\"banner\">"
+        + ([ $d.notices[]
+             | if .kind == "pr-data"
+               then "<span>Pull request checks are not current. Merge readiness may be outdated.</span>"
+                    + "<button type=\"button\" class=\"act\" data-reveal=\"refresh-cmd\">Refresh checks</button>"
+                    + "<code id=\"refresh-cmd\" hidden>bin/fm-dashboard.sh --refresh-prs</code>"
+               else "<span>\(.text | e)</span>" end ] | join(""))
         + "</div>"
    else "" end)
-+ "<section class=\"inbox\" id=\"view-inbox\" hidden>"
+
++ "<main id=\"view-panels\">"
++ "<section class=\"card attention\"><h2>Needs your attention"
+  + "<span class=\"count\"><b>\($mine | length)</b> item\(if ($mine | length) == 1 then "" else "s" end)</span></h2>"
+  + "<div class=\"scroll\" data-scroll=\"attention\" id=\"queue\">"
+  + (if ($mine | length) == 0
+     then "<div class=\"empty\"><div class=\"big\">All caught up</div>"
+          + "<div class=\"small\">Nothing is waiting on you. \($lanes | length) workstream\(if ($lanes | length) == 1 then " is" else "s are" end) still running.</div></div>"
+     else ([ $mine[] | queue_row($names; $fetched) ] | join("")) end)
+  + "</div></section>"
+
++ "<div class=\"lower\">"
++ "<section class=\"card\"><h2>Active work"
+  # Only work that is actually stuck earns an alarm count. Calling every quiet
+  # finished lane "unattended" would cry wolf, which is the same failure as
+  # staying silent about the one that really is stalled.
+  + "<span class=\"count\">"
+  + (([ $lanes[] | select(.attended == false and (.state | IN("blocked", "failed"))) ] | length) as $stuck
+     | if $stuck > 0 then "<b>\($stuck)</b> stuck<span class=\"sep\"> · </span>" else "" end)
+  + "\([ $lanes[] | select(.live) ] | length) running</span></h2>"
+  + "<div class=\"scroll\" data-scroll=\"lanes\">"
+  + (if ($lanes | length) == 0 then "<div class=\"hint\">No workstreams running.</div>"
+     else ([ $lanes[] | lane_row($names) ] | join("")) end)
+  + "</div></section>"
++ "<section class=\"card\"><h2>Recently landed"
+  + "<span class=\"count\">\($d.completed | length)</span></h2>"
+  + "<div class=\"scroll\" data-scroll=\"landed\">"
+  + (if ($d.completed | length) == 0 then "<div class=\"hint\">Nothing landed yet.</div>"
+     else ([ $d.completed[0:6][] | landed_row($names) ] | join(""))
+          + (if ($d.completed | length) > 6
+             then "<details class=\"older\"><summary>View \(($d.completed | length) - 6) older</summary>"
+                  + ([ $d.completed[6:][] | landed_row($names) ] | join(""))
+                  + "</details>"
+             else "" end) end)
+  + "</div></section>"
++ "</div></main>"
+
++ "<main id=\"view-inbox\" hidden><section class=\"card\">"
+  + "<h2>Inbox<span class=\"count\" id=\"inbox-shown\"></span></h2>"
   + "<div class=\"filters\">"
-  + "<div class=\"fgroup\" data-filter=\"turn\">"
+  + "<div class=\"fset\"><span class=\"lab\">Whose turn</span><div class=\"fgroup\" data-filter=\"turn\">"
   + ([ {v: "captain", l: "Mine"}, {v: "external", l: "External"},
        {v: "worker", l: "Worker"}, {v: "all", l: "Everything"} ]
-     | map("<button type=\"button\" data-turn=\"\(.v)\"\(if .v == "captain" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | map(. as $f
+       | ($all | map(select($f.v == "all" or .turn == $f.v)) | length) as $n
+       | "<button type=\"button\" data-turn=\"\($f.v)\"\(if $f.v == "captain" then " class=\"on\"" else "" end)>\($f.l)<span class=\"n\">\($n)</span></button>")
      | join(""))
-  + "</div>"
-  + "<div class=\"fgroup\" data-filter=\"kind\">"
+  + "</div></div>"
+  + "<div class=\"fset\"><span class=\"lab\">Type</span><div class=\"fgroup\" data-filter=\"kind\">"
   + ([ {v: "all", l: "All"}, {v: "pr", l: "PRs"}, {v: "ui", l: "UI"},
        {v: "plan", l: "Plans"}, {v: "decision", l: "Decisions"}, {v: "lane", l: "Lanes"} ]
-     | map("<button type=\"button\" data-kind=\"\(.v)\"\(if .v == "all" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | map(. as $f
+       | ($all | map(select($f.v == "all" or .row == $f.v)) | length) as $n
+       | "<button type=\"button\" data-kind=\"\($f.v)\"\(if $f.v == "all" then " class=\"on\"" else "" end)>\($f.l)<span class=\"n\">\($n)</span></button>")
      | join(""))
+  + "</div></div>"
+  + "<div class=\"fset\"><span class=\"lab\">Sort</span><div class=\"fgroup\" data-filter=\"sort\">"
+  + ([ {v: "priority", l: "Priority"}, {v: "oldest", l: "Oldest"}, {v: "recent", l: "Recently updated"} ]
+     | map("<button type=\"button\" data-sort=\"\(.v)\"\(if .v == "priority" then " class=\"on\"" else "" end)>\(.l)</button>")
+     | join(""))
+  + "</div></div>"
   + "</div>"
-  + "<span class=\"shown\" id=\"inbox-shown\"></span>"
-  + "</div>"
-  + "<ol class=\"items\" id=\"inbox-list\">"
-  + ([ $inbox[] | inbox_row($names) ] | join(""))
-  + "</ol>"
-  + "<p class=\"cleared\" id=\"inbox-empty\" hidden>Nothing here. Pick another filter.</p>"
-  + "</section>"
-+ "<div class=\"grid\" id=\"view-panels\">"
-+ panel("review"; "Waiting on you";
-    "\($d.counts.ui) to look at, \($d.counts.plan) to read, \($d.counts.decision) to decide";
-    ([ $d.awaiting_captain[] | review_row($multi_review; $names) ] | join("")))
-+ panel("merge"; "Waiting to merge";
-    "\([$d.merge_queue[] | select(.turn == "captain")] | length) yours, \([$d.merge_queue[] | select(.turn != "captain")] | length) elsewhere";
-    ([ $d.merge_queue[] | merge_row($multi_merge; $fetched; $names) ] | join("")))
-+ panel("decisions"; "Decisions";
-    "\($d.counts.decisions) open"
-    + (if ([$d.awaiting_captain[] | .recommended_count // 0] | add // 0) > 0
-       then ", \([$d.awaiting_captain[] | .recommended_count // 0] | add) recommended"
-       else "" end);
-    ([ $with_decisions[] | decision_group($names) ] | join("")))
-+ panel("flight"; "In flight";
-    "\($d.counts.in_flight_live) working, \($d.counts.in_flight - $d.counts.in_flight_live) finished";
-    ([ $d.in_flight[] | lane_row($names) ] | join("")))
-+ panel("landed"; "Recently landed";
-    "\($d.counts.completed)";
-    ([ $d.completed[] | landed_row($names) ] | join("")))
-+ "</div>"
+  + "<div class=\"scroll\" data-scroll=\"inbox\" id=\"inbox-list\">"
+  + "<div class=\"group-head\" data-group=\"captain\">Needs action</div>"
+  + ([ $all[] | select(.turn == "captain") | queue_row($names; $fetched) ] | join(""))
+  + "<div class=\"group-head\" data-group=\"other\">For awareness</div>"
+  + ([ $all[] | select(.turn != "captain") | queue_row($names; $fetched) ] | join(""))
+  + "<div class=\"empty\" id=\"inbox-empty\" hidden><div class=\"big\">Nothing here</div>"
+  + "<div class=\"small\">Pick another filter.</div></div>"
+  + "</div></section></main>"
 JQ
   printf '%s' "$prog"
 }
-
 render_tail() {  # <state-json>
   printf '<script type="application/json" id="mission-control-state">\n'
   # The embedded copy is the exact document this page renders. `<` is escaped so
@@ -1552,82 +1628,165 @@ render_tail() {  # <state-json>
   printf '\n</script>\n'
   cat <<'HTML'
 <script>
-// Offline, self-contained behaviour only.
+// Offline, self-contained behaviour only - no network, no framework.
 //
 // The page reloads itself on a <meta refresh> because a file:// page cannot
-// fetch its own data - Chrome blocks fetch and XMLHttpRequest from a file://
-// origin. The page never scrolls, but its panels do, so each panel's scroll
-// offset is carried across that reload instead of being silently reset.
+// fetch its own data: Chrome blocks fetch and XMLHttpRequest from a file://
+// origin. The page never scrolls, but its regions do, so scroll offsets, the
+// chosen view, the filters and every expanded row are carried across that
+// reload rather than being silently reset.
 (function () {
   var store = null;
   try { store = window.sessionStorage; } catch (e) { store = null; }
+  var save = function (k, v) { try { if (store) store.setItem('mc.' + k, v); } catch (e) {} };
+  var load = function (k, d) {
+    try { return (store && store.getItem('mc.' + k)) || d; } catch (e) { return d; }
+  };
 
   document.querySelectorAll('[data-scroll]').forEach(function (el) {
-    var key = 'mc.scroll.' + el.getAttribute('data-scroll');
-    if (store) {
-      var saved = parseInt(store.getItem(key) || '0', 10);
-      if (saved > 0) { el.scrollTop = saved; }
-      el.addEventListener('scroll', function () {
-        try { store.setItem(key, String(el.scrollTop)); } catch (e) {}
-      }, { passive: true });
-    }
+    var key = 'scroll.' + el.getAttribute('data-scroll');
+    var saved = parseInt(load(key, '0'), 10);
+    if (saved > 0) { el.scrollTop = saved; }
+    el.addEventListener('scroll', function () { save(key, String(el.scrollTop)); }, { passive: true });
   });
 
-  // Two views over one state document: the panel board, and the experimental
-  // inbox. The choice, and the inbox filters, survive the refresh reload so a
-  // reload never drops the captain back into a view he did not pick.
-  var remember = function (key, value) {
-    try { if (store) { store.setItem('mc.' + key, value); } } catch (e) {}
-  };
-  var recall = function (key, fallback) {
-    try { return (store && store.getItem('mc.' + key)) || fallback; } catch (e) { return fallback; }
-  };
+  // Expanded rows are the captain's own progressive-disclosure choices; keep them.
+  document.querySelectorAll('details[data-lane], details.item, details.older').forEach(function (d, i) {
+    var key = 'open.' + (d.getAttribute('data-lane') || d.getAttribute('data-kind') || 'x') + '.' + i;
+    if (load(key, '') === '1') { d.open = true; }
+    d.addEventListener('toggle', function () { save(key, d.open ? '1' : '0'); });
+  });
 
   var views = { panels: document.getElementById('view-panels'),
                 inbox: document.getElementById('view-inbox') };
   var showView = function (name) {
     if (!views[name]) { name = 'panels'; }
-    Object.keys(views).forEach(function (k) {
-      if (views[k]) { views[k].hidden = (k !== name); }
-    });
+    Object.keys(views).forEach(function (k) { if (views[k]) views[k].hidden = (k !== name); });
     document.querySelectorAll('.views button').forEach(function (b) {
       b.classList.toggle('on', b.getAttribute('data-view') === name);
     });
-    remember('view', name);
+    save('view', name);
+    setCursor(-1);
   };
   document.querySelectorAll('.views button').forEach(function (b) {
     b.addEventListener('click', function () { showView(b.getAttribute('data-view')); });
   });
 
-  var filters = { turn: recall('filter.turn', 'captain'), kind: recall('filter.kind', 'all') };
+  // --- inbox filters and sort ---
+  var filters = { turn: load('filter.turn', 'captain'),
+                  kind: load('filter.kind', 'all'),
+                  sort: load('filter.sort', 'priority') };
+  var list = document.getElementById('inbox-list');
   var shown = document.getElementById('inbox-shown');
   var emptyNote = document.getElementById('inbox-empty');
+
+  var applySort = function () {
+    if (!list) { return; }
+    ['captain', 'other'].forEach(function (group) {
+      var head = list.querySelector('[data-group="' + group + '"]');
+      if (!head) { return; }
+      var rows = [], n = head.nextElementSibling;
+      while (n && !n.classList.contains('group-head') && n.id !== 'inbox-empty') {
+        rows.push(n); n = n.nextElementSibling;
+      }
+      rows.sort(function (a, b) {
+        var aa = parseInt(a.getAttribute('data-age') || '0', 10);
+        var bb = parseInt(b.getAttribute('data-age') || '0', 10);
+        if (filters.sort === 'oldest') { return bb - aa; }
+        if (filters.sort === 'recent') { return aa - bb; }
+        return bb - aa;
+      });
+      rows.forEach(function (r) { head.parentNode.insertBefore(r, n); });
+    });
+  };
+
   var applyFilters = function () {
+    if (!list) { return; }
     var visible = 0, total = 0;
-    document.querySelectorAll('#inbox-list .item').forEach(function (li) {
+    list.querySelectorAll('.item').forEach(function (el) {
       total += 1;
-      var okTurn = filters.turn === 'all' || li.getAttribute('data-turn') === filters.turn;
-      var okKind = filters.kind === 'all' || li.getAttribute('data-kind') === filters.kind;
-      li.hidden = !(okTurn && okKind);
-      if (!li.hidden) { visible += 1; }
+      var ok = (filters.turn === 'all' || el.getAttribute('data-turn') === filters.turn)
+            && (filters.kind === 'all' || el.getAttribute('data-kind') === filters.kind);
+      el.hidden = !ok;
+      if (ok) { visible += 1; }
+    });
+    // A group heading with nothing under it is noise.
+    list.querySelectorAll('.group-head').forEach(function (h) {
+      var any = false, n = h.nextElementSibling;
+      while (n && !n.classList.contains('group-head') && n.id !== 'inbox-empty') {
+        if (n.classList.contains('item') && !n.hidden) { any = true; }
+        n = n.nextElementSibling;
+      }
+      h.hidden = !any;
     });
     if (shown) { shown.textContent = visible + ' of ' + total; }
     if (emptyNote) { emptyNote.hidden = visible !== 0; }
     document.querySelectorAll('.fgroup button').forEach(function (b) {
-      var group = b.parentNode.getAttribute('data-filter');
-      b.classList.toggle('on', b.getAttribute('data-' + group) === filters[group]);
+      var g = b.parentNode.getAttribute('data-filter');
+      b.classList.toggle('on', b.getAttribute('data-' + g) === filters[g]);
     });
+    setCursor(-1);
   };
+
   document.querySelectorAll('.fgroup button').forEach(function (b) {
     b.addEventListener('click', function () {
-      var group = b.parentNode.getAttribute('data-filter');
-      filters[group] = b.getAttribute('data-' + group);
-      remember('filter.' + group, filters[group]);
+      var g = b.parentNode.getAttribute('data-filter');
+      filters[g] = b.getAttribute('data-' + g);
+      save('filter.' + g, filters[g]);
+      if (g === 'sort') { applySort(); }
       applyFilters();
     });
   });
+
+  // --- j/k between items, Enter to open ---
+  var cursor = -1;
+  var rows = function () {
+    var view = views.inbox && !views.inbox.hidden ? views.inbox : views.panels;
+    if (!view) { return []; }
+    return Array.prototype.filter.call(view.querySelectorAll('.item'), function (el) {
+      return !el.hidden;
+    });
+  };
+  function setCursor(i) {
+    document.querySelectorAll('.item.here').forEach(function (el) { el.classList.remove('here'); });
+    var all = rows();
+    if (i < 0 || i >= all.length) { cursor = -1; return; }
+    cursor = i;
+    all[i].classList.add('here');
+    all[i].scrollIntoView({ block: 'nearest' });
+  }
+  document.addEventListener('keydown', function (ev) {
+    var tag = (ev.target && ev.target.tagName) || '';
+    if (ev.metaKey || ev.ctrlKey || ev.altKey || tag === 'INPUT' || tag === 'TEXTAREA') { return; }
+    var all = rows();
+    if (ev.key === 'j') { ev.preventDefault(); setCursor(Math.min(cursor + 1, all.length - 1)); }
+    else if (ev.key === 'k') { ev.preventDefault(); setCursor(Math.max(cursor - 1, 0)); }
+    else if (ev.key === 'Enter' && cursor >= 0 && all[cursor]) {
+      var a = all[cursor].querySelector('a.go') || all[cursor].querySelector('a');
+      if (a) { ev.preventDefault(); window.open(a.href, '_blank', 'noopener'); }
+    }
+  });
+
+  // The banner offers the way out; an offline page cannot run it, so it reveals
+  // the exact command instead of pretending to have acted.
+  document.querySelectorAll('[data-reveal]').forEach(function (b) {
+    b.addEventListener('click', function () {
+      var code = document.getElementById(b.getAttribute('data-reveal'));
+      if (!code) { return; }
+      code.hidden = !code.hidden;
+      if (!code.hidden) {
+        var r = document.createRange();
+        r.selectNodeContents(code);
+        var sel = window.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(r);
+      }
+    });
+  });
+
+  applySort();
   applyFilters();
-  showView(recall('view', 'panels'));
+  showView(load('view', 'panels'));
 
   // A visible countdown, so a page that looks static is provably still live.
   var meta = document.querySelector('meta[http-equiv="refresh"]');
@@ -1635,7 +1794,7 @@ render_tail() {  # <state-json>
   var left = meta ? parseInt(meta.getAttribute('content') || '0', 10) : 0;
   if (next && left > 0) {
     var tick = function () {
-      next.textContent = left > 0 ? 'next in ' + left + 's' : 'refreshing';
+      next.textContent = left > 0 ? 'next check in ' + left + 's' : 'refreshing';
       left -= 1;
     };
     tick();
@@ -1647,6 +1806,7 @@ render_tail() {  # <state-json>
 </html>
 HTML
 }
+
 
 # ---------------------------------------------------------------------------
 # Main

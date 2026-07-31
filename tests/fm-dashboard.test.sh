@@ -141,11 +141,29 @@ EOF
     "pr=https://github.com/owner/demo/pull/12"
   printf 'working: validation running\n' > "$home/state/busy-pr.status"
 
+  # Blocked with nobody on it: the lane reported a blocker and its worker is
+  # gone. This is the case the captain must be able to spot without asking.
+  mkdir -p "$home/projects/wt-stalled"
+  fm_write_meta "$home/state/stalled-lane.meta" \
+    "window=firstmate:fm-gone" "worktree=$home/projects/wt-stalled" \
+    "project=owner/demo" "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off"
+  printf 'blocked: upstream API returns 500 and I cannot get past it\n' \
+    > "$home/state/stalled-lane.status"
+
+  # Ownership genuinely unverifiable: no endpoint was ever recorded, so we must
+  # say we cannot tell rather than guess either way.
+  mkdir -p "$home/projects/wt-unknown"
+  fm_write_meta "$home/state/unverified-lane.meta" \
+    "worktree=$home/projects/wt-unknown" \
+    "project=owner/demo" "harness=claude" "kind=ship" "mode=no-mistakes" "yolo=off"
+  printf 'blocked: waiting on something unclear\n' > "$home/state/unverified-lane.status"
+
   record_idle "$home" ship-ui
   record_idle "$home" scout-plan
   record_idle "$home" ask-only
   record_idle "$home" held-pr
   record_busy "$home" busy-pr
+  record_idle "$home" stalled-lane
 }
 
 capture() {  # <home> -> snapshot path
@@ -179,7 +197,7 @@ test_empty_home_is_honest() {
 
   printf '%s' "$out" > "$TMP_ROOT/empty.json"
   html=$("$DASH" --render "$TMP_ROOT/empty.json") || fail "empty render failed"
-  assert_contains "$html" "Nothing waiting." "an empty board should say so rather than look broken"
+  assert_contains "$html" "All caught up" "an empty queue should say so rather than look broken"
   pass "an empty home renders a valid, explicitly empty board"
 }
 
@@ -207,11 +225,12 @@ test_typed_awaiting_queue() {
     .awaiting_captain[] | select(.id == "ask-only") | .link == null
   ' >/dev/null || fail "an ask with no artifact must not invent a link"
 
-  # ask-only and held-pr both ask a bare question: one blocks nothing, one blocks
-  # a pull request. Both are still the captain's to answer.
+  # Four bare questions with no artifact: ask-only, the held PR, and the two
+  # blocked lanes. A blocked lane is the captain's to clear too, so it belongs
+  # in the same queue rather than only in a status log.
   printf '%s' "$out" | jq -e '
-    .counts.ui == 1 and .counts.plan == 1 and .counts.decision == 2
-      and .counts.awaiting_captain == 4
+    .counts.ui == 1 and .counts.plan == 1 and .counts.decision == 4
+      and .counts.awaiting_captain == 6
   ' >/dev/null || fail "typed counts wrong: $(printf '%s' "$out" | jq -c .counts)"
   pass "review queue is typed by what the work produces, not by file extension"
 }
@@ -371,9 +390,10 @@ test_page_is_self_contained_and_escapes_hostile_text() {
 
   assert_contains "$html" 'http-equiv="refresh"' "the page must carry its own refresh instruction"
   assert_contains "$html" 'id="mission-control-state"' "the page must embed the document it renders"
-  for panel in review merge decisions flight landed; do
-    assert_contains "$html" "data-panel=\"$panel\"" "panel $panel must be rendered"
-  done
+  assert_contains "$html" 'id="queue"' "the dominant attention queue must be rendered"
+  assert_contains "$html" "Needs your attention" "the queue must be named for the question it answers"
+  assert_contains "$html" "Active work" "the active-work summary must be rendered"
+  assert_contains "$html" "Recently landed" "the landed summary must be rendered"
 
   # Self-contained: nothing is loaded from anywhere.
   assert_not_contains "$html" '<script src=' "no external script may be loaded"
@@ -510,8 +530,76 @@ test_inbox_view_ships_beside_the_panels() {
   pass "the experimental inbox ships alongside the panels, filtered by type and turn"
 }
 
+test_blocked_says_whether_anyone_is_on_it() {
+  local home out
+  home=$(make_home attended)
+  write_fixture "$home"
+  out=$(state_for "$home") || fail "attendance projection failed"
+
+  # A worker the backend reports busy is positive evidence someone is on it.
+  printf '%s' "$out" | jq -e '
+    .merge_queue[] | select(.number == 12)
+    | .attended == true and .attended_by == "worker"
+      and .attended_evidence == "live-endpoint"
+  ' >/dev/null || fail "a busy worker must read as being worked on: \
+$(printf '%s' "$out" | jq -c '[.merge_queue[]|{number,attended,attended_by,attended_evidence}]')"
+
+  # Blocked with the worker gone is the case that needs saying outright.
+  printf '%s' "$out" | jq -e '
+    .in_flight[] | select(.id == "stalled-lane")
+    | .attended == false and .attended_by == null
+      and (.attended_evidence | IN("no-endpoint", "idle-endpoint"))
+  ' >/dev/null || fail "a blocked lane with no worker must read as unattended: \
+$(printf '%s' "$out" | jq -c '[.in_flight[]|{id,state,attended,attended_evidence}]')"
+
+  # Unverifiable ownership is its own answer, never guessed either way.
+  printf '%s' "$out" | jq -e '
+    .in_flight[] | select(.id == "unverified-lane")
+    | .attended == null and .attended_evidence == "unverified"
+  ' >/dev/null || fail "unverifiable ownership must stay null, not be guessed: \
+$(printf '%s' "$out" | jq -c '[.in_flight[]|select(.id=="unverified-lane")]')"
+
+  printf '%s' "$out" | jq -e '
+    [ .merge_queue[], .awaiting_captain[], .in_flight[] ]
+    | all(has("attended") and has("attended_evidence"))
+  ' >/dev/null || fail "every item must carry attendance, so ownership is never silent"
+  pass "blocked work says whether someone is on it, or that we cannot tell"
+}
+
+test_redesign_shape() {
+  local home state html
+  home=$(make_home shape)
+  write_fixture "$home"
+  state=$TMP_ROOT/shape-state.json
+  state_for "$home" > "$state"
+  html=$("$DASH" --render "$state") || fail "render failed"
+
+  # The captain works from this page and must not lose it.
+  local links newtab
+  links=$(printf '%s' "$html" | grep -c '<a class="go"' || true)
+  newtab=$(printf '%s' "$html" | grep -c 'class="go" href=[^>]*target="_blank"' || true)
+  [ "$links" -gt 0 ] || fail "the queue must offer actions to open"
+  [ "$links" = "$newtab" ] || fail "every queue action must open in a new tab ($newtab of $links)"
+
+  # A plan carrying decisions is ONE row, with its questions behind expansion -
+  # not duplicated as a separate decisions column.
+  assert_not_contains "$html" 'data-panel="decisions"' "the separate decisions column must be gone"
+  assert_contains "$html" '<details class="item"' "a row with questions must expand in place"
+  assert_contains "$html" 'Recommended:' "a recommended answer must be readable in the row"
+
+  # Relative time, not repeated ISO dates.
+  printf '%s' "$html" | grep -qE '<span class="when">(just now|[0-9]+[mhd]|yesterday)</span>' \
+    || fail "the queue must show human elapsed time"
+
+  # Progressive disclosure for the activity log.
+  assert_contains "$html" '<details class="lane' "workstream events must sit behind expansion"
+  pass "the board leads with one queue, folds decisions into their plan, and opens in new tabs"
+}
+
 test_empty_home_is_honest
 test_typed_awaiting_queue
+test_blocked_says_whether_anyone_is_on_it
+test_redesign_shape
 test_turn_says_whose_move_it_is
 test_decisions_carry_their_recommendation
 test_inbox_view_ships_beside_the_panels
