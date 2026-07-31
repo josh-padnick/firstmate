@@ -456,6 +456,102 @@ test_terminal_stale_surfaced() {
   pass "a stale pane sitting on a terminal status is surfaced (queue + exit)"
 }
 
+# --- stale pane PARKED on an already-delivered terminal result ---------------
+# Regression for the parked-fleet wake storm. The stale suppressor is the pane
+# HASH, so a pane sitting on done:/needs-decision: re-surfaced once per distinct
+# hash with no cadence bound at all. Anything that re-renders the fleet - a
+# resize, a workspace or tab interaction, a new pane joining the layout -
+# invalidates every hash at once, so a fleet of N workers parked awaiting the
+# captain produced N fresh "possible wedge" wakes, one full model turn each,
+# none carrying anything the captain had not already been shown. Measured live:
+# six parked panes changed hash inside a ten-second window and six stale wakes
+# followed over the next four minutes.
+# A result the captain has already been shown must not be re-fired by pane
+# churn - but a CHANGED status still surfaces at once, and the long reminder
+# still fires, so nothing can rot invisibly.
+test_terminal_parked_stale_absorbed_until_status_changes() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case terminal-parked); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-parked"
+  printf 'finished, awaiting review' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/parked.meta"
+  printf 'done: PR https://example.test/pr/7 checks green\n' > "$state/parked.status"
+  sig=$(seen_sig "$state/parked.status"); printf '%s' "$sig" > "$state/.seen-parked_status"
+  # Firstmate has ALREADY been told this exact result (the signal path surfaced
+  # the status write itself and marked it).
+  printf 'done: PR https://example.test/pr/7 checks green' > "$state/.hb-surfaced-parked"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "finished, awaiting review")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  # Phase A: a brand-new stale hash on an already-delivered result is absorbed.
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_TERMINAL_RESURFACE_SECS=99999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if ! wait_live "$pid" 30; then
+    reap "$pid"; fail "watcher exited for a pane parked on an already-delivered result: $(cat "$out")"
+  fi
+  [ ! -s "$out" ] || fail "a parked already-delivered result printed a wake reason: $(cat "$out")"
+  [ ! -s "$state/.wake-queue" ] || fail "a parked already-delivered result enqueued a wake"
+  [ "$(cat "$state/.stale-$key" 2>/dev/null || true)" = "$pane_hash" ] || fail "stale suppressor not advanced on a parked absorb"
+  grep -qF 'parked on an already-surfaced terminal status' "$state/.watch-triage.log" \
+    || fail "the parked absorb was not recorded in the triage log"
+  reap "$pid"
+
+  # Phase B: the crew writes a DIFFERENT result. That is news, so it surfaces at
+  # once - the suppression is tied to the delivered status, never to the pane.
+  printf 'needs-decision: pick option A or B\n' >> "$state/parked.status"
+  sig=$(seen_sig "$state/parked.status"); printf '%s' "$sig" > "$state/.seen-parked_status"
+  : > "$out"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_TERMINAL_RESURFACE_SECS=99999 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "watcher did not surface a CHANGED terminal status on a parked pane"
+  grep -F "stale: $window" "$out" >/dev/null || fail "a changed terminal status did not surface a stale wake"
+  [ "$(cat "$state/.hb-surfaced-parked" 2>/dev/null || true)" = "needs-decision: pick option A or B" ] \
+    || fail "surfacing a changed terminal status did not update the delivered marker"
+  pass "a pane parked on an already-delivered result is absorbed, and a changed result still surfaces immediately"
+}
+
+# The bounded half of the same contract: suppression is a long cadence, never a
+# mute. A result parked past FM_TERMINAL_RESURFACE_SECS re-surfaces once as a
+# reminder, so a forgotten decision or an unmerged PR cannot rot invisibly.
+test_terminal_parked_stale_resurfaces_on_long_cadence() {
+  local dir state fakebin out capture_file window key pane_hash sig pid
+  dir=$(make_case terminal-parked-resurface); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  window="test:fm-reminder"
+  printf 'awaiting the captain' > "$capture_file"
+  printf 'window=%s\nkind=ship\n' "$window" > "$state/reminder.meta"
+  printf 'needs-decision: approve the API shape\n' > "$state/reminder.status"
+  printf 'needs-decision: approve the API shape' > "$state/.hb-surfaced-reminder"
+  # Age the status write well past the reminder window (the cadence is anchored
+  # on the status mtime, not a per-hash marker, so pane churn cannot reset it).
+  set_mtime $(( $(date +%s) - 600 )) "$state/reminder.status"
+  sig=$(seen_sig "$state/reminder.status"); printf '%s' "$sig" > "$state/.seen-reminder_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "awaiting the captain")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_TERMINAL_RESURFACE_SECS=60 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  wait_for_exit "$pid" 40 || fail "a long-parked result never re-surfaced its reminder"
+  grep -F "stale: $window" "$out" >/dev/null || fail "the parked reminder did not print a stale wake"
+  grep -F "parked" "$out" >/dev/null || fail "the parked reminder did not name the parked wait"
+  grep -F "not a wedge" "$out" >/dev/null || fail "the parked reminder was framed as a wedge"
+  [ -s "$state/.terminal-resurfaced-$key" ] || fail "the reminder throttle was not recorded, so it would refire every poll"
+  pass "a result parked past the reminder window re-surfaces once, framed as a recheck rather than a wedge"
+}
+
 # --- stale pane, STALE terminal status overridden by an active run: absorbed ---
 # Regression for the 2026-07 herdr false-surface incidents: a crew's own status
 # log gets no new entry once firstmate hands it to a no-mistakes validation
@@ -606,6 +702,86 @@ test_nonterminal_stale_not_working_surfaced() {
   FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" 2>/dev/null || fail "drain after the immediate stale failed"
   grep "$(printf '\tstale\t')" "$drain_out" | grep -F "$window" >/dev/null || fail "immediate stale wake was not queued"
   pass "a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)"
+}
+
+# --- repeat wedge escalations are paced by how much the pane verdict proves ---
+# Regression for the busy-signature miss. bin/fm-busy-lib.sh is explicit that
+# missing, malformed, stale, or unverified semantic data is UNKNOWN and must never
+# be promoted to either pole, but the stale path collapsed unknown and a proven
+# idle into one "not busy" boolean and then repeated the possible-wedge alarm on
+# both at the same cadence. A worker whose harness has no semantic turn source
+# reports unknown for its whole turn, so a multi-minute build that renders nothing
+# new climbed to demand-deep-inspection on exactly the schedule a genuinely idle
+# pane does - which is how panes that deep inspection proved were mid-productive-turn
+# kept re-alarming.
+# Weak evidence must earn patience, not silence: the FIRST surface is untouched
+# (asserted above), only the repeat escalations stretch, and they still fire.
+run_noevidence_wedge() {  # <dir-name> <window> <status-line> <since-age> [meta-extra] [record-idle-id]
+  local name=$1 window=$2 status_line=$3 age=$4 meta_extra=${5:-} idle_id=${6:-}
+  local dir state fakebin out capture_file key pane_hash sig pid gen id
+  dir=$(make_case "$name"); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"
+  id=${window##*fm-}
+  printf 'building, no new output' > "$capture_file"
+  printf 'window=%s\nkind=ship\n%s' "$window" "$meta_extra" > "$state/$id.meta"
+  printf '%s\n' "$status_line" > "$state/$id.status"
+  sig=$(seen_sig "$state/$id.status"); printf '%s' "$sig" > "$state/.seen-${id}_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "building, no new output")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+  # Post-first-surface state: this pane was already surfaced once with NO positive
+  # evidence, and its repeat-escalation timer has been running for <since-age>.
+  printf '%s' "$pane_hash" > "$state/.stale-$key"
+  : > "$state/.stale-noevidence-$key"
+  echo $(( $(date +%s) - age )) > "$state/.stale-since-$key"
+  if [ -n "$idle_id" ]; then
+    gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" "$idle_id")
+    "$ROOT/bin/fm-busy-event.sh" apply "$state" "$idle_id" idle --gen "$gen" \
+      --source pi-ext --event agent-settled >/dev/null
+  fi
+  export FM_FAKE_CREW_STATE='state: unknown · source: none · no current-state source available'
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" \
+    FM_STALE_ESCALATE_SECS=100 FM_STALE_ESCALATE_UNKNOWN_MULT=4 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
+  pid=$!
+  if wait_for_exit "$pid" 40; then
+    printf 'escalated\t%s\t%s' "$dir" "$(cat "$out")"
+  else
+    reap "$pid"
+    printf 'absorbed\t%s\t%s' "$dir" "$(cat "$out")"
+  fi
+  unset FM_FAKE_CREW_STATE
+}
+
+test_unknown_busy_verdict_paces_repeat_wedge_escalations() {
+  local result verdict
+  # An UNKNOWN pane verdict (no semantic turn source for this harness) 150s in:
+  # past the 100s base threshold, short of the 400s scaled one. It must not alarm.
+  result=$(run_noevidence_wedge unknown-wedge-patient "test:fm-buildA" "working: building" 150)
+  verdict=${result%%$'\t'*}
+  [ "$verdict" = absorbed ] \
+    || fail "an unprovable pane escalated on the base threshold, so a long tool call still alarms: $result"
+
+  # Past the scaled threshold it DOES escalate: patience, never silence.
+  result=$(run_noevidence_wedge unknown-wedge-fires "test:fm-buildB" "working: building" 450)
+  verdict=${result%%$'\t'*}
+  [ "$verdict" = escalated ] \
+    || fail "an unprovable pane never escalated, which would trade away wedge detection: $result"
+  case "$result" in
+    *"possible wedge"*) ;;
+    *) fail "the scaled escalation did not flag a possible wedge: $result" ;;
+  esac
+
+  # Control: a PROVEN idle verdict (a trusted pi-ext record) keeps the base
+  # cadence, so real wedge detection is unchanged where the evidence is real.
+  result=$(run_noevidence_wedge idle-wedge-base "test:fm-buildC" "working: building" 150 \
+    "harness=pi"$'\n' buildC)
+  verdict=${result%%$'\t'*}
+  [ "$verdict" = escalated ] \
+    || fail "a PROVEN idle pane was given unknown-grade patience, weakening wedge detection: $result"
+  pass "repeat wedge escalations stretch for an unprovable pane verdict but keep the base cadence for a proven idle"
 }
 
 # --- non-terminal stale, crew DECLARED a pause: absorbed, re-surfaced on a long
@@ -1566,6 +1742,8 @@ test_turn_ended_not_working_surfaced
 test_working_note_not_working_surfaced
 test_actionable_signal_surfaced
 test_terminal_stale_surfaced
+test_terminal_parked_stale_absorbed_until_status_changes
+test_terminal_parked_stale_resurfaces_on_long_cadence
 test_stale_terminal_status_overridden_by_active_run
 test_nonterminal_stale_provably_working_absorbed_then_escalated
 test_wedge_escalation_marks_demand_deep_inspection_after_threshold
@@ -1577,6 +1755,7 @@ test_busy_pane_turn_end_touch_resets_age
 test_busy_pane_repeated_escalation_reaches_demand_deep_inspection
 test_busy_pane_default_turn_age_bound_is_3600s
 test_nonterminal_stale_not_working_surfaced
+test_unknown_busy_verdict_paces_repeat_wedge_escalations
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
 test_secondmate_paused_resurfaces_in_normal_mode

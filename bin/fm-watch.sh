@@ -20,10 +20,17 @@
 #                          line, since the crew's own log gets no new entry once
 #                          firstmate hands it to a no-mistakes validation. A declared
 #                          external-wait pause is absorbed instead with its own long
-#                          re-surface cadence, never as a wedge. Only when neither
-#                          absorb class applies does the log's last line decide:
-#                          terminal (captain-relevant) or non-terminal (no verb),
-#                          both surfaced at once. A provably-working stale past the
+#                          re-surface cadence, never as a wedge. A pane PARKED on a
+#                          captain-relevant terminal result gets that same bounded
+#                          treatment once the result has actually been delivered:
+#                          the first sighting surfaces, and afterwards the pane hash
+#                          may no longer re-fire a result the captain has already
+#                          been shown - only a CHANGED status line, or the long
+#                          TERMINAL_RESURFACE_SECS reminder, surfaces it again (see
+#                          handle_terminal_parked_stale). Only when no absorb class
+#                          applies does the log's last line decide: terminal
+#                          (captain-relevant) or non-terminal (no verb), both
+#                          surfaced at once. A provably-working stale past the
 #                          wedge threshold also surfaces, with an "escalation N"
 #                          count in the reason; at FM_WEDGE_DEMAND_INSPECT_COUNT
 #                          consecutive escalations on the SAME pane, the reason
@@ -133,6 +140,8 @@ SIGNAL_GRACE=${FM_SIGNAL_GRACE:-30}   # seconds to linger after a signal so trai
 # daemon owns triage, so this watcher reverts to one-shot (enqueue + exit on every
 # wake) and never double-triages - and never runs the costly provably-working read.
 STALE_ESCALATE_SECS=${FM_STALE_ESCALATE_SECS:-240}  # idle secs before a provably-working stale escalates as a possible wedge
+                                      # (scaled by FM_STALE_ESCALATE_UNKNOWN_MULT when the pane's
+                                      # semantic busy verdict is unknown rather than a proven idle)
 # A busy pane is unconditional proof of liveness with no built-in duration bound,
 # so a hung foreground call can remain hidden even while its rendered busy
 # footer changes every poll. BUSY_TURN_MAX_SECS bounds how long any busy pane
@@ -153,6 +162,12 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
 # longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
+# The same bounded-reminder cadence for a pane parked on a terminal status the
+# captain has already been shown (handle_terminal_parked_stale). A parked result
+# is a captain-owned wait exactly like a declared pause, so it shares the pause
+# default rather than inventing a second number; FM_TERMINAL_RESURFACE_SECS
+# overrides it independently when a home wants a different reminder rhythm.
+TERMINAL_RESURFACE_SECS=${FM_TERMINAL_RESURFACE_SECS:-$PAUSE_RESURFACE_SECS}
 # Consecutive event-path failures (fm_backend_wait_transition returning 2 -
 # connect/subscribe failure) before the push fast-path is disabled for the rest
 # of this watcher process and the loop reverts to pure polling (report section
@@ -183,6 +198,10 @@ hash_pane() {
 # treated as not-provably-working and surfaces rather than being absorbed.
 # <tail40> is the same bounded capture already read for hashing and is
 # consumed only by the Grok-scoped fallback inside the contract.
+# The full verdict is also published in FM_WINDOW_BUSY_VERDICT so the caller can
+# distinguish a PROVEN idle from an UNKNOWN one without classifying twice; see
+# wedge_escalate_secs for why that distinction changes the alarm cadence.
+FM_WINDOW_BUSY_VERDICT=
 window_is_busy() {  # <window> <tail40>
   local w=$1 tail40=$2 task meta verdict
   task=$(window_to_task "$w" "$STATE")
@@ -193,7 +212,8 @@ window_is_busy() {  # <window> <tail40>
     verdict=$(fm_busy_classify "$(window_backend "$w")" "$w" "$(window_harness "$w")" \
       "${task:-unknown}" "$STATE" "$tail40")
   fi
-  [ "${verdict%% *}" = busy ]
+  FM_WINDOW_BUSY_VERDICT=${verdict%% *}
+  [ "$FM_WINDOW_BUSY_VERDICT" = busy ]
 }
 
 window_kind() {
@@ -262,16 +282,60 @@ recorded_windows() {
 # below).
 FM_WEDGE_DEMAND_INSPECT_COUNT=${FM_WEDGE_DEMAND_INSPECT_COUNT:-3}
 
+# Patience multiplier applied to STALE_ESCALATE_SECS on the ONE wedge path that
+# runs with no positive evidence at all: a non-terminal stale whose crew came
+# back `none` (no running run-step, no busy verdict, no declared pause) and whose
+# pane busy verdict is UNKNOWN rather than a proven idle.
+#
+# bin/fm-busy-lib.sh is explicit that missing, malformed, stale, or unverified
+# semantic data is unknown and must never be promoted to either pole, but the
+# stale path collapses unknown and idle into one "not busy" boolean and then
+# repeats the wedge alarm on both at the same cadence. That is the busy-signature
+# miss: a worker whose harness has no semantic turn source (Codex is unverified
+# today, Grok has no writer, and any task whose busy wiring was never armed has no
+# record at all) reports unknown for its whole turn, so a multi-minute build or
+# pipeline call that renders nothing new is indistinguishable from a wedge at a
+# poll instant - and climbs to demand-deep-inspection on exactly the schedule a
+# proven-idle pane does.
+# Weak evidence earns patience, not silence. Nothing here delays a FIRST surface:
+# that pane was already surfaced immediately by surface_nonterminal_stale. This
+# only paces the REPEAT "possible wedge" escalations on top of it, and the ladder
+# still runs, still reaches demand-deep-inspection, and still bounds detection
+# latency - any pane output resets the timer outright.
+# Deliberately NOT applied to the two provably-working call sites: those hold
+# strong independent evidence (an actively-running no-mistakes run-step), and
+# their timer exists precisely to catch a run that froze DESPITE that evidence.
+# Slowing those would weaken frozen-run detection, which is the one thing this
+# change must not trade away. A harness that can prove turn state never reaches
+# this path at all - it reports busy through the whole tool call.
+FM_STALE_ESCALATE_UNKNOWN_MULT=${FM_STALE_ESCALATE_UNKNOWN_MULT:-4}
+
+# Effective wedge threshold for an evidence-free stale whose pane verdict is
+# <busy-verdict>. Proven idle keeps the base cadence; unknown is scaled.
+wedge_escalate_secs() {  # <busy-verdict>
+  local mult=$FM_STALE_ESCALATE_UNKNOWN_MULT
+  case "$mult" in ''|*[!0-9]*|0) mult=1 ;; esac
+  if [ "${1:-}" = unknown ]; then
+    printf '%s' "$(( STALE_ESCALATE_SECS * mult ))"
+  else
+    printf '%s' "$STALE_ESCALATE_SECS"
+  fi
+}
+
 # Repeat-poll wedge-timer bookkeeping for an already-classified stale hash
 # absorbed as provably-working - repairs a missing/corrupt timer (self-heals a
 # watcher restart between recording the hash and recording the timer), or
-# escalates once STALE_ESCALATE_SECS have elapsed. Never re-reads the crew
+# escalates once the effective threshold has elapsed. Never re-reads the crew
 # state (the costly check already ran once, at classification time). Shared by
 # both places a hash can be absorbed this way: the plain non-terminal path,
 # and the stale_is_terminal-overridden path (a captain-relevant status-log
 # line that an active run/busy pane outranked).
-wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file>
-  local win=$1 since_file=$2 label=$3 escalation_file=$4 since age n reason
+# <escalate-secs> is the caller's effective threshold from wedge_escalate_secs;
+# absent, the base STALE_ESCALATE_SECS applies.
+wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-file> [escalate-secs]
+  local win=$1 since_file=$2 label=$3 escalation_file=$4 escalate=${5:-$STALE_ESCALATE_SECS}
+  local since age n reason
+  case "$escalate" in ''|*[!0-9]*|0) escalate=$STALE_ESCALATE_SECS ;; esac
   since=$(cat "$since_file" 2>/dev/null || true)
   case "$since" in
     ''|*[!0-9]*)
@@ -280,7 +344,7 @@ wedge_timer_check() {  # <window> <since-file> <triage-label> <escalation-count-
       ;;
     *)
       age=$(( $(date +%s) - since ))
-      if [ "$age" -ge "$STALE_ESCALATE_SECS" ]; then
+      if [ "$age" -ge "$escalate" ]; then
         n=$(( $(cat "$escalation_file" 2>/dev/null || echo 0) + 1 ))
         echo "$n" > "$escalation_file"
         reason="stale: $win (idle ${age}s, possible wedge, escalation $n)"
@@ -324,7 +388,7 @@ handle_paused_stale() {  # <window> <task> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   printf '%s' "$h" > "$STATE/.stale-$key"
   : > "$STATE/.paused-$key"
-  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-noevidence-$key"
   statusf="$STATE/$task.status"
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
@@ -338,6 +402,73 @@ handle_paused_stale() {  # <window> <task> <hash>
     wake "$reason"
   fi
   triage_log "absorbed stale (paused, awaiting external, age ${age}s): $win"
+}
+
+# Absorb a stale pane that is PARKED on a captain-relevant terminal status
+# (done:/needs-decision:/blocked:/failed:) which firstmate has ALREADY been told
+# about, and re-surface it only on a long bounded cadence.
+#
+# Why this exists: the stale suppressor is the pane HASH, so a terminal pane
+# re-surfaced once per distinct hash with no cadence bound at all. Any event that
+# re-renders the fleet - a resize, a workspace or tab interaction, a new pane
+# joining the layout - invalidates every pane's hash in one sweep, so a fleet of N
+# workers parked awaiting the captain produced N fresh "possible wedge" wakes, one
+# full model turn each, none of them carrying anything the captain had not already
+# been shown. Measured live: six parked panes changed hash inside a ten-second
+# window and six stale wakes followed over the next four minutes, while every one
+# of them sat on an unchanged done:/needs-decision: line.
+# handle_paused_stale already solved this class for declared pauses - its cadence
+# is anchored on the status file mtime precisely so a churny idle pane cannot keep
+# resetting it - and this is the same treatment for the terminal case.
+#
+# The suppression is state-justified and self-clearing, never a blanket mute:
+#   - it applies ONLY while the pane's last status is captain-relevant AND byte-
+#     identical to what mark_surfaced already delivered to firstmate, so a status
+#     that has never been surfaced still surfaces immediately;
+#   - ANY new status line differs from the marker and surfaces on the next poll;
+#   - the heartbeat backstop reads that same .hb-surfaced-<task> marker, so a wake
+#     the per-wake path absorbed by mistake is still recovered there;
+#   - a parked pane that resumes work stops being terminal and re-enters the
+#     ordinary stale path, wedge timer and all.
+# Cheap by contract, like handle_paused_stale: it NEVER re-reads crew state.
+# A .terminal-resurfaced-<key> throttle records the last re-surface epoch so, once
+# past the window, the reminder fires once per window rather than every poll.
+handle_terminal_parked_stale() {  # <window> <task> <hash>
+  local win=$1 task=$2 h=$3 key statusf last surfaced mtime age rf rf_age reason
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  statusf="$STATE/$task.status"
+  last=$(last_status_line "$statusf")
+  surfaced=$(cat "$(_hb_surfaced_path "$task")" 2>/dev/null || true)
+  if [ -z "$last" ] || [ "$last" != "$surfaced" ]; then
+    # Never surfaced (or superseded since): this is news, so treat it exactly as
+    # the unbounded path always did.
+    fm_wake_append stale "$win" "stale: $win" || exit 1
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    rm -f "$STATE/.stale-since-$key" "$STATE/.terminal-resurfaced-$key" "$STATE/.stale-noevidence-$key"
+    mark_surfaced "$statusf"
+    wake "stale: $win"
+  else
+    printf '%s' "$h" > "$STATE/.stale-$key"
+    rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-noevidence-$key"
+    mtime=$(stat_mtime "$statusf")
+    case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
+    age=$(( $(date +%s) - mtime ))
+    rf="$STATE/.terminal-resurfaced-$key"
+    rf_age=$(age_of "$rf")   # 999999 when no prior re-surface
+    if [ "$age" -ge "$TERMINAL_RESURFACE_SECS" ] && [ "$rf_age" -ge "$TERMINAL_RESURFACE_SECS" ]; then
+      reason="stale: $win (parked ${age}s on an already-reported result, rechecked on a long cadence not a wedge; the captain still owes this one a decision or a merge)"
+      fm_wake_append stale "$win" "$reason" || exit 1
+      date +%s > "$rf"
+      wake "$reason"
+    fi
+    triage_log "absorbed stale (parked on an already-surfaced terminal status, age ${age}s): $win"
+  fi
+}
+
+clear_terminal_parked_tracking() {  # <window>
+  local win=$1 key
+  key=$(printf '%s' "$win" | tr ':/.' '___')
+  rm -f "$STATE/.terminal-resurfaced-$key"
 }
 
 clear_pause_state() {  # <window>
@@ -354,7 +485,7 @@ clear_pause_tracking() {  # <window>
   key=${key//\//_}
   key=${key//./_}
   clear_pause_state "$win"
-  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key"
+  rm -f "$STATE/.stale-$key" "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-noevidence-$key"
 }
 
 # Reconcile a declared pause or captain-held status with authoritative crew state.
@@ -411,6 +542,10 @@ surface_nonterminal_stale() {  # <window> <hash>
   key=$(printf '%s' "$win" | tr ':/.' '___')
   fm_wake_append stale "$win" "stale: $win" || exit 1
   printf '%s' "$h" > "$STATE/.stale-$key"
+  # Remember that this pane's wedge timer was started with NO positive evidence,
+  # so the repeat escalations on top of this first surface can be paced against
+  # the strength of what we actually know. See FM_STALE_ESCALATE_UNKNOWN_MULT.
+  : > "$STATE/.stale-noevidence-$key"
   rm -f "$STATE/.stale-since-$key"
   task=$(window_to_task "$win" "$STATE")
   last=$(last_status_line "$STATE/$task.status")
@@ -874,6 +1009,12 @@ EOF
     if ! status_is_paused_or_captain_held "$last" && [ -e "$STATE/.paused-$key" ]; then
       clear_pause_tracking "$w"
     fi
+    # Self-clearing half of the parked-terminal cadence: the moment this pane's
+    # last status stops being a captain-relevant result, it is no longer parked,
+    # so its reminder throttle must not survive into the next parked spell.
+    if ! status_is_captain_relevant "$last"; then
+      clear_terminal_parked_tracking "$w"
+    fi
     if [ "$kind" = secondmate ] && ! status_is_paused "$last"; then
       continue
     fi
@@ -886,13 +1027,18 @@ EOF
     ssf="$STATE/.stale-since-$key"
     ewf="$STATE/.wedge-escalations-$key"
     pf="$STATE/.paused-$key"   # flag: this key's stale is using the bounded pause cadence
+    nef="$STATE/.stale-noevidence-$key"  # flag: this key's wedge timer started with NO positive evidence
     prev=$(cat "$hf" 2>/dev/null || true)
     # Busy match: a backend's native semantic state when available (herdr), else
     # the last 6 non-blank lines only (the TUI footer area, where every verified
     # harness renders its busy indicator) so busy-looking strings in displayed
     # content cannot suppress stale detection. Read once per window per poll and
     # reused below so a busy verdict is consistent within one cycle.
+    # busy_verdict keeps the SEMANTIC verdict behind that boolean (busy, idle,
+    # unknown, dead) so the wedge cadence can tell a proven idle from an
+    # unprovable one; see wedge_escalate_secs.
     if window_is_busy "$w" "$tail40"; then busy_now=0; else busy_now=1; fi
+    busy_verdict=$FM_WINDOW_BUSY_VERDICT
     if [ "$h" = "$prev" ]; then
       n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
       echo "$n" > "$cf"
@@ -928,15 +1074,17 @@ EOF
           # over the log) a chance to override before trusting the log.
           if [ "$(cat "$sf" 2>/dev/null || true)" != "$h" ]; then
             if crew_is_provably_working "$(window_to_task "$w" "$STATE")"; then
+              clear_terminal_parked_tracking "$w"
               printf '%s' "$h" > "$sf"
               date +%s > "$ssf"
               triage_log "absorbed stale (provably working, overriding a stale captain-relevant status): $w"
             else
-              fm_wake_append stale "$w" "stale: $w" || exit 1
-              printf '%s' "$h" > "$sf"
+              # PARKED on a terminal result, not working. Surface it the first
+              # time; afterwards the pane hash is no longer allowed to re-fire a
+              # result the captain has already been shown - see
+              # handle_terminal_parked_stale for the whole contract.
               rm -f "$ssf"
-              mark_surfaced "$STATE/$(window_to_task "$w" "$STATE").status"
-              wake "stale: $w"
+              handle_terminal_parked_stale "$w" "$(window_to_task "$w" "$STATE")" "$h"
             fi
           elif [ -e "$ssf" ]; then
             # This exact hash was already overridden as provably-working (a
@@ -944,10 +1092,13 @@ EOF
             # without re-reading the crew state every poll, and without
             # letting the still-captain-relevant log line re-surface it.
             wedge_timer_check "$w" "$ssf" "stale (overridden terminal status)" "$ewf"
+          else
+            # Already surfaced as genuinely terminal on a prior poll of this same
+            # hash. A pane can hold one hash for hours, so the bounded reminder
+            # must still be able to fire here; the throttle inside keeps it to
+            # once per window rather than once per poll.
+            handle_terminal_parked_stale "$w" "$(window_to_task "$w" "$STATE")" "$h"
           fi
-          # else: already surfaced as genuinely terminal on a prior poll of
-          # this same hash - nothing left to do (matches the original,
-          # unmodified terminal-status behavior).
         else
           # Non-terminal stale: a crew gone quiet without a captain-relevant status.
           # Decided once per distinct stale hash (the costly state reads run only
@@ -970,6 +1121,7 @@ EOF
                 clear_pause_tracking "$w"
                 printf '%s' "$h" > "$sf"
                 date +%s > "$ssf"
+                rm -f "$nef"
                 triage_log "absorbed non-terminal stale (provably working): $w"
                 ;;
               paused)
@@ -986,10 +1138,17 @@ EOF
                 paused)  handle_paused_stale "$w" "$task" "$h" ;;
                 working) clear_pause_state "$w"
                          printf '%s' "$h" > "$sf"
+                         rm -f "$nef"
                          wedge_timer_check "$w" "$ssf" "non-terminal stale (provably working after a declared pause)" "$ewf"
                          triage_log "absorbed non-terminal stale (provably working): $w" ;;
                 *)       handle_paused_stale "$w" "$task" "$h" ;;
               esac
+            elif [ -e "$nef" ]; then
+              # The timer under this hash was started with no positive evidence,
+              # so pace its repeat escalations against how little the pane verdict
+              # actually proves. The first surface already happened.
+              wedge_timer_check "$w" "$ssf" "non-terminal stale (no positive evidence)" "$ewf" \
+                "$(wedge_escalate_secs "$busy_verdict")"
             else
               wedge_timer_check "$w" "$ssf" "non-terminal stale" "$ewf"
             fi
@@ -1002,7 +1161,7 @@ EOF
         if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
           wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
         else
-          rm -f "$ssf" "$ewf"
+          rm -f "$ssf" "$ewf" "$nef"
         fi
         if [ -e "$pf" ] && { [ "$n" -ge 2 ] || ! status_is_paused_or_captain_held "$(last_status_line "$STATE/$(window_to_task "$w" "$STATE").status")"; }; then
           clear_pause_tracking "$w"
@@ -1014,7 +1173,7 @@ EOF
       if [ "$busy_now" -eq 0 ] && busy_turn_over_age "$task"; then
         wedge_timer_check "$w" "$ssf" "busy (no completed turn)" "$ewf"
       else
-        rm -f "$ssf" "$ewf"
+        rm -f "$ssf" "$ewf" "$nef"
       fi
       task=$(window_to_task "$w" "$STATE")
       if ! afk_present && status_is_paused_or_captain_held "$(last_status_line "$STATE/$task.status")" && [ "$busy_now" -ne 0 ]; then

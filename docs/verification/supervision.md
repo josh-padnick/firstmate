@@ -187,6 +187,25 @@ Observed guarantee: after ordinary `session_shutdown` for `/new`, `/resume`, and
 Stale prior-generation tool callbacks could not mutate the active child, repeated transitions kept exactly one live arm cycle, and terminal `quit` still refused late rearm.
 Plain Pi and pi-signed share the same tracked `.pi/extensions/fm-primary-pi-watch.ts` path, so both inherit the generation owner; other primary harnesses are not applicable because they do not use this Pi extension lifecycle.
 
+A watcher cycle close is classified as a failure only when the durable wake queue proves nothing was delivered during it, measured on 2026-07-31 against one live home's arm-owned lifecycle ledger:
+
+```sh
+awk -F'\t' '{for(i=1;i<=NF;i++) if($i ~ /^reason=/) print $i}' state/.watch-cycle-exits.log | sort | uniq -c
+grep -c 'reason=attached-cycle-ended.*successor=none' state/.watch-cycle-exits.log
+grep -h 'watcher: FAILED' state/.claude-autoarm-output.* | sort | uniq -c
+```
+
+```text
+ 147 reason=actionable-stale
+ 102 reason=attached-cycle-ended
+  67 reason=actionable-signal
+93
+  43 watcher: FAILED - cycle ended without an actionable reason
+```
+
+Observed guarantee: only the arm that forked a watcher receives that watcher's printed wake reason, so 93 of 102 attached cycles ended with no visible successor and every one of that home's 43 watcher-FAILED alarms was that same false line, none of them a real supervision outage.
+The monotonic `state/.wake-queue.seq` survives drains, so an attached arm now reprints a still-pending delivery, reports an already-drained one as a handoff, and reserves the FAILED line for a cycle that queued nothing.
+
 Deterministic entry points:
 
 ```sh
