@@ -1297,10 +1297,8 @@ render_css() {
          gap: 0; padding: var(--gap); }
   main[hidden] { display: none; }
 
-  #pane-updates { flex: 2 1 0; min-height: 6rem; }
-  .lower { flex: 1 1 0; min-height: 6rem; display: flex; gap: 0; }
-  #pane-active { flex: 1.5 1 0; min-width: 12rem; }
-  #pane-landed { flex: 1 1 0; min-width: 10rem; }
+  #pane-updates { flex: 1.4 1 0; min-height: 6rem; }
+  #pane-tasks { flex: 1 1 0; min-height: 6rem; }
 
   /* --- draggable grips: the captain asked to pull a panel open --- */
   .grip { flex: 0 0 var(--gap); position: relative; }
@@ -1652,27 +1650,26 @@ def task_screen($names; $updates):
 
 + "<div class=\"grip\" data-grip=\"v\" title=\"Drag to resize\"></div>"
 
-# Active work and Recently landed are STATUS FILTERS over one task collection,
-# drawn by one component.
-+ "<div class=\"lower\">"
-+ "<section class=\"card\" id=\"pane-active\"><h2>Active work"
+# ONE tasks collection with a status filter - not two hand-built lists. A task
+# renders through the same component whichever filter is showing it.
++ "<section class=\"card\" id=\"pane-tasks\"><h2>Tasks"
   + "<span class=\"count\">\($d.counts.tasks_running) running"
   + (if $d.counts.tasks_blocked > 0 then "<span class=\"sep\"> · </span><b>\($d.counts.tasks_blocked)</b> blocked" else "" end)
   + "</span></h2>"
-  + "<div class=\"scroll\" data-scroll=\"active\">"
-  + (([ $d.tasks[] | select(.status != "landed") ]) as $active
-     | if ($active | length) == 0 then "<div class=\"hint\">No tasks running.</div>"
-       else ([ $active[] | task_card($names) ] | join("")) end)
+  + "<div class=\"filters\"><div class=\"fset\"><div class=\"fgroup\" data-filter=\"status\">"
+  + ([ {v: "active", l: "Active", n: $d.counts.tasks_active},
+       {v: "landed", l: "Landed", n: $d.counts.tasks_landed},
+       {v: "all",    l: "All",    n: $d.counts.tasks} ]
+     | map("<button type=\"button\" data-status=\"\(.v)\"\(if .v == "active" then " class=\"on\"" else "" end)>\(.l)<span class=\"n\">\(.n)</span></button>")
+     | join(""))
+  + "</div></div></div>"
+  + "<div class=\"scroll\" data-scroll=\"tasks\" id=\"task-list\">"
+  + (if ($d.tasks | length) == 0 then "<div class=\"hint\">No tasks yet.</div>"
+     else ([ $d.tasks[] | task_card($names) ] | join("")) end)
+  + "<div class=\"empty\" id=\"tasks-empty\" hidden><div class=\"big\">Nothing here</div>"
+  + "<div class=\"small\">Pick another filter.</div></div>"
   + "</div></section>"
-+ "<div class=\"grip\" data-grip=\"h\" title=\"Drag to resize\"></div>"
-+ "<section class=\"card\" id=\"pane-landed\"><h2>Recently landed"
-  + "<span class=\"count\">\($d.counts.tasks_landed)</span></h2>"
-  + "<div class=\"scroll\" data-scroll=\"landed\">"
-  + (([ $d.tasks[] | select(.status == "landed") ]) as $landed
-     | if ($landed | length) == 0 then "<div class=\"hint\">Nothing landed yet.</div>"
-       else ([ $landed[] | task_card($names) ] | join("")) end)
-  + "</div></section>"
-+ "</div></main>"
++ "</main>"
 
 + "<main id=\"view-inbox\" hidden><section class=\"card\">"
   + "<h2>Inbox<span class=\"count\" id=\"inbox-shown\"></span></h2>"
@@ -1822,7 +1819,27 @@ render_tail() {  # <state-json>
   // --- inbox filters and sort ---
   var filters = { turn: load('filter.turn', 'captain'),
                   kind: load('filter.kind', 'all'),
-                  sort: load('filter.sort', 'priority') };
+                  sort: load('filter.sort', 'priority'),
+                  status: load('filter.status', 'active') };
+
+  // Active and Landed are filters over one task collection, not two lists.
+  var taskList = document.getElementById('task-list');
+  var tasksEmpty = document.getElementById('tasks-empty');
+  var applyTaskFilter = function () {
+    if (!taskList) { return; }
+    var visible = 0;
+    taskList.querySelectorAll('.task').forEach(function (el) {
+      var landed = el.getAttribute('data-status') === 'landed';
+      var ok = filters.status === 'all'
+            || (filters.status === 'landed' ? landed : !landed);
+      el.hidden = !ok;
+      if (ok) { visible += 1; }
+    });
+    if (tasksEmpty) { tasksEmpty.hidden = visible !== 0; }
+    document.querySelectorAll('[data-filter="status"] button').forEach(function (b) {
+      b.classList.toggle('on', b.getAttribute('data-status') === filters.status);
+    });
+  };
   var list = document.getElementById('inbox-list');
   var shown = document.getElementById('inbox-shown');
   var emptyNote = document.getElementById('inbox-empty');
@@ -1868,7 +1885,7 @@ render_tail() {  # <state-json>
       filters[g] = b.getAttribute('data-' + g);
       save('filter.' + g, filters[g]);
       if (g === 'sort') { applySort(); }
-      applyFilters();
+      if (g === 'status') { applyTaskFilter(); } else { applyFilters(); }
     });
   });
 
@@ -1923,6 +1940,7 @@ render_tail() {  # <state-json>
 
   applySort();
   applyFilters();
+  applyTaskFilter();
   showView(load('view', 'board'));
 
   // A visible countdown, so a page that looks static is provably still live.

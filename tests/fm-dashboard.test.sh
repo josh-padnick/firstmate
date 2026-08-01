@@ -525,8 +525,11 @@ test_page_is_self_contained_and_escapes_hostile_text() {
   assert_contains "$html" 'id="mission-control-state"' "the page must embed the document it renders"
   assert_contains "$html" 'id="pane-updates"' "the dominant attention queue must be rendered"
   assert_contains "$html" "Needs your attention" "the queue must be named for the question it answers"
-  assert_contains "$html" "Active work" "the active-work summary must be rendered"
-  assert_contains "$html" "Recently landed" "the landed summary must be rendered"
+  # Active and Landed are filters over ONE task collection, not two lists.
+  assert_contains "$html" 'id="pane-tasks"' "there must be a single tasks region"
+  assert_contains "$html" 'data-filter="status"' "tasks must be filtered by status"
+  assert_not_contains "$html" 'id="pane-active"' "the separate active-work list must be gone"
+  assert_not_contains "$html" 'id="pane-landed"' "the separate landed list must be gone"
 
   # Self-contained: nothing is loaded from anywhere.
   assert_not_contains "$html" '<script src=' "no external script may be loaded"
