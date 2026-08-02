@@ -42,6 +42,7 @@ Launching a supported harness inside it instantiates your first mate - and makes
 ## Features
 
 - **One liaison** - you talk only to the first mate; it dispatches, supervises, escalates only real decisions, and reports plain outcomes.
+- **Mission control** - a self-updating, single-viewport dashboard shows what needs your attention, whose turn each item is, active work, and recent completions; its `fm-mission-control.v1` JSON state document is the primary output and the offline page is a rendering of it.
 - **A visible crew** - every crewmate works in its own tmux window, experimental herdr/zellij tab, cmux workspace, or Orca terminal you can watch or type into; the first mate reconciles.
 - **Disposable worktrees** - each task runs in a clean [treehouse](https://github.com/kunchenguid/treehouse) git worktree, or an Orca-managed worktree when `backend=orca`, so parallel work on one repo never collides.
 - **Two task shapes** - ship tasks deliver authorized changes; scout tasks leave standalone investigation reports when the intake contract warrants separate research.
@@ -125,6 +126,12 @@ The preference persists for the effective Firstmate home, and toggling it off re
 
 > alright merge it
 ```
+
+### Open mission control
+
+Run `bin/fm-dashboard.sh --watch` and open `data/mission-control.html` in a browser to keep the local fleet view current without manual refresh.
+The normal update path is local-only; run `bin/fm-dashboard.sh --refresh-prs` when you also want to refresh the dashboard's pull-request check cache.
+The primary structured output is `data/mission-control.json`, schema `fm-mission-control.v1`; [`fm-dashboard.sh`'s header and help](bin/fm-dashboard.sh) own the complete command, rendering, and schema contracts.
 
 ### More backends
 

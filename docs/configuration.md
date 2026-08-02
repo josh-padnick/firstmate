@@ -14,6 +14,10 @@ The tracked code root contains the shared instruction, skill, documentation, wor
 `state/` holds volatile runtime records such as task metadata, append-only status events, endpoint signals, watcher and wake-queue coordination, away-mode state, generated X-mode artifacts, private secondmate config-reread generations with their retry and quarantine state, and parent-owned secondmate pending-reply records under `state/pending-replies/` (`bin/fm-pending-reply-lib.sh`).
 `config/` holds local gitignored operating choices, and `projects/` holds the local project clones that Firstmate reads but changes only through the narrow guarded and concrete captain-approved exceptions in `AGENTS.md`.
 
+`bin/fm-dashboard.sh` writes the primary `fm-mission-control.v1` state document to `data/mission-control.json` and renders that document to the self-contained `data/mission-control.html` page.
+Its optional pull-request refresh writes `state/dashboard-prs.json`; ordinary regeneration makes no network request, reads that cache when present, and reports its age and staleness in the state document.
+The script's header and help own the exact schema, flags, refresh behavior, and mutation contract.
+
 `bin/fm-spawn.sh` owns the base task-metadata fields it emits, while the runtime-backend section below owns backend-specific fields and selector interpretation.
 The producing PR and X helpers own the fields they append, `bin/fm-classify-lib.sh` owns status-event vocabulary, and `bin/fm-crew-state.sh` owns current-state reconciliation.
 Wake, watcher, away-mode, and X-specific state mechanics remain with their named scripts and reference sections rather than being duplicated into one exhaustive state tree here.
