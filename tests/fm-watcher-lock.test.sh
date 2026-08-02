@@ -763,6 +763,114 @@ test_arm_waits_for_peer_beacon_after_child_stands_down() {
   pass "arm attaches to a peer watcher after child stands down and surfaces a missing successor"
 }
 
+# Regression: an ATTACHED arm never sees its watcher's printed wake reason - only
+# the arm that forked that watcher does. So when the singleton delivered an
+# actionable wake and exited, every attached arm saw nothing but "the lock holder
+# went away", and a successor cannot exist until the model's next turn re-arms.
+# Reporting that as a failure told the captain supervision was down while it was
+# working normally: in one live home 93 of 102 attached cycles ended that way, and
+# every single watcher-FAILED alarm that home ever raised was this false one.
+# The durable wake queue is the evidence both arms share, so a cycle that queued a
+# wake must be reported as the actionable close it was.
+test_attached_arm_reports_queued_delivery_not_failure() {
+  local dir state fakebin armout peer identity armpid status i
+  dir=$(make_case arm-attached-delivery)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=1 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$peer" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$peer" "$armout" || fail "arm did not attach to the peer watcher: $(cat "$armout")"
+
+  # The singleton delivers an actionable wake durably (exactly as fm-watch.sh
+  # does: append first, then print and exit), then its process ends.
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_append stale "sess:fm-w" "stale: sess:fm-w"' _ "$LIB" \
+    || fail "could not enqueue the delivered wake"
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+
+  wait_for_exit "$armpid" 120
+  status=$?
+  [ "$status" -ne 124 ] || fail "attached arm never returned after its watcher delivered a wake"
+  ! grep -qF 'watcher: FAILED' "$armout" \
+    || fail "attached arm falsely reported FAILED for a cycle that delivered a queued wake: $(cat "$armout")"
+  [ "$status" -eq 0 ] || fail "attached arm exited $status for a successfully delivered wake: $(cat "$armout")"
+  grep -qF 'stale: sess:fm-w' "$armout" \
+    || fail "attached arm did not reprint the queued wake so a handling turn still happens: $(cat "$armout")"
+  # Reading the queue must never consume it: the handling turn's drain is still
+  # the only consumer, so the no-loss property is untouched.
+  grep -qF 'stale: sess:fm-w' "$state/.wake-queue" \
+    || fail "the attached arm consumed the durable queue instead of only reading it"
+  pass "an attached arm reports its watcher's queued delivery instead of a false FAILED, without consuming the queue"
+}
+
+# Companion to the above: once the handling turn has drained the queue, there is
+# nothing left to hand a model, so the same close must stay quiet rather than
+# manufacturing an empty wake - while still not calling a delivered cycle a
+# failure.
+test_attached_arm_reports_drained_delivery_quietly() {
+  local dir state fakebin armout peer identity armpid status i
+  dir=$(make_case arm-attached-drained)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  armout="$dir/arm.out"
+  mark_pr_check_migration_complete "$state"
+  sleep 300 &
+  peer=$!
+  identity=$(FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_pid_identity "$2"' _ "$LIB" "$peer") || fail "could not identify peer pid"
+  mkdir "$state/.watch.lock"
+  printf '%s\n' "$peer" > "$state/.watch.lock/pid"
+  printf '%s\n' "$dir" > "$state/.watch.lock/fm-home"
+  printf '%s\n' "$WATCH" > "$state/.watch.lock/watcher-path"
+  printf '%s\n' "$identity" > "$state/.watch.lock/pid-identity"
+  touch "$state/.last-watcher-beat"
+  PATH="$fakebin:$PATH" FM_HOME="$dir" FM_POLL=5 FM_SIGNAL_GRACE=1 FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 FM_ARM_CONFIRM_TIMEOUT=1 FM_ARM_ATTACH_POLL=0.1 "$WATCH_ARM" > "$armout" &
+  armpid=$!
+  i=0
+  while [ "$i" -lt 80 ]; do
+    grep -qF "watcher: attached pid=$peer" "$armout" 2>/dev/null && break
+    sleep 0.1
+    i=$((i + 1))
+  done
+  grep -qF "watcher: attached pid=$peer" "$armout" || fail "arm did not attach to the peer watcher: $(cat "$armout")"
+
+  FM_STATE_OVERRIDE="$state" bash -c '. "$1"; fm_wake_append stale "sess:fm-w" "stale: sess:fm-w"' _ "$LIB" \
+    || fail "could not enqueue the delivered wake"
+  # A concurrent handling turn takes it. The monotonic .wake-queue.seq survives
+  # that drain, which is exactly what lets the arm still tell delivery from failure.
+  FM_STATE_OVERRIDE="$state" "$DRAIN" >/dev/null 2>&1 || true
+  kill "$peer" 2>/dev/null || true
+  wait "$peer" 2>/dev/null || true
+
+  wait_for_exit "$armpid" 120
+  status=$?
+  [ "$status" -ne 124 ] || fail "attached arm never returned after a drained delivery"
+  ! grep -qF 'watcher: FAILED' "$armout" \
+    || fail "attached arm falsely reported FAILED after a delivered wake was drained: $(cat "$armout")"
+  [ "$status" -eq 0 ] || fail "attached arm exited $status after a drained delivery: $(cat "$armout")"
+  ! grep -qE '^(signal:|stale:|check:|heartbeat)' "$armout" \
+    || fail "attached arm invented a wake for an already-handled delivery: $(cat "$armout")"
+  grep -qF 'watcher: handed off' "$armout" \
+    || fail "attached arm did not report the handoff: $(cat "$armout")"
+  pass "a delivered-then-drained cycle closes as a handoff: no false FAILED and no invented wake"
+}
+
 test_arm_fails_loud_when_no_fresh_watcher_confirmable() {
   local dir state fakebin armout live armpid status
   dir=$(make_case arm-failed-stale)
@@ -1036,6 +1144,8 @@ test_arm_starts_and_self_heals
 test_arm_hup_cleans_child_and_temp_output
 test_arm_propagates_immediate_wake_before_confirmation
 test_arm_waits_for_peer_beacon_after_child_stands_down
+test_attached_arm_reports_queued_delivery_not_failure
+test_attached_arm_reports_drained_delivery_quietly
 test_arm_fails_loud_when_no_fresh_watcher_confirmable
 test_cycle_exit_ledger_links_successor_and_stays_bounded
 test_stopped_watcher_is_live_but_stale_then_exit_is_classified

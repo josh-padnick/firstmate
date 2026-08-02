@@ -30,17 +30,37 @@
 #                                                          this arm attaches and follows it
 #   watcher: FAILED - no live watcher with a fresh beacon  - could not confirm one
 #   watcher: FAILED - cycle ended without an actionable reason
-#                                                        - a clean cycle ended with no wake and no
+#                                                        - a clean cycle ended with no wake, no
+#                                                          queued wake delivered during it, and no
 #                                                          verified healthy successor
+#   watcher: handed off <n> queued wake(s)               - the cycle DID end with an actionable
+#                                                          reason, delivered durably rather than
+#                                                          through this arm's own child (see below)
 # It NEVER reports started/attached/healthy off a stale beacon or a dead/reused pid: a
 # stale-beacon or dead-pid holder either self-heals (the fresh child steals the
 # dead lock per the singleton self-eviction/steal path and is confirmed) or this
 # returns the FAILED line. On started it waits the child and propagates the wake
-# reason; on attached it stays live across identity-matched successors. An
-# attached cycle that ends without a healthy successor is a typed nonzero failure,
-# never a clean empty completion. On FAILED it exits non-zero so the failure is
-# loud. A live cycle already present means re-arm attaches - do not start a second
-# watcher.
+# reason; on attached it stays live across identity-matched successors. On FAILED
+# it exits non-zero so the failure is loud. A live cycle already present means
+# re-arm attaches - do not start a second watcher.
+#
+# Only the arm that FORKED a watcher receives that watcher's printed wake reason.
+# Every other arm attached to the same singleton sees just the lock, so when the
+# watcher delivers an actionable wake and exits, an attached arm observes only
+# "the holder went away". Its successor cannot exist until the model's next turn
+# re-arms, so treating that as a failure reported supervision as down while it was
+# working normally - measured at 93 of 102 attached cycles in one live home, and
+# every one of that home's watcher-FAILED alarms.
+# The durable wake queue is the evidence both arms share: an actionable watcher
+# exit ALWAYS appends to it (and bumps the monotonic state/.wake-queue.seq, which
+# survives drains) before printing and exiting. So before declaring a failure this
+# script asks whether the queue moved during the cycle:
+#   - records still pending  -> reprint them so the handling turn still happens,
+#                               exactly as the forking arm would have, and succeed;
+#   - queue advanced but already drained -> another turn is handling it; report the
+#                               handoff and succeed, without inventing a second wake;
+#   - queue never moved and no healthy successor -> a genuine failure, reported as
+#                               loudly as before.
 #
 # Every observed watcher cycle appends one tab-separated lifecycle record to
 # state/.watch-cycle-exits.log. The arm layer owns that bounded ledger; it records
@@ -104,12 +124,27 @@ cycle_watcher_pid=none
 cycle_origin=unknown
 cycle_started_at=0
 cycle_lock_before='pid:none|identity:none'
+cycle_wake_seq_before=0
+
+# The monotonic wake counter fm_wake_append advances under the queue lock. It is
+# never reset by a drain, so comparing it across a cycle answers "did this
+# watcher enqueue anything while I was attached?" even when the handling turn
+# already emptied the queue file.
+wake_seq_now() {
+  local seq
+  seq=$(cat "$STATE/.wake-queue.seq" 2>/dev/null || true)
+  case "$seq" in
+    ''|*[!0-9]*) printf '0' ;;
+    *) printf '%s' "$seq" ;;
+  esac
+}
 
 cycle_begin() {
   cycle_watcher_pid=$1
   cycle_origin=$2
   cycle_started_at=$(date +%s)
   cycle_lock_before=$(lock_snapshot)
+  cycle_wake_seq_before=$(wake_seq_now)
   cycle_active=1
 }
 
@@ -256,7 +291,30 @@ wait_for_healthy_successor() {
   done
 }
 
+# Pending queue payloads, deduped exactly as the drain would present them. Printed
+# by an arm that observed a delivery it did not own, so the wake still reaches a
+# handling turn through this arm's own close. Reading never consumes the queue -
+# the handling turn's drain remains the only consumer, so the no-loss property is
+# untouched.
+pending_wake_payloads() {
+  [ -s "$FM_WAKE_QUEUE" ] || return 1
+  fm_wake_print_deduped "$FM_WAKE_QUEUE" 2>/dev/null | cut -f5- | grep -v '^[[:space:]]*$'
+}
+
+# A cycle that ends with no healthy successor is a failure ONLY when the durable
+# wake queue proves nothing was delivered during it. See the header for why an
+# attached arm cannot see its watcher's own printed reason.
 fail_unexplained_cycle() {
+  local payloads count
+  if payloads=$(pending_wake_payloads) && [ -n "$payloads" ]; then
+    printf '%s\n' "$payloads"
+    return 0
+  fi
+  if [ "$(wake_seq_now)" -gt "$cycle_wake_seq_before" ]; then
+    count=$(( $(wake_seq_now) - cycle_wake_seq_before ))
+    echo "watcher: handed off $count queued wake(s) already taken by a handling turn"
+    return 0
+  fi
   echo "watcher: FAILED - cycle ended without an actionable reason"
   return 1
 }
@@ -286,7 +344,7 @@ attach_and_wait() {
     fi
     cycle_log_append unknown unknown attached-cycle-ended none
     fail_unexplained_cycle
-    return 1
+    return $?
   done
 }
 
@@ -436,7 +494,7 @@ owned_child_finished() {
     child=
     child_out=
     fail_unexplained_cycle
-    return 1
+    return $?
   fi
 
   reason_type="nonzero-exit"
