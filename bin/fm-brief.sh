@@ -49,6 +49,8 @@
 # declared-external-wait verb (FM_CLASSIFY_PAUSED_VERB, default "paused") from
 # "blocked:": pause for a known external wait expected to clear on its own,
 # blocked when firstmate must act.
+# Every scaffold includes one communication standard for text that a human reads.
+# The standard uses ASD-STE100 and the project's own domain terms.
 # Ship tasks include a project-memory section so durable project-intrinsic
 # learnings can be committed to AGENTS.md through the project's delivery path;
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
@@ -178,6 +180,21 @@ shell_quote() {
 
 STATUS_FILE=$(shell_quote "$STATE/$ID.status")
 
+IFS= read -r -d '' COMMUNICATION_STANDARD <<'EOF' || true
+# Communication standard
+Use ASD-STE100 Simplified Technical English for all text that a human reads.
+Use approved words.
+Put one idea in each short sentence.
+Use active voice and present tense when possible.
+Use a plain word instead of a new compound noun.
+Read `CONTEXT.md` and `AGENTS.md` in the project when they exist.
+Use the project terms for domain concepts.
+Do not invent synonyms.
+This standard applies to status lines, reports, PR titles, PR descriptions, and commit messages.
+This standard does not restrict code identifiers.
+EOF
+COMMUNICATION_STANDARD=${COMMUNICATION_STANDARD%$'\n'}
+
 if [ "$KIND" = secondmate ]; then
 SECONDMATE_PROJECTS=""
 idx=1
@@ -207,6 +224,8 @@ $SECONDMATE_CHARTER
 
 # Routing scope
 $SECONDMATE_SCOPE
+
+$COMMUNICATION_STANDARD
 
 # Project clones
 $PROJECT_CLONES_BODY
@@ -303,6 +322,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$COMMUNICATION_STANDARD
 
 $HERDR_SECTION
 
@@ -412,6 +433,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 
 # Task
 {TASK}
+
+$COMMUNICATION_STANDARD
 
 $HERDR_SECTION
 

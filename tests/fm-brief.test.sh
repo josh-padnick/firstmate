@@ -174,7 +174,63 @@ test_help_includes_entire_header() {
   local help
   help=$("$ROOT/bin/fm-brief.sh" --help)
   assert_contains "$help" "Refuses to overwrite an existing brief." "fm-brief.sh --help omitted its header terminator"
+  assert_contains "$help" "Every scaffold includes one communication standard for text that a human reads." \
+    "fm-brief.sh --help omitted the common communication standard"
   pass "fm-brief.sh: --help renders the complete header"
+}
+
+# Every public scaffold form must carry the common communication contract.
+# Generate each form through fm-brief.sh so this test checks output behavior.
+test_all_brief_variants_include_communication_standard() {
+  local home id brief variant
+  home="$TMP_ROOT/communication-standard-home"
+  mkdir -p "$home/data"
+
+  for variant in ship-no-mistakes ship-direct-pr ship-local-only scout secondmate herdr-ship herdr-scout; do
+    id="brief-writing-$variant"
+    case "$variant" in
+      ship-no-mistakes)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --mode no-mistakes >/dev/null 2>&1
+        ;;
+      ship-direct-pr)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --mode direct-PR >/dev/null 2>&1
+        ;;
+      ship-local-only)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --mode local-only >/dev/null 2>&1
+        ;;
+      scout)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --scout >/dev/null 2>&1
+        ;;
+      secondmate)
+        FM_HOME="$home" FM_SECONDMATE_CHARTER='Supervise sample work.' \
+          "$ROOT/bin/fm-brief.sh" "$id" --secondmate --no-projects >/dev/null 2>&1
+        ;;
+      herdr-ship)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --mode direct-PR --herdr-lab >/dev/null 2>&1
+        ;;
+      herdr-scout)
+        FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" sample --scout --herdr-lab >/dev/null 2>&1
+        ;;
+    esac
+
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$variant: brief was not scaffolded"
+    assert_grep "Use ASD-STE100 Simplified Technical English for all text that a human reads." "$brief" \
+      "$variant: brief omitted the named writing standard"
+    assert_grep "Put one idea in each short sentence." "$brief" \
+      "$variant: brief omitted the practical ASD-STE100 rules"
+    assert_grep "Use active voice and present tense when possible." "$brief" \
+      "$variant: brief omitted the voice and tense rules"
+    assert_grep "Read \`CONTEXT.md\` and \`AGENTS.md\` in the project when they exist." "$brief" \
+      "$variant: brief omitted the project-language sources"
+    assert_grep "Use the project terms for domain concepts." "$brief" \
+      "$variant: brief omitted the project vocabulary rule"
+    assert_grep "status lines, reports, PR titles, PR descriptions, and commit messages" "$brief" \
+      "$variant: brief omitted the human-facing scope examples"
+    assert_grep "This standard does not restrict code identifiers." "$brief" \
+      "$variant: brief applied the communication rule to code identifiers"
+  done
+  pass "fm-brief.sh: every scaffold form includes the common communication standard"
 }
 
 # Registry with one project per delivery mode. fm-brief.sh no longer reads it -
@@ -711,6 +767,7 @@ test_scout_and_secondmate_scaffold() {
 test_script_parses
 test_no_heredoc_in_command_substitution
 test_help_includes_entire_header
+test_all_brief_variants_include_communication_standard
 test_ship_modes_generate_clean_briefs
 test_ship_mode_is_required_and_closed_set
 test_ship_mode_is_explicit_not_registry
