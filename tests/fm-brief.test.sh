@@ -256,7 +256,7 @@ test_ship_mode_is_explicit_not_registry() {
   brief="$home/data/brief-explicit-a5/brief.md"
   grep -qx "Delivery contract: mode=no-mistakes" "$brief" \
     || fail "registered direct-PR posture overrode the explicit --mode"
-  assert_grep "Firstmate will then instruct you to run /no-mistakes" "$brief" \
+  assert_grep "firstmate decides when to instruct you to run /no-mistakes" "$brief" \
     "explicit no-mistakes brief did not render the pipeline definition of done"
 
   # An unregistered project is not a blocker either, because nothing is looked up.
@@ -299,6 +299,12 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
   brief="$home/data/$id/brief.md"
   assert_grep "The configured merge authority decides whether to merge the PR; firstmate relays the outcome." "$brief" \
     "direct-PR brief lost configured merge authority"
+  assert_grep "append \`done: {summary}\` to the status file and stop" "$brief" \
+    "direct-PR brief must stop at review readiness before push"
+  assert_grep "firstmate decides when to instruct you to push and open the PR, normally after the captain accepts the deliverable unless risk or an explicit instruction requires opening it sooner" "$brief" \
+    "direct-PR brief must defer push and PR until deliverable acceptance by default"
+  assert_grep "After firstmate instructs you, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\`" "$brief" \
+    "direct-PR brief must preserve its post-acceptance PR handoff"
   assert_no_grep "The captain reviews and merges the PR" "$brief" \
     "direct-PR brief hard-coded captain-only authority"
   id="brief-local-authority-a4"
@@ -306,6 +312,8 @@ test_faster_paths_use_configured_authority_without_stacked_review() {
   brief="$home/data/$id/brief.md"
   assert_grep "The configured merge authority approves the ready branch, then firstmate merges it into local \`main\` through the guarded fast-forward path." "$brief" \
     "local-only brief lost configured merge authority and guarded landing"
+  assert_grep "After the captain accepts the deliverable, firstmate will instruct one full local check run (the project's full test suite and lint, or its documented equivalent) on the final branch, and that run succeeding is required before the merge decision." "$brief" \
+    "local-only brief must require its post-acceptance full-check handoff"
   assert_no_grep "The captain approves the ready branch" "$brief" \
     "local-only brief hard-coded captain-only authority"
   assert_no_grep "Firstmate then reviews your branch diff" "$brief" \
@@ -369,6 +377,69 @@ test_ship_project_memory_wording() {
   assert_grep "lacks \`## Maintaining this file\`, add that short self-governance section" "$brief" \
     "project-memory contract lost the self-governance add-in-same-pass rule"
   pass "fm-brief.sh: ship project-memory wording carries the AGENTS.md authoring bar"
+}
+
+# R5: ship briefs carry a standing instruction that completeness on
+# parity-style work means scanning for the whole pattern family, not stopping
+# at an enumerated site list firstmate names.
+test_ship_parity_scan_wording() {
+  local home id brief
+  home="$TMP_ROOT/parity-scan-home"
+  mkdir -p "$home/data"
+  id="brief-parity-scan-e1"
+  FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode no-mistakes >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "ship brief was not scaffolded"
+  assert_grep "# Completeness for parity-style work" "$brief" \
+    "ship brief missing the parity-style completeness section"
+  assert_grep "what pattern or language to search for" "$brief" \
+    "ship brief missing the pattern-to-search element"
+  assert_grep "what treatment to apply to each match" "$brief" \
+    "ship brief missing the treatment-to-apply element"
+  assert_grep "the exhaustive done condition" "$brief" \
+    "ship brief missing the exhaustive-done-condition element"
+  assert_grep "Any known sites named above are examples, not the scope boundary" "$brief" \
+    "ship brief missing the known-sites-are-examples clarification"
+  pass "fm-brief.sh: ship briefs instruct the worker to scan the pattern family, not enumerate sites"
+}
+
+# Captain-gated delivery: every ship mode carries a deliverable review
+# evidence section (all applicable lenses, task-owned evidence path, no new
+# merge authority), and Rule 2's worktree-isolation line explicitly carves
+# out that evidence path so it does not contradict "stay inside this
+# worktree" the way the R7-era preview-only section once did.
+test_ship_deliverable_review_evidence_wording() {
+  local home id brief
+  home="$TMP_ROOT/review-evidence-home"
+  mkdir -p "$home/data"
+
+  for id_mode in "brief-evidence-nm:no-mistakes" "brief-evidence-dp:direct-PR" "brief-evidence-lo:local-only"; do
+    id=${id_mode%%:*}
+    mode=${id_mode##*:}
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj --mode "$mode" >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$mode brief was not scaffolded"
+    assert_grep "# Deliverable review evidence" "$brief" \
+      "$mode brief missing the deliverable review evidence section"
+    assert_grep "Feature or product-concept:" "$brief" \
+      "$mode brief missing the feature/product-concept lens"
+    assert_grep "Architecture:" "$brief" \
+      "$mode brief missing the architecture lens"
+    assert_grep "Bug fix:" "$brief" \
+      "$mode brief missing the bug-fix lens"
+    assert_grep "Other work:" "$brief" \
+      "$mode brief missing the other-work lens"
+    assert_grep "Save every artifact under \`$home/data/$id/\`" "$brief" \
+      "$mode brief missing the task-owned evidence path"
+    assert_grep "report its openable \`file://\` path(s)" "$brief" \
+      "$mode brief missing the openable-path surfacing instruction"
+    assert_grep "does not create a second merge authority" "$brief" \
+      "$mode brief missing the single-merge-authority guardrail"
+    assert_grep "the only files you may write outside it are the status file below and, when applicable, deliverable review evidence under" "$brief" \
+      "$mode brief's worktree-isolation rule does not carve out the evidence path"
+  done
+
+  pass "fm-brief.sh: every ship mode requires deliverable review evidence with an explicit worktree carve-out"
 }
 
 test_herdr_lab_contract_is_explicit_and_complete() {
@@ -719,6 +790,8 @@ test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_ship_parity_scan_wording
+test_ship_deliverable_review_evidence_wording
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path

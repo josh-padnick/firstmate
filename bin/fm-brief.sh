@@ -30,10 +30,10 @@
 # For ship tasks, --mode is REQUIRED and shapes the definition of done. Firstmate
 # resolves it per task at intake (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never reads it:
-#   no-mistakes  implement -> /no-mistakes pipeline -> PR -> configured merge authority
-#   direct-PR    implement -> push + open PR via gh-axi (no pipeline) -> configured merge authority
-#   local-only   implement on branch, stop and report "ready in branch" (no push/PR);
-#                the configured merge authority approves, firstmate merges to local main
+#   no-mistakes  implement -> review readiness -> deliverable acceptance -> /no-mistakes pipeline -> PR -> configured merge authority
+#   direct-PR    implement -> review readiness -> deliverable acceptance -> push + PR + CI -> configured merge authority
+#   local-only   implement -> review readiness -> deliverable acceptance -> full local checks (no push/PR);
+#                report ready, then configured merge authority approves the guarded local merge
 # no-mistakes-prod-only is a registry policy, not a task mode; resolve it to one of
 # the three concrete modes at intake before calling this script.
 # The generated ship brief records the chosen mode as a fixed machine-readable
@@ -54,6 +54,11 @@
 # it carries the AGENTS.md authoring bar (widely useful knowledge only, pointers
 # over copied detail) and has the crewmate add the fm-ensure-agents-md.sh
 # self-governance section when a touched project AGENTS.md lacks it.
+# Ship tasks also include a standing "Completeness for parity-style work"
+# section instructing the worker to scan for the whole pattern/selector/contract
+# family on parity-style work rather than stopping at an enumerated site list;
+# see .agents/skills/ask-user-authority/SKILL.md "Simple-ship parity authority"
+# for how that scan interacts with a reviewer finding a missed family member.
 # Refuses to overwrite an existing brief.
 set -eu
 
@@ -351,6 +356,29 @@ fi
 # delivery mode, validated above. The generated DOD opens with the fixed
 # "Delivery contract: mode=<mode>" line that bin/fm-spawn.sh checks against its own
 # explicit --mode before launching.
+# Deliverable review evidence (captain-gated delivery workflow; load
+# `captain-gated-delivery` for the full procedure): rendered for every mode,
+# since the deliverable review loop runs before firstmate decides to invoke
+# full validation regardless of how the task eventually ships. The captain
+# still owns the merge exactly as $RULE1/DOD already say for this mode; this
+# section only moves WHEN evidence reaches them, never who decides.
+IFS= read -r -d '' REVIEW_EVIDENCE_SECTION <<EOF || true
+
+# Deliverable review evidence
+This task's result goes through a captain review loop before full validation ships it. Before you start implementing, identify which review lenses below apply and capture any before-state evidence that would be hard to recreate later (a failing repro, a screenshot or recording of the current broken behavior).
+
+Applicable lenses - use every one that fits, and skip a lens only when no meaningful human judgment can be exercised over that aspect of the result:
+- Feature or product-concept: an openable preview, screenshots, or a recording of the working experience, plus a short explanation of any new concepts, states, or rules this introduces.
+- Architecture: a before/after summary of the affected modules, ownership boundaries, data flow, and the rationale for the chosen structure.
+- Bug fix: paired before/after evidence of the same reproducible scenario - recordings by default, or the closest paired evidence (failing/passing tests, transcripts, logs) when recording is not meaningful, stating why recordings were omitted.
+- Other work: the artifact that exposes the meaningful result (rendered docs, runnable examples, measurements, or behavioral tests).
+
+Save every artifact under \`$DATA/$ID/\` and report its openable \`file://\` path(s) in a status line as soon as it exists - do not wait until the rest of the task is finished, so firstmate can build the review package right away.
+This evidence capture does not create a second merge authority: the configured merge authority for this task's delivery mode still owns the merge decision exactly as this brief already says.
+
+EOF
+REVIEW_EVIDENCE_SECTION=${REVIEW_EVIDENCE_SECTION%$'\n'}
+
 case "$MODE" in
   direct-PR)
     SETUP2=""
@@ -360,7 +388,9 @@ case "$MODE" in
 Delivery contract: mode=direct-PR
 This task ships **direct-PR**: you raise the PR yourself, without the no-mistakes pipeline.
 The task is complete only when committed on your branch.
-When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
+When you believe it is complete, run only the targeted builds, regressions, and smoke tests needed to make the result safe and credible to review (not necessarily the full suite), then append \`done: {summary}\` to the status file and stop.
+This \`done:\` milestone means implementation and review evidence are ready, not that the branch has been pushed - firstmate decides when to instruct you to push and open the PR, normally after the captain accepts the deliverable unless risk or an explicit instruction requires opening it sooner.
+After firstmate instructs you, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
 EOF
     ;;
@@ -374,6 +404,7 @@ This task ships **local-only**: no remote, no PR, no pipeline.
 The task is complete only when committed on your branch \`fm/$ID\`. Do NOT push, do NOT open a PR, do NOT merge.
 Keep your branch a clean fast-forward onto the current default branch - if \`main\` has advanced, rebase onto it so the eventual merge stays a fast-forward.
 When it is implemented and committed, append \`done: ready in branch fm/$ID\` to the status file and stop.
+After the captain accepts the deliverable, firstmate will instruct one full local check run (the project's full test suite and lint, or its documented equivalent) on the final branch, and that run succeeding is required before the merge decision.
 The configured merge authority approves the ready branch, then firstmate merges it into local \`main\` through the guarded fast-forward path.
 EOF
     ;;
@@ -385,8 +416,8 @@ EOF
 # Definition of done
 Delivery contract: mode=no-mistakes
 The task is complete only when committed on your branch.
-When you believe it is complete, append \`done: {summary}\` to the status file and stop.
-Firstmate will then instruct you to run /no-mistakes to validate and ship a PR.
+When you believe it is complete, run only the targeted builds, regressions, and smoke tests needed to make the result safe and credible to review (not necessarily the full suite), then append \`done: {summary}\` to the status file and stop.
+This \`done:\` milestone means implementation and review evidence are ready, not that full validation has happened - firstmate decides when to instruct you to run /no-mistakes, normally after the captain accepts the deliverable unless risk requires validating sooner.
 
 You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the guidance no-mistakes itself provides for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
@@ -415,6 +446,16 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 # Task
 {TASK}
 
+# Completeness for parity-style work
+When this task's intent is to make one thing behave like another, or otherwise complete an existing pattern (parity, fill, or alignment completions), completeness is defined by three things, which the Task section above should already state:
+- what pattern or language to search for;
+- what treatment to apply to each match; and
+- the exhaustive done condition (when no member of that family remains untreated).
+Any known sites named above are examples, not the scope boundary - search for every member of the family yourself rather than stopping at an enumerated list.
+Example shape: "search for every rule targeting X, apply the same treatment to Y, and finish when no member of that family remains untreated."
+A reviewer finding a missed family member is ordinary in-scope parity work, not new product scope.
+If this task is not parity-style work, disregard this section.
+
 $HERDR_SECTION
 
 # Setup
@@ -428,7 +469,7 @@ If the top-level path is the primary checkout or not the worktree you were launc
 
 # Rules
 $RULE1
-2. Stay inside this worktree; modify nothing outside it.
+2. Stay inside this worktree; the only files you may write outside it are the status file below and, when applicable, deliverable review evidence under \`$DATA/$ID/\`.
 3. Use gh-axi for GitHub operations and chrome-devtools-axi for browser operations.
 4. Report status by appending one line:
    \`echo "{state}: {one short line}" >> $STATUS_FILE\`
@@ -458,7 +499,7 @@ Record only project knowledge useful to almost every future session.
 For anything the codebase already shows, prefer a pointer to the authoritative file, command, or doc over copying the detail.
 If you touch a project \`AGENTS.md\` that lacks \`## Maintaining this file\`, add that short self-governance section from \`$FM_ROOT/bin/fm-ensure-agents-md.sh\` in the same pass.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
-
+$REVIEW_EVIDENCE_SECTION
 $DOD
 EOF
 echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK})"
