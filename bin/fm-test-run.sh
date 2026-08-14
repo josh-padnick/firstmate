@@ -207,6 +207,9 @@ family_for_basename() {
     fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
       ;;
+    fm-linear-poll.test.sh|fm-linear-act.test.sh)
+      printf '%s\n' linear
+      ;;
     fm-afk-inject-e2e.test.sh|fm-afk-return.test.sh)
       printf '%s\n' afk
       ;;
@@ -253,6 +256,7 @@ snapshot-bearings
 cmux
 zellij
 orca
+linear
 unclassified
 EOF
 }
@@ -926,6 +930,9 @@ families_for_changed_path() {
       printf '%s\n' snapshot-bearings
       printf '%s\n' pure-contract-unit
       printf '%s\n' secondmate
+      ;;
+    bin/fm-linear-*)
+      printf '%s\n' linear
       ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)

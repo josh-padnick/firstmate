@@ -333,6 +333,25 @@ The locked bootstrap inheritance pass uses the same placement-specific behavior;
 That live discovery starts from `state/*.meta` records with `kind=secondmate`; `data/secondmates.md` only backfills `home=` for older or incomplete meta records.
 Skipped items, such as a destination checkout that does not yet gitignore the item, are visible warnings but not hard failures.
 
+## Linear event ledger (.env)
+
+A home opts into Linear by placing a non-empty `LINEAR_API_KEY` in its private `.env`.
+The locked bootstrap pass then writes and hash-registers `state/fm-linear-inbox.check.sh`, which dispatches the tracked `bin/fm-linear-poll.sh`, and writes the shared connector cadence file `config/x-mode.env` with a 30-second interval.
+Bootstrap never copies the key into generated state.
+
+The poller reads author-attributed comments and issue history, atomically publishes captain events under `state/linear-inbox/`, records content-aware dedupe keys in `state/.linear-seen.tsv`, and only then advances the server-timestamp cursors in `state/.linear-cursor`.
+It retains self-authored events in the ledger without waking, so Firstmate's own writes never absorb a time window that could contain captain input.
+Comment keys include the body hash, so edits wake again while reply-only `updatedAt` bumps with unchanged bodies remain silent.
+The `linear-operations` skill owns how a wake drains and acknowledges the durable inbox.
+
+All Firstmate state, assignee, and comment writes use `bin/fm-linear-act.sh`.
+It journals intent under `state/linear-outbox/`, derives assignee from the target status, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
+Unfinished journals are replayed with `fm-linear-act.sh resume`.
+
+On its first successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.
+It removes them only after the replacement shim has been published and registered.
+If the key later disappears, bootstrap preserves the armed shim so the next sweep emits a loud board-channel failure instead of silently disabling observation.
+
 ## Relay (.env)
 
 Relay lets a firstmate instance answer public mentions and act on normal reversible mention requests through firstmate's normal lifecycle.
@@ -356,15 +375,16 @@ To turn it on:
 The dashboard owns account creation, identity linking, bot installation, and token issuance; this document owns only what the local firstmate home does with the token once it is in `.env`.
 
 The locked session-start bootstrap step turns the token into local generated state.
-It writes `state/x-watch.check.sh`, a byte-static identity shim for `bin/fm-x-poll.sh`, and `config/x-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in that home.
+It writes `state/x-watch.check.sh`, a byte-static identity shim for `bin/fm-x-poll.sh`, and the shared connector cadence file `config/x-mode.env`, which exports `FM_CHECK_INTERVAL=30` for watcher processes in a home with Relay or Linear enabled.
 The watcher accepts the shim only when its bytes match the expected generated content, then invokes the trusted repository poll script directly instead of executing state-file source.
-This section is the single owner of the Relay cadence contract: a Relay instance polls every 30 seconds instead of the default 300, only a Relay instance speeds up because a non-Relay home has no `config/x-mode.env`, and the session-start supervision operating block includes the cadence instruction when that file exists.
+The connector cadence contract is 30 seconds whenever Relay or Linear is enabled and the default 300 seconds when neither integration owns `config/x-mode.env`.
+The session-start supervision operating block includes the cadence instruction whenever that file exists.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
 While away mode is active the daemon owns the watcher and its default cadence applies; away-mode Relay cadence is a deferred follow-up.
-When the token is removed or empty, the next locked session-start bootstrap step removes those artifacts.
+When the token is removed or empty, the next locked session-start bootstrap step removes the Relay shim and removes the cadence file only when Linear is also off.
 Steady-state off is silent and writes nothing.
-Relay remains additive to non-Relay lifecycle behavior: homes without the generated artifacts keep the default watcher cadence and do not run the Relay poll.
+Relay remains additive to non-Relay lifecycle behavior: homes without either connector's generated artifacts keep the default watcher cadence and do not run the Relay poll.
 Its request handling remains in Relay-specific `bin/` scripts and the `fmx-respond` skill, while the watcher owns authenticated dispatch from the generated local identity shim.
 
 `bin/fm-x-poll.sh` calls `GET /connector/poll` with `Authorization: Bearer <FMX_PAIRING_TOKEN>`.
