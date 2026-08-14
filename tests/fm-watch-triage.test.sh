@@ -281,6 +281,26 @@ test_status_is_paused_classifier() {
   pass "status_is_paused: only the leading paused verb matches, and paused is not captain-relevant"
 }
 
+# status_is_captain_held: the shared verb test that tells a durable captain-held
+# decision transfer apart from a genuine declared external wait, so a caller
+# (handle_paused_stale) can give the two different periodic-recheck treatment
+# even though pause_state_class bounces both through the same bounded-absorb
+# class. Matches only the verb before the first colon.
+test_status_is_captain_held_classifier() {
+  status_is_captain_held 'captain-held [key=route]: tracked by task-decision-route' \
+    || fail "captain-held verb not recognized"
+  status_is_captain_held '  captain-held [key=x]:   tracked by task-x' \
+    || fail "leading-space captain-held verb not recognized"
+  status_is_captain_held 'paused: holding for the upstream release' \
+    && fail "a declared external-wait pause false-matched as captain-held"
+  status_is_captain_held 'blocked: captain-held decision pending' \
+    && fail "a blocked line mentioning captain-held false-matched"
+  status_is_captain_held 'resolved [key=route]: captain answered' \
+    && fail "resolved decision remained classed as captain-held"
+  status_is_captain_held '' && fail "empty line classified as captain-held"
+  pass "status_is_captain_held: only the leading captain-held verb matches"
+}
+
 # crew_absorb_class: the single fm-crew-state.sh read that returns BOTH absorb
 # reasons - working (active run/busy pane), paused (declared external wait), or none
 # (surface it) - so the watcher's stale path gets both for one bounded call.
@@ -853,10 +873,13 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
   pass "a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated"
 }
 
-# A captain-held crew can leave a stable backend endpoint after its agent exits.
-# fm-crew-state then authoritatively reports stopped rather than paused, but the
-# confirmed-dead agent plus the declared wait or captain-held transfer must retain
-# bounded pause handling.
+# A declared-pause crew can leave a stable backend endpoint after its agent
+# exits. fm-crew-state then authoritatively reports stopped rather than
+# paused, but the confirmed-dead agent plus the declared wait must retain
+# bounded pause handling. (The sibling captain-held case - same confirmed-dead
+# handling, but never re-surfaced at all - is covered separately by
+# test_exited_captain_held_never_resurfaces, since Linear BIG-45 gave it
+# different periodic-recheck behavior.)
 # A still-live agent at an external-decision gate is the disconfirming case: it
 # must surface once, while the unchanged hash must not append the same wake on
 # every watcher re-arm.
@@ -884,38 +907,16 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
       FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
       FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
     pid=$!
-    if wait_live "$pid" 15; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
+    if wait_live "$pid" 30; then reap "$pid"; else wait "$pid" || fail "dead-agent watcher round $round failed"; fi
     round=$((round + 1))
   done
-  wakes=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
-  bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  wakes=$([ -e "$state/.wake-queue" ] && awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" || printf 0)
+  bare=$([ -e "$state/.wake-queue" ] && awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue" || printf 0)
+  [ "$wakes" -ge 1 ] || fail "dead-agent declared pause never re-surfaced across six polls past the threshold"
   [ "$wakes" -le 1 ] || fail "dead-agent declared pause flooded $wakes stale wakes across six unchanged polls"
   [ "$bare" -eq 0 ] || fail "dead-agent declared pause surfaced as $bare bare stopped-crew wakes"
   grep -F "awaiting external" "$state/.wake-queue" >/dev/null \
     || fail "dead-agent declared pause did not use the bounded paused recheck"
-
-  dir=$(make_case exited-captain-held); state="$dir/state"; fakebin="$dir/fakebin"
-  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
-  window="test:fm-held"
-  printf 'idle bare shell after captain-held transfer\n' > "$capture_file"
-  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/held.meta"
-  printf 'captain-held [key=route]: tracked by held-decision-route\n' > "$statusf"
-  back=$(( $(date +%s) - 500 ))
-  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
-  else touch -m -d "@$back" "$statusf"; fi
-  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
-  key=$(printf '%s' "$window" | tr ':/.' '___')
-  pane_hash=$(hash_text "idle bare shell after captain-held transfer")
-  printf '%s' "$pane_hash" > "$state/.hash-$key"
-  printf '1\n' > "$state/.count-$key"
-  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
-    FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
-    FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
-    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" > "$out" &
-  pid=$!
-  wait_for_exit "$pid" 40 || fail "captain-held dead-agent pane did not re-surface on the bounded cadence"
-  grep -F "awaiting external" "$state/.wake-queue" >/dev/null \
-    || fail "captain-held dead-agent pane surfaced as a stopped crew"
 
   dir=$(make_case alive-decision-gate); state="$dir/state"; fakebin="$dir/fakebin"
   out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/gate.status"
@@ -959,7 +960,49 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   bare=$(awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w && $5 == "stale: " w { n++ } END { print n + 0 }' "$state/.wake-queue")
   [ "$wakes" -eq 1 ] || fail "live external-decision gate should surface once, got $wakes wakes"
   [ "$bare" -eq 1 ] || fail "live external-decision gate lost its immediate bare stale surface"
-  pass "exited declared-pause and captain-held panes use bounded pause cadence while a live decision gate still surfaces once"
+  pass "an exited declared-pause pane uses bounded pause cadence while a live decision gate still surfaces once"
+}
+
+# Linear BIG-45: a captain-held transfer is already durable in the captain-held
+# backlog record (fm-decision-hold.sh), so re-surfacing its idle pane on the
+# same PAUSE_RESURFACE_SECS cadence used for a genuine declared external wait
+# only costs a supervision turn to confirm nothing changed. Same confirmed-dead
+# setup as the declared-pause case above (and the same tight threshold that
+# proves that sibling case DOES re-surface), but across the same six polls this
+# pane must never enqueue a recheck wake at all - while still being absorbed
+# (not wedge-escalated) via the ordinary bounded-pause bookkeeping.
+test_exited_captain_held_never_resurfaces() {
+  local dir state fakebin out capture_file statusf window key pane_hash sig pid back round wakes
+  dir=$(make_case exited-captain-held); state="$dir/state"; fakebin="$dir/fakebin"
+  out="$dir/watch.out"; capture_file="$dir/pane.txt"; statusf="$state/held.status"
+  window="test:fm-held"
+  printf 'idle bare shell after captain-held transfer\n' > "$capture_file"
+  printf 'window=%s\nkind=ship\nharness=grok\nbackend=tmux\n' "$window" > "$state/held.meta"
+  printf 'captain-held [key=route]: tracked by held-decision-route\n' > "$statusf"
+  back=$(( $(date +%s) - 500 ))
+  if [ "$(uname)" = Darwin ]; then touch -mt "$(date -r "$back" '+%Y%m%d%H%M.%S')" "$statusf"
+  else touch -m -d "@$back" "$statusf"; fi
+  sig=$(seen_sig "$statusf"); printf '%s' "$sig" > "$state/.seen-held_status"
+  key=$(printf '%s' "$window" | tr ':/.' '___')
+  pane_hash=$(hash_text "idle bare shell after captain-held transfer")
+  printf '%s' "$pane_hash" > "$state/.hash-$key"
+  printf '1\n' > "$state/.count-$key"
+
+  round=1
+  while [ "$round" -le 6 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$window" FM_FAKE_TMUX_CAPTURE="$capture_file" \
+      FM_FAKE_TMUX_CURRENT_COMMAND=zsh FM_FAKE_CREW_STATE='state: stopped · source: pane · bare shell' \
+      FM_STATE_OVERRIDE="$state" FM_CREW_STATE_BIN="$fakebin/fm-crew-state.sh" FM_PAUSE_RESURFACE_SECS=240 FM_POLL=1 FM_SIGNAL_GRACE=1 \
+      FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+    pid=$!
+    if wait_live "$pid" 30; then reap "$pid"; else wait "$pid" || fail "captain-held watcher round $round failed"; fi
+    round=$((round + 1))
+  done
+  wakes=$([ -e "$state/.wake-queue" ] && awk -F '\t' -v w="$window" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue" || printf 0)
+  [ "$wakes" -eq 0 ] || fail "captain-held pane enqueued $wakes recheck wakes across six polls past the threshold - it must never re-surface"
+  [ -e "$state/.paused-$key" ] || fail "captain-held pane lost its bounded-absorb pause marker"
+  [ ! -e "$state/.stale-since-$key" ] || fail "captain-held pane started the wedge timer instead of the (silenced) pause path"
+  pass "a captain-held pane is absorbed via the bounded-pause path but never re-surfaces a periodic recheck wake"
 }
 
 test_secondmate_paused_resurfaces_in_normal_mode() {
@@ -1981,6 +2024,7 @@ test_scan_captain_relevant_statuses_classifier
 test_classifier_primitives
 test_crew_is_provably_working_classifier
 test_status_is_paused_classifier
+test_status_is_captain_held_classifier
 test_crew_absorb_class_classifier
 test_signal_crew_provably_working_classifier
 test_provably_working_signal_absorbed
@@ -2005,6 +2049,7 @@ test_nonterminal_stale_not_working_surfaced
 test_unknown_busy_verdict_paces_repeat_wedge_escalations
 test_nonterminal_stale_paused_absorbed_then_resurfaced
 test_exited_declared_pause_is_bounded_but_live_gate_surfaces
+test_exited_captain_held_never_resurfaces
 test_secondmate_paused_resurfaces_in_normal_mode
 test_secondmate_nonpaused_stale_remains_suppressed
 test_secondmate_unpause_clears_pause_tracking

@@ -163,9 +163,11 @@ BUSY_TURN_MAX_SECS=${FM_BUSY_TURN_MAX_SECS:-3600}
 # A crew that declared a pause is idling on a known external wait, so its stale
 # pane is absorbed rather than wedge-escalated.
 # A captain-held or paused crew whose agent has confidently exited uses the same
-# bounded cadence, while a live or ambiguously read agent still surfaces once.
-# These cases re-surface once for a recheck every PAUSE_RESURFACE_SECS - far
-# longer than the wedge threshold, but finite so a forgotten hold cannot rot invisibly.
+# bounded-absorb cadence, while a live or ambiguously read agent still surfaces
+# once. A declared external wait re-surfaces once for a recheck every
+# PAUSE_RESURFACE_SECS - far longer than the wedge threshold, but finite so a
+# forgotten wait cannot rot invisibly; a captain-held transfer's own re-surface
+# behavior is owned by handle_paused_stale below.
 PAUSE_RESURFACE_SECS=${FM_PAUSE_RESURFACE_SECS:-$FM_PAUSE_RESURFACE_SECS_DEFAULT}
 # The same bounded-reminder cadence for a pane parked on a terminal status the
 # captain has already been shown (handle_terminal_parked_stale). A parked result
@@ -379,10 +381,14 @@ busy_turn_over_age() {  # <task>
 }
 
 # Absorb a stale pane under a declared external-wait pause (paused:) or a
-# dead-agent captain-held transfer, and re-surface it once every
-# PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly. Called on any
-# stale poll once pause_state_class permits the bounded cadence, so it must be
-# cheap: it NEVER re-reads crew state. The re-surface age is anchored on the
+# dead-agent captain-held transfer. A declared external wait re-surfaces once
+# every PAUSE_RESURFACE_SECS for a recheck so it cannot rot invisibly; a
+# captain-held transfer never re-surfaces this pane at all, because the
+# decision itself is already durable in the captain-held backlog record
+# (fm-decision-hold.sh) - a periodic "still paused, come check" wake would only
+# cost a supervision turn to confirm nothing changed (Linear BIG-45). Called on
+# any stale poll once pause_state_class permits the bounded cadence, so it must
+# be cheap: it NEVER re-reads crew state. The re-surface age is anchored on the
 # status file mtime, not a per-hash marker, so a churny idle pane (a ticking
 # clock, a token counter) cannot keep resetting the cadence the way a hash-tied
 # timer would. A .paused-resurfaced-<key> throttle marker records the last
@@ -395,6 +401,10 @@ handle_paused_stale() {  # <window> <task> <hash>
   : > "$STATE/.paused-$key"
   rm -f "$STATE/.stale-since-$key" "$STATE/.wedge-escalations-$key" "$STATE/.stale-noevidence-$key"
   statusf="$STATE/$task.status"
+  if status_is_captain_held "$(last_status_line "$statusf")"; then
+    triage_log "absorbed stale (captain-held, awaiting captain review - no periodic recheck): $win"
+    return
+  fi
   mtime=$(stat_mtime "$statusf")
   case "$mtime" in ''|*[!0-9]*) mtime=$(date +%s) ;; esac
   age=$(( $(date +%s) - mtime ))
@@ -1166,8 +1176,9 @@ EOF
           #     pane (e.g. waiting on CI), so absorb and start the wedge timer so a
           #     genuinely frozen run still escalates past STALE_ESCALATE_SECS;
           #   - paused: the crew declared an external wait, or a declared pause or
-          #     captain hold is paired with a confidently dead agent, so absorb on
-          #     the long PAUSE_RESURFACE_SECS cadence instead of wedge-escalating;
+          #     captain hold is paired with a confidently dead agent, so absorb
+          #     instead of wedge-escalating (handle_paused_stale owns which of
+          #     the two re-surfaces and which stays silent);
           #   - none: no running pipeline, no exact busy verdict, no declared pause.
           #     Surface immediately so firstmate inspects the inconclusive state
           #     (it may be done via an interactive menu that wrote no done: status,
