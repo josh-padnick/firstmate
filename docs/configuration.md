@@ -345,7 +345,7 @@ Incomplete provider traversals are privately checkpointed under `state/.linear-h
 Every durable event carries explicit `captain`, `non-captain`, or `unattributed` authority; only the configured `LINEAR_CAPTAIN_ID` produces captain instructions, while the authenticated viewer ID alone identifies Firstmate writes.
 Initial activation durably fixes its normal event-ingestion horizon at two hours before the first fetch and advances a resumable one-page-per-sweep historical comment-head scan, so retries cannot move that horizon and a mature board cannot block activation.
 An old comment not yet reached by that scan is classified from Linear's `editedAt` signal, so a reply-only parent bump seeds its current head silently while an actual edit still wakes.
-It retains self-authored events in the ledger without waking, so Firstmate's own writes never absorb a time window that could contain captain input.
+It consumes self-authored changes into deduplication, thread-participation, and outbox-observation state without publishing inbox events or waking, so Firstmate's own writes never absorb a time window that could contain captain input.
 Comment transitions include the body hash, `editedAt`, and server update timestamp, so a same-hash edit occurrence and an A-to-B-to-A edit wake while reply-only `updatedAt` bumps remain silent.
 New issue ownership is label-only: only the `Firstmate` label wakes Firstmate for an issue-created event, while assignment and body text do not establish ownership.
 On an unlabelled issue, a mention is required to start a comment thread; after Firstmate has commented in that thread, every later reply wakes without another mention.
@@ -392,7 +392,7 @@ The connector cadence contract is 30 seconds whenever Relay or Linear is enabled
 The session-start supervision operating block includes the cadence instruction whenever that file exists.
 The active primary-harness supervision protocol owns how that sourced cadence reaches the watcher process.
 Because `bin/fm-watch.sh` reads `FM_CHECK_INTERVAL` only at process start, a cadence transition - opt-in while a watcher is already running, or opt-out - is applied by restarting the home-scoped watcher through the emitted harness protocol; bootstrap deliberately never restarts the watcher itself.
-While away mode is active the daemon owns the watcher and its default cadence applies; away-mode Relay cadence is a deferred follow-up.
+While away mode is active the daemon owns the watcher and its default cadence applies; away-mode connector cadence is a deferred follow-up.
 When the token is removed or empty, the next locked session-start bootstrap step removes the Relay shim and removes the cadence file only when Linear is also off.
 Steady-state off is silent and writes nothing.
 Relay remains additive to non-Relay lifecycle behavior: homes without either connector's generated artifacts keep the default watcher cadence and do not run the Relay poll.
@@ -568,7 +568,7 @@ FM_HEARTBEAT=600        # base seconds between heartbeat scans; no-change heartb
 FM_HEARTBEAT_MAX=7200   # heartbeat backoff cap
 FM_INACTIVE_RECONCILE_SECS=900  # 60..1800-second watcher cadence and inactivity threshold; locked session start also scans immediately
 FM_INACTIVE_RECONCILE_BUDGET_SECS=10  # 1..30-second aggregate bound per inactive-outcome scan
-FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or Relay dispatch)
+FM_CHECK_INTERVAL=300   # seconds between slow checks (authenticated merge polls, custom checks, or connector dispatch)
 FM_CHECK_TIMEOUT=30     # seconds allowed per slow check script
 FM_PROCEVENT_MAX_OUTPUT_BYTES=1048576   # bound on one captured process-to-event result
 FM_PROCEVENT_CLAIM_ROOT=                # machine-wide source claim root; default $XDG_STATE_HOME/firstmate/procevent-claims

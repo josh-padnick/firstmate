@@ -910,13 +910,14 @@ connector_cadence_publish() {  # <path>
 # Drops two idempotent, gitignored artifacts:
 #   state/x-watch.check.sh - byte-static identity shim; the watcher validates
 #                            its bytes and invokes bin/fm-x-poll.sh directly
-#   config/x-mode.env      - exports FM_CHECK_INTERVAL=30, sourced by the watcher
-#                            arm so only an X instance polls at the 30s cadence
-# On opt-out (no token, or empty) it removes any such artifacts so the instance
-# reverts to the default 300s no-poll behavior. Absent a token AND with no leftover
-# artifacts it is a complete no-op (nothing written, nothing printed), so a non-X
-# user sees zero change. Prints one confirmation line on opt-in, and one on opt-out
-# only when it actually removed artifacts. It never touches the watcher itself;
+#   config/x-mode.env      - shared Relay or Linear FM_CHECK_INTERVAL=30 cadence,
+#                            sourced by the watcher arm
+# On Relay opt-out (no token, or empty) it removes the Relay shim and removes the
+# shared cadence only when Linear is also inactive. With no token, no Relay shim,
+# and no orphaned shared cadence it is a complete no-op (nothing written, nothing
+# printed), so a home with neither connector sees zero change. Prints one
+# confirmation line on opt-in, and one on opt-out only when it actually removed
+# artifacts. It never touches the watcher itself;
 # applying a cadence transition to a running watcher is the caller's job via
 # the emitted harness-aware supervision repair instruction.
 x_mode_setup() {

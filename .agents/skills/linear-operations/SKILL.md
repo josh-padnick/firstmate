@@ -43,7 +43,7 @@ Use `bin/fm-linear-act.sh` for every state, assignee, and comment write.
 Do not call `linear-axi issue update`, `issueUpdate`, or `commentCreate` directly for those writes.
 The script's header and `--help`-shaped usage block own its exact subcommands.
 
-Use `handoff-to-captain` when the board enters a captain-owned review or decision state.
+Use `handoff-to-captain` when the board enters a captain-owned review state.
 Use `take-from-captain` when accepted input returns the board to a Firstmate-owned state.
 Use `reply` for a comment-only response in the captain's existing thread.
 Use `escalate` for a visible Firstmate or captain decision gate.

@@ -383,6 +383,10 @@
     {
       "path": "skills/stow/SKILL.md",
       "audience": "public-product"
+    },
+    {
+      "path": "tests/fixtures/legacy-linear-inbox.check.sh.txt",
+      "audience": "maintainer-verification"
     }
   ]
 }
