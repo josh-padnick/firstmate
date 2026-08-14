@@ -129,6 +129,17 @@ update_journal_phase() {  # <journal> <phase>
   fm_linear_atomic_file "$journal" 600 < "$updated" || die "cannot publish write journal phase"
 }
 
+test_pause_after_mutation() {
+  local control=${FM_LINEAR_TEST_PAUSE_AFTER_MUTATION_DIR:-} attempts=0
+  [ -n "$control" ] || return 0
+  : > "$control/ready" || die "cannot publish mutation pause signal"
+  while [ ! -e "$control/release" ]; do
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt 1000 ] || die "timed out waiting for mutation pause release"
+    sleep 0.01
+  done
+}
+
 apply_state_mutation() {  # <journal>
   local journal=$1 payload="$TMP_ROOT/mutate-payload.json" response="$TMP_ROOT/mutate-response.json" query
   [ "$(jq -r '.target_state // empty' "$journal")" != "" ] || return 0
@@ -143,13 +154,14 @@ apply_state_mutation() {  # <journal>
   api issueUpdate "$payload" "$response"
   jq -e '.data.issueUpdate.success == true' "$response" >/dev/null 2>&1 || die "atomic state and assignee mutation was not accepted"
   update_journal_phase "$journal" mutated
+  test_pause_after_mutation
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION:-0}" = 1 ]; then
     kill -KILL "$$"
   fi
 }
 
 post_comment() {  # <journal>
-  local journal=$1 phase payload="$TMP_ROOT/comment-payload.json" response="$TMP_ROOT/comment-response.json" query
+  local journal=$1 phase payload="$TMP_ROOT/comment-payload.json" response="$TMP_ROOT/comment-response.json" query accepted=0
   phase=$(jq -r '.phase // "journaled"' "$journal")
   [ "$phase" != verified ] || return 0
   if [ "$(jq -r '.target_state // empty' "$journal")" != "" ] && [ "$phase" = journaled ]; then
@@ -172,6 +184,11 @@ post_comment() {  # <journal>
     esac
   elif ! jq -e '.data.commentCreate.success == true' "$response" >/dev/null 2>&1; then
     die "comment mutation was not accepted"
+  else
+    accepted=1
+  fi
+  if [ "$accepted" -eq 1 ] && [ "${FM_LINEAR_TEST_KILL_AFTER_COMMENT_ACCEPTED:-0}" = 1 ]; then
+    kill -KILL "$$"
   fi
   update_journal_phase "$journal" commented
 }

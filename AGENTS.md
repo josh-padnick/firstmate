@@ -76,6 +76,7 @@ config/trace-context  optional presence flag enabling default-off native W3C tra
 config/cmux-socket-password  optional cmux control-socket password; LOCAL, gitignored; read fresh on every cmux CLI call and passed through without ever overriding an operator's own ambient CMUX_SOCKET_PASSWORD when absent (docs/cmux-backend.md "Setup")
 config/wedge-alarm  optional away-mode wedge-alarm active-alert directives; LOCAL, gitignored; absent means auto (macOS Notification Center when available); see docs/wedge-alarm.md
 config/x-mode.env    generated connector watcher cadence for Relay or Linear; LOCAL, gitignored; source before arming watcher when present
+config/linear-event-ledger-activation  captain-reviewed Linear cutover approval; LOCAL, gitignored; exact content `approved` permits first activation only after PR review
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         this home's domain-local captain preferences and working style; LOCAL, gitignored, canonical even if harness memory mirrors it, and updated with inspect-then-update
@@ -104,9 +105,9 @@ state/               runtime records and signals; gitignored
   .pr-check-migration.log  private per-task outcomes distinguishing rebuilt or canonically registered replacement polls, quarantined unarmed polls, and incomplete migrations
   .pr-check-migration-scan-v1  private marker proving the non-executing scan disabled every unsafe legacy check; .pr-check-migration-v1 separately records completed private repairs
   x-watch.check.sh   generated Relay poll shim; present only when opted in (section 14)
-  fm-linear-inbox.check.sh  generated Linear event-ledger poll shim; hash-registered by bootstrap when LINEAR_API_KEY opts the home in
+  fm-linear-inbox.check.sh  generated Linear event-ledger poll shim; hash-registered only after the captain-reviewed activation record exists
   linear-inbox/ linear-outbox/  durable captain-event inbox and journaled Firstmate write intents; linear-operations owns handling
-  .linear-cursor .linear-seen.tsv .linear-poll-health  server-timestamp cursors, content-aware dedupe ledger, and poll health
+  .linear-cursor .linear-seen.tsv .linear-comment-heads.tsv .linear-poll-health  server-timestamp cursors, immutable event dedupe, latest comment hashes, and poll health
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   procevent/         registered process-to-event sources, one private record per canonical source id; written only by bin/fm-procevent.sh, and their presence alone keeps supervision required (section 13)
   procevent-inbox/   private captured results and their durable handled-acknowledgement markers; source output lives here and never in an event line

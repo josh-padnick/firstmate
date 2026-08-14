@@ -902,7 +902,8 @@ x_mode_remove_artifact() {
 # applying a cadence transition to a running watcher is the caller's job via
 # the emitted harness-aware supervision repair instruction.
 x_mode_setup() {
-  local env_file token linear_token shim cadence shim_body cadence_body tool missing shim_home
+  local env_file token linear_token linear_active linear_activation linear_shim
+  local shim cadence shim_body cadence_body tool missing shim_home
   env_file="$FM_HOME/.env"
   shim="$STATE/x-watch.check.sh"
   cadence="$CONFIG/x-mode.env"
@@ -911,6 +912,14 @@ x_mode_setup() {
   [ -f "$env_file" ] && token=$(fmx_env_get FMX_PAIRING_TOKEN "$env_file")
   linear_token=
   [ -f "$env_file" ] && linear_token=$(fm_linear_env_get LINEAR_API_KEY "$env_file")
+  linear_activation="$CONFIG/linear-event-ledger-activation"
+  linear_shim="$STATE/fm-linear-inbox.check.sh"
+  linear_active=0
+  if [ -f "$linear_shim" ] && [ ! -L "$linear_shim" ]; then
+    linear_active=1
+  elif [ -n "$linear_token" ] && fm_linear_activation_approved "$linear_activation"; then
+    linear_active=1
+  fi
 
   x_mode_remove_artifacts() {
     local failed=0
@@ -929,10 +938,10 @@ x_mode_setup() {
   if [ -z "$token" ]; then
     # Opt-out (or never opted in): drop any X artifacts; stay silent unless we
     # actually removed something.
-    if x_mode_artifact_present "$shim" || { [ -z "$linear_token" ] && x_mode_artifact_present "$cadence"; }; then
+    if x_mode_artifact_present "$shim" || { [ "$linear_active" -eq 0 ] && x_mode_artifact_present "$cadence"; }; then
       if x_mode_remove_artifact "$shim" \
-        && { [ -n "$linear_token" ] || x_mode_remove_artifact "$cadence"; }; then
-        if [ -n "$linear_token" ]; then
+        && { [ "$linear_active" -eq 1 ] || x_mode_remove_artifact "$cadence"; }; then
+        if [ "$linear_active" -eq 1 ]; then
           echo "FMX: X mode off - removed relay poll shim; Linear still owns the 30s watcher cadence"
         else
           echo "FMX: X mode off - removed relay poll shim and 30s cadence; default cadence applies on the next supervision cycle; $(x_mode_supervision_repair)"
@@ -997,22 +1006,25 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
-# Linear mode is opt-in on first activation via LINEAR_API_KEY in the private
-# home .env. Once armed, losing the key deliberately leaves the check armed so
-# the poller announces the broken board channel instead of turning silent.
+# Linear mode requires both LINEAR_API_KEY and the captain-reviewed activation
+# record on first activation. Once armed, losing either deliberately leaves the
+# check armed so the poller announces a broken board channel instead of turning silent.
 # A successful arm publishes and hash-registers a byte-static shim before it
 # removes the old absorb, snapshot, id-only seen, and local-clock cursor files.
 linear_mode_setup() {
-  local env_file key shim cadence shim_body cadence_body shim_home tool missing artifact changed
+  local env_file key activation shim cadence shim_body cadence_body shim_home tool missing artifact changed
   env_file="$FM_HOME/.env"
+  activation="$CONFIG/linear-event-ledger-activation"
   shim="$STATE/fm-linear-inbox.check.sh"
   cadence="$CONFIG/x-mode.env"
   key=
   [ -f "$env_file" ] && key=$(fm_linear_env_get LINEAR_API_KEY "$env_file")
 
-  # Preserve an already-armed shim when credentials disappear so its next sweep
-  # emits the required board-channel-down diagnostic.
-  [ -n "$key" ] || return 0
+  if [ ! -f "$shim" ] || [ -L "$shim" ]; then
+    [ -n "$key" ] && fm_linear_activation_approved "$activation" || return 0
+  else
+    [ -n "$key" ] || return 0
+  fi
   changed=0
 
   missing=0

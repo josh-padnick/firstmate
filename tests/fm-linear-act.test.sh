@@ -10,6 +10,7 @@ set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 ACT="$ROOT/bin/fm-linear-act.sh"
+POLL="$ROOT/bin/fm-linear-poll.sh"
 TMP_ROOT=$(fm_test_tmproot fm-linear-act)
 NOW=$(jq -nr '"2026-08-14T12:00:00Z" | fromdateiso8601')
 
@@ -111,6 +112,102 @@ posted_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -r '.
 awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -e '.variables.issue == "issue-1"' >/dev/null \
   || fail "comment mutation did not use the resolved Linear issue UUID"
 pass "a killed state-carrying write resumes without half state or duplicate comments"
+
+home=$(make_home accepted-comment)
+fixtures="$TMP_ROOT/accepted-comment-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_fixture "$fixtures/02-mutate.json"
+comment_fixture "$fixtures/03-comment.json"
+accepted_store="$home/accepted-comment-ids"
+accepted_log="$home/accepted-kill.log"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_FIXTURE_LOG="$accepted_log" FM_LINEAR_FIXTURE_COMMENT_STORE="$accepted_store" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_COMMENT_ACCEPTED=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/comment.md"
+) >/dev/null 2>&1 || true
+journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
+[ -n "$journal" ] || fail "accepted-comment SIGKILL did not leave a resumable journal"
+[ "$(jq -r '.phase' "$journal")" = mutated ] \
+  || fail "accepted-comment SIGKILL unexpectedly published the commented phase"
+[ "$(wc -l < "$accepted_store" | tr -d ' ')" = 1 ] || fail "fixture server did not retain one accepted comment"
+fixtures="$TMP_ROOT/accepted-comment-resume-fixtures"
+mkdir -p "$fixtures"
+comment_fixture "$fixtures/01-comment.json"
+verify_fixture "$fixtures/02-verify.json" 'Approve Deliverable' josh.padnick
+retry_log="$home/accepted-retry.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$retry_log" FM_LINEAR_FIXTURE_COMMENT_STORE="$accepted_store" \
+  FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume >/dev/null \
+  || fail "accepted-comment retry did not complete through duplicate-ID recovery"
+first_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$accepted_log" | jq -r '.variables.id')
+retry_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$retry_log" | jq -r '.variables.id')
+[ "$first_id" = "$retry_id" ] || fail "accepted-comment retry changed the client comment ID"
+[ "$(wc -l < "$accepted_store" | tr -d ' ')" = 1 ] || fail "accepted-comment retry created a duplicate server comment"
+pass "an accepted comment survives pre-phase SIGKILL without duplication"
+
+home=$(make_home overlap)
+fixtures="$TMP_ROOT/overlap-act-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_fixture "$fixtures/02-mutate.json"
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick
+control="$home/mutation-pause"
+mkdir -p "$control"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_PAUSE_AFTER_MUTATION_DIR="$control" \
+  "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+    --comment-file "$home/comment.md" > "$home/overlap-act.out" 2>&1 &
+act_pid=$!
+attempts=0
+while [ ! -e "$control/ready" ] && kill -0 "$act_pid" 2>/dev/null; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 500 ]; then
+    kill "$act_pid" 2>/dev/null || true
+    wait "$act_pid" 2>/dev/null || true
+    fail "outbound write did not reach the overlap boundary"
+  fi
+  sleep 0.01
+done
+[ -e "$control/ready" ] || { wait "$act_pid" 2>/dev/null || true; fail "outbound write failed before overlap"; }
+poll_fixtures="$TMP_ROOT/overlap-poll-fixtures"
+mkdir -p "$poll_fixtures"
+jq -n '
+  {data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{
+    pageInfo:{hasNextPage:false,endCursor:null},nodes:[
+      {id:"captain-during-write",createdAt:"2026-08-14T11:59:01Z",updatedAt:"2026-08-14T11:59:01Z",
+       body:"captain input during write",user:{id:"captain-id",displayName:"shared-name"},
+       issue:{identifier:"BIG-1"},parent:null}]}}}
+' > "$poll_fixtures/01-comments.json"
+jq -n '
+  {data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[{
+    identifier:"BIG-1",title:"fixture",description:"",updatedAt:"2026-08-14T11:59:02Z",
+    createdAt:"2026-08-01T00:00:00Z",state:{name:"Approve Deliverable"},
+    assignee:{id:"captain-id",displayName:"josh.padnick"},
+    creator:{id:"firstmate-id",displayName:"shared-name"},labels:{nodes:[]},history:{
+      pageInfo:{hasNextPage:false,endCursor:null},nodes:[{
+        id:"self-write-history",createdAt:"2026-08-14T11:59:00Z",
+        actor:{id:"firstmate-id",displayName:"shared-name"},fromState:{name:"Building"},
+        toState:{name:"Approve Deliverable"},fromAssignee:null,
+        toAssignee:{id:"captain-id",displayName:"josh.padnick"},updatedDescription:null,
+        addedLabels:[],removedLabels:[]}]}}]}}}
+' > "$poll_fixtures/02-issues.json"
+poll_status=0
+poll_out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$poll_fixtures" \
+  FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_PENDING_ALARM_SECONDS=9999 "$POLL") \
+  || poll_status=$?
+: > "$control/release"
+wait "$act_pid" || fail "outbound write did not finish after overlap release"
+[ "$poll_status" -eq 0 ] || fail "poll failed while outbound write was paused"
+assert_contains "$poll_out" "1 captain input(s)" "captain input was lost during the outbound write"
+[ "$(find "$home/state/linear-inbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
+  || fail "overlapping poll persisted a self-authored event or lost captain input"
+[ "$(find "$home/state/linear-outbox" -name '*.done' | wc -l | tr -d ' ')" = 1 ] \
+  || fail "overlapping outbound write did not complete"
+pass "captain input remains durable during an overlapping Firstmate write"
 
 # T12: bare upload links are rejected before any journal exists, while Markdown
 # image embeds pass through the same reply door.

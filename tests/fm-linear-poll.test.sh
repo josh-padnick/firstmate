@@ -26,7 +26,7 @@ make_fixtures() {  # <dir> <comments-json> <issues-json>
   local dir=$1 comments=$2 issues=$3
   mkdir -p "$dir"
   jq -n --argjson nodes "$comments" '
-    {data:{viewer:{displayName:"josh.padnickfirstmate"},
+    {data:{viewer:{id:"firstmate-id",displayName:"shared-name"},
            comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$nodes}}}
   ' > "$dir/01-comments.json"
   jq -n --argjson nodes "$issues" '
@@ -34,28 +34,30 @@ make_fixtures() {  # <dir> <comments-json> <issues-json>
   ' > "$dir/02-issues.json"
 }
 
-comment() {  # <id> <updated> <body> <author> <issue>
-  jq -nc --arg id "$1" --arg updated "$2" --arg body "$3" --arg author "$4" --arg issue "$5" '
+comment() {  # <id> <updated> <body> <author-id> <author-name> <issue>
+  jq -nc --arg id "$1" --arg updated "$2" --arg body "$3" --arg author_id "$4" --arg author "$5" --arg issue "$6" '
     {id:$id,createdAt:$updated,updatedAt:$updated,body:$body,
-     user:{displayName:$author},issue:{identifier:$issue},parent:null}
+     user:{id:$author_id,displayName:$author},issue:{identifier:$issue},parent:null}
   '
 }
 
-history() {  # <id> <created> <actor> <from> <to>
-  jq -nc --arg id "$1" --arg created "$2" --arg actor "$3" --arg from "$4" --arg to "$5" '
-    {id:$id,createdAt:$created,actor:{displayName:$actor},
-     fromState:{name:$from},toState:{name:$to},fromAssignee:null,toAssignee:null,
+history() {  # <id> <created> <actor-id> <actor-name> <from> <to> [to-assignee-id] [to-assignee-name]
+  jq -nc --arg id "$1" --arg created "$2" --arg actor_id "$3" --arg actor "$4" --arg from "$5" --arg to "$6" \
+    --arg to_assignee_id "${7:-}" --arg to_assignee "${8:-}" '
+    {id:$id,createdAt:$created,actor:{id:$actor_id,displayName:$actor},
+     fromState:{name:$from},toState:{name:$to},fromAssignee:null,
+     toAssignee:(if $to_assignee_id == "" then null else {id:$to_assignee_id,displayName:$to_assignee} end),
      updatedDescription:null,addedLabels:[],removedLabels:[]}
   '
 }
 
-issue() {  # <id> <updated> <creator> <history-json> [status] [assignee]
-  jq -nc --arg id "$1" --arg updated "$2" --arg creator "$3" --argjson history "$4" \
-    --arg status "${5:-Backlog}" --arg assignee "${6:-}" '
+issue() {  # <id> <updated> <creator-id> <creator-name> <history-json> [status] [assignee-id] [assignee-name]
+  jq -nc --arg id "$1" --arg updated "$2" --arg creator_id "$3" --arg creator "$4" --argjson history "$5" \
+    --arg status "${6:-Backlog}" --arg assignee_id "${7:-}" --arg assignee "${8:-}" '
     {identifier:$id,title:"fixture",description:"",updatedAt:$updated,
      createdAt:"2026-08-01T00:00:00Z",state:{name:$status},
-     assignee:(if $assignee == "" then null else {displayName:$assignee} end),
-     creator:{displayName:$creator},labels:{nodes:[]},
+     assignee:(if $assignee_id == "" then null else {id:$assignee_id,displayName:$assignee} end),
+     creator:{id:$creator_id,displayName:$creator},labels:{nodes:[]},
      history:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$history}}
   '
 }
@@ -72,27 +74,32 @@ pending_count() {  # <home>
 # T1, T5, and the author-identity half of the concurrent-write regression.
 home=$(make_home idempotence)
 fixtures="$TMP_ROOT/idempotence-fixtures"
-self_comment=$(comment self-comment 2026-08-14T11:58:00Z own josh.padnickfirstmate BIG-1)
-captain_comment=$(comment captain-comment 2026-08-14T11:58:01Z captain josh.padnick BIG-1)
-self_history=$(history self-history 2026-08-14T11:58:02Z josh.padnickfirstmate Backlog Building)
-captain_history=$(history captain-history 2026-08-14T11:58:03Z josh.padnick Building Backlog)
+self_comment=$(comment self-comment 2026-08-14T11:58:00Z own firstmate-id shared-name BIG-1)
+captain_comment=$(comment captain-comment 2026-08-14T11:58:01Z captain captain-id shared-name BIG-1)
+self_history=$(history self-history 2026-08-14T11:58:02Z firstmate-id shared-name Backlog Building firstmate-id shared-name)
+captain_history=$(history captain-history 2026-08-14T11:58:03Z captain-id shared-name Building Backlog)
 comments=$(jq -nc --argjson a "$self_comment" --argjson b "$captain_comment" '[$a,$b]')
 histories=$(jq -nc --argjson a "$self_history" --argjson b "$captain_history" '[$a,$b]')
-issues=$(jq -nc --argjson a "$(issue BIG-1 2026-08-14T11:58:04Z josh.padnickfirstmate "$histories")" '[$a]')
+issues=$(jq -nc --argjson a "$(issue BIG-1 2026-08-14T11:58:04Z firstmate-id shared-name "$histories")" '[$a]')
 make_fixtures "$fixtures" "$comments" "$issues"
 out1=$(run_poll "$home" "$fixtures") || fail "initial interleaved poll failed"
 assert_contains "$out1" "2 captain input(s)" "interleaved poll did not surface exactly the captain's events"
 [ "$(pending_count "$home")" = 2 ] || fail "interleaved poll did not persist exactly two captain events"
-[ "$(wc -l < "$home/state/.linear-seen.tsv" | tr -d ' ')" = 4 ] || fail "self events were not retained in the seen ledger"
+[ "$(wc -l < "$home/state/.linear-seen.tsv" | tr -d ' ')" = 2 ] || fail "self history was not retained in the seen ledger"
+[ "$(wc -l < "$home/state/.linear-comment-heads.tsv" | tr -d ' ')" = 2 ] || fail "latest hashes were not retained for both comments"
 out2=$(run_poll "$home" "$fixtures") || fail "second identical poll failed"
 [ -z "$out2" ] || fail "second identical poll was not silent: $out2"
 [ "$(pending_count "$home")" = 2 ] || fail "second identical poll duplicated an inbox event"
 pass "poller is idempotent and filters only by author identity"
 
+captured=$(find "$home/state/linear-inbox" -type f -name '*.json' -exec jq -r 'select(.comment_id == "captain-comment") | .author_id' {} +)
+[ "$captured" = captain-id ] || fail "captain comment with the viewer's display name was misclassified"
+pass "stable user IDs distinguish authors with the same display name"
+
 # A write can finish after its self-events were first observed.
 # Re-reading a seen self-event must still close the outbound observation loop.
 mkdir -p "$home/state/linear-outbox"
-jq -n '{issue:"BIG-1",target_state:"Building",comment_id:"self-comment"}' \
+jq -n '{issue:"BIG-1",target_state:"Building",assignee_id:"firstmate-id",comment_id:"self-comment"}' \
   > "$home/state/linear-outbox/late-journal.done"
 chmod 0700 "$home/state/linear-outbox"
 chmod 0600 "$home/state/linear-outbox/late-journal.done"
@@ -130,9 +137,9 @@ home=$(make_home pagination)
 printf 'comments_updated_at=2026-08-14T11:00:00Z\nissues_updated_at=2026-08-14T11:00:00Z\n' > "$home/state/.linear-cursor"
 fixtures="$TMP_ROOT/pagination-fail"
 mkdir -p "$fixtures"
-page_comment=$(comment page-one 2026-08-14T11:59:00Z captain josh.padnick BIG-2)
+page_comment=$(comment page-one 2026-08-14T11:59:00Z captain captain-id shared-name BIG-2)
 jq -n --argjson node "$page_comment" '
-  {data:{viewer:{displayName:"josh.padnickfirstmate"},
+  {data:{viewer:{id:"firstmate-id",displayName:"shared-name"},
    comments:{pageInfo:{hasNextPage:true,endCursor:"next"},nodes:[$node]}}}
 ' > "$fixtures/01-comments-page-one.json"
 printf '{}\n' > "$fixtures/02-fail-500.json"
@@ -144,9 +151,9 @@ run_poll "$home" "$fixtures" >/dev/null 2>&1 && fail "page-two HTTP failure unex
 fixtures="$TMP_ROOT/pagination-good"
 mkdir -p "$fixtures"
 cp "$TMP_ROOT/pagination-fail/01-comments-page-one.json" "$fixtures/01-comments-page-one.json"
-page_two=$(comment page-two 2026-08-14T11:59:01Z captain josh.padnick BIG-3)
+page_two=$(comment page-two 2026-08-14T11:59:01Z captain captain-id shared-name BIG-3)
 jq -n --argjson node "$page_two" '
-  {data:{viewer:{displayName:"josh.padnickfirstmate"},
+  {data:{viewer:{id:"firstmate-id",displayName:"shared-name"},
    comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}
 ' > "$fixtures/02-comments-page-two.json"
 jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/03-issues.json"
@@ -157,23 +164,39 @@ pass "failed pagination holds the cursor and a retry captures every page"
 # T7: body hashes surface an edit but absorb a reply-only updatedAt bump.
 home=$(make_home edits)
 fixtures="$TMP_ROOT/edit-one"
-comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:55:00Z first josh.padnick BIG-4)" '[$c]')
+comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:55:00Z first captain-id shared-name BIG-4)" '[$c]')
 make_fixtures "$fixtures" "$comments" '[]'
 run_poll "$home" "$fixtures" >/dev/null || fail "initial edit fixture failed"
 [ "$(pending_count "$home")" = 1 ] || fail "initial comment was not captured"
 fixtures="$TMP_ROOT/edit-two"
-comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:56:00Z 'first plus more' josh.padnick BIG-4)" '[$c]')
+comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:56:00Z 'first plus more' captain-id shared-name BIG-4)" '[$c]')
 make_fixtures "$fixtures" "$comments" '[]'
 out=$(run_poll "$home" "$fixtures") || fail "edited comment poll failed"
 assert_contains "$out" "1 captain input(s)" "edited comment did not surface"
 [ "$(pending_count "$home")" = 2 ] || fail "edited body did not create a new content event"
 fixtures="$TMP_ROOT/edit-bump"
-comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:57:00Z 'first plus more' josh.padnick BIG-4)" '[$c]')
+comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:57:00Z 'first plus more' captain-id shared-name BIG-4)" '[$c]')
 make_fixtures "$fixtures" "$comments" '[]'
 out=$(run_poll "$home" "$fixtures") || fail "reply-bump poll failed"
 [ -z "$out" ] || fail "same-body reply bump was not silent: $out"
 [ "$(pending_count "$home")" = 2 ] || fail "same-body reply bump duplicated the comment"
-pass "comment edits surface and same-body reply bumps dedupe"
+fixtures="$TMP_ROOT/edit-revert"
+comments=$(jq -nc --argjson c "$(comment edit-id 2026-08-14T11:58:00Z first captain-id shared-name BIG-4)" '[$c]')
+make_fixtures "$fixtures" "$comments" '[]'
+out=$(run_poll "$home" "$fixtures") || fail "reverted comment poll failed"
+assert_contains "$out" "1 captain input(s)" "A-to-B-to-A edit did not surface the final A"
+[ "$(pending_count "$home")" = 3 ] || fail "A-to-B-to-A did not persist three comment transitions"
+pass "comment transitions surface A-to-B-to-A and silence same-body bumps"
+
+home=$(make_home complete-body)
+long_body=$(printf 'captain-%0500d' 7)
+fixtures="$TMP_ROOT/complete-body-fixtures"
+comments=$(jq -nc --argjson c "$(comment long-comment 2026-08-14T11:58:00Z "$long_body" captain-id shared-name BIG-5)" '[$c]')
+make_fixtures "$fixtures" "$comments" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "long captain comment poll failed"
+body_file=$(find "$home/state/linear-inbox" -type f -name '*.json' | head -n 1)
+[ "$(jq -r '.body' "$body_file")" = "$long_body" ] || fail "durable inbox truncated the observed captain comment"
+pass "the durable inbox preserves the complete observed comment body"
 
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)
@@ -182,20 +205,16 @@ before=$(shasum "$home/state/.linear-cursor")
 fixtures="$TMP_ROOT/fail-http"
 mkdir -p "$fixtures"
 printf '{}\n' > "$fixtures/01-fail-500.json"
-run_poll "$home" "$fixtures" >/dev/null 2>&1 || true
-run_poll "$home" "$fixtures" >/dev/null 2>&1 || true
 out=$(run_poll "$home" "$fixtures" 2>&1 || true)
-assert_contains "$out" "POLL FAILING (3x)" "third HTTP failure was not loud"
+assert_contains "$out" "POLL FAILING (1x)" "first HTTP failure was not loud"
 [ "$before" = "$(shasum "$home/state/.linear-cursor")" ] || fail "HTTP failures advanced the cursor"
 
 home=$(make_home malformed)
 fixtures="$TMP_ROOT/fail-malformed"
 mkdir -p "$fixtures"
 printf '{broken\n' > "$fixtures/01-malformed.json"
-run_poll "$home" "$fixtures" >/dev/null 2>&1 || true
-run_poll "$home" "$fixtures" >/dev/null 2>&1 || true
 out=$(run_poll "$home" "$fixtures" 2>&1 || true)
-assert_contains "$out" "POLL FAILING (3x)" "third malformed response was not loud"
+assert_contains "$out" "POLL FAILING (1x)" "first malformed response was not loud"
 
 home=$(make_home missing-key)
 : > "$home/.env"
@@ -206,7 +225,7 @@ pass "every inability to poll becomes a loud, durable failure episode"
 # T9 and T11: old pending inputs and turn-marker drift announce every sweep.
 home=$(make_home alarms)
 fixtures="$TMP_ROOT/alarm-fixtures"
-bad_issue=$(issue BIG-9 2026-08-14T11:59:00Z josh.padnickfirstmate '[]' 'Approve Deliverable' josh.padnickfirstmate)
+bad_issue=$(issue BIG-9 2026-08-14T11:59:00Z firstmate-id shared-name '[]' 'Approve Deliverable' firstmate-id shared-name)
 issues=$(jq -nc --argjson i "$bad_issue" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
 mkdir -p "$home/state/linear-inbox"
@@ -219,30 +238,83 @@ assert_contains "$out" "UNHANDLED captain inputs" "stale pending event was silen
 assert_contains "$out" "TURN-MARKER MISMATCH BIG-9" "board invariant mismatch was silent"
 pass "stale pending events and turn-marker drift wake loudly"
 
-# Migration contract: bootstrap arms and registers the replacement before
-# removing every legacy absorb/snapshot/cursor artifact, then preserves the
-# check when a previously configured key disappears so the poll can fail loud.
+home=$(make_home unknown-status)
+fixtures="$TMP_ROOT/unknown-status-fixtures"
+unknown_issue=$(issue BIG-10 2026-08-14T11:59:00Z captain-id shared-name '[]' QA)
+issues=$(jq -nc --argjson i "$unknown_issue" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "first unknown-status poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "first unknown-status occurrence was silent"
+fixtures="$TMP_ROOT/unknown-status-empty-fixtures"
+make_fixtures "$fixtures" '[]' '[]'
+out=$(run_poll "$home" "$fixtures") || fail "repeated unknown-status poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "unresolved unknown status did not stay loud when absent from the incremental page"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$POLL" acknowledge-unknown-status BIG-10 QA) \
+  || fail "unknown-status acknowledgment failed"
+assert_contains "$out" "acknowledged unknown status QA (BIG-10)" "acknowledgment was not observable"
+out=$(run_poll "$home" "$fixtures") || fail "acknowledged unknown-status poll failed"
+assert_not_contains "$out" "UNKNOWN STATUS" "exact issue-status acknowledgment did not silence the occurrence"
+fixtures="$TMP_ROOT/issue-scoped-unknown-fixtures"
+unknown_issue=$(issue BIG-10 2026-08-14T12:00:00Z captain-id shared-name '[]' QA)
+other_unknown_issue=$(issue BIG-11 2026-08-14T12:00:01Z captain-id shared-name '[]' QA)
+issues=$(jq -nc --argjson a "$unknown_issue" --argjson b "$other_unknown_issue" '[$a,$b]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "issue-scoped unknown-status poll failed"
+assert_not_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "BIG-11 invalidated BIG-10's exact acknowledgment"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-11)" "BIG-10's acknowledgment silenced BIG-11"
+fixtures="$TMP_ROOT/known-status-fixtures"
+known_issue=$(issue BIG-10 2026-08-14T12:00:00Z captain-id shared-name '[]' Backlog)
+other_known_issue=$(issue BIG-11 2026-08-14T12:00:01Z captain-id shared-name '[]' Backlog)
+issues=$(jq -nc --argjson a "$known_issue" --argjson b "$other_known_issue" '[$a,$b]')
+make_fixtures "$fixtures" '[]' "$issues"
+run_poll "$home" "$fixtures" >/dev/null || fail "known-status transition poll failed"
+fixtures="$TMP_ROOT/unknown-status-return-fixtures"
+unknown_issue=$(issue BIG-10 2026-08-14T12:01:00Z captain-id shared-name '[]' QA)
+issues=$(jq -nc --argjson i "$unknown_issue" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "returned unknown-status poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "acknowledgment survived after the issue left its status"
+pass "unknown statuses stay loud with issue-scoped expiring acknowledgments"
+
+# Migration contract: credentials stage the replacement without cutover, and a
+# separate captain-reviewed activation record permits bootstrap to arm it.
 home=$(make_home bootstrap)
 for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
   printf 'legacy\n' > "$home/state/$legacy"
 done
 out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+assert_not_contains "$out" "LINEAR:" "credentials alone emitted a cutover result"
+[ ! -e "$home/state/fm-linear-inbox.check.sh" ] || fail "credentials alone armed the replacement poll"
+[ ! -e "$home/config/x-mode.env" ] || fail "credentials alone changed the watcher cadence"
+for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
+  [ -e "$home/state/$legacy" ] || fail "credentials alone removed legacy state/$legacy"
+done
+mkdir -p "$home/config"
+printf 'approved\n' > "$home/config/linear-event-ledger-activation"
+out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
 assert_contains "$out" "LINEAR: event-ledger poll armed" "bootstrap did not arm the Linear replacement"
 [ -x "$home/state/fm-linear-inbox.check.sh" ] || fail "bootstrap did not publish an executable Linear shim"
 [ -f "$home/state/fm-linear-inbox.check-trust" ] || fail "bootstrap did not hash-register the Linear shim"
-grep -F 'fm-linear-poll.sh' "$home/state/fm-linear-inbox.check.sh" >/dev/null \
-  || fail "Linear shim does not dispatch the tracked poller"
 for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
   [ ! -e "$home/state/$legacy" ] || fail "bootstrap left legacy state/$legacy beside the replacement"
 done
-grep -qx 'export FM_CHECK_INTERVAL=30' "$home/config/x-mode.env" \
-  || fail "Linear activation did not install the 30-second connector cadence"
+interval=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
+  . "$1/config/x-mode.env"
+  . "$2/bin/fm-watch.sh"
+  printf "%s\n" "$CHECK_INTERVAL"
+' _ "$home" "$ROOT")
+[ "$interval" = 30 ] || fail "the watcher did not consume the activated 30-second cadence"
 : > "$home/.env"
 FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
 [ -x "$home/state/fm-linear-inbox.check.sh" ] || fail "missing key silently disarmed an established Linear poll"
-out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$home/state/fm-linear-inbox.check.sh" 2>&1 || true)
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
+  . "$1/bin/fm-watch.sh"
+  fm_custom_check_snapshot_prepare "$2" fm-linear-inbox || exit 1
+  run_check "$FM_CUSTOM_CHECK_SNAPSHOT"
+  fm_custom_check_snapshot_cleanup
+' _ "$ROOT" "$home/state" 2>&1 || true)
 assert_contains "$out" "missing LINEAR_API_KEY" "established shim did not announce a missing key"
-pass "bootstrap replaces legacy polling only after the event-ledger shim is registered"
+pass "captain approval gates cutover and the registered watcher path runs the replacement"
 
 # A hard kill must not make the lock a permanent silent outage.
 home=$(make_home stale-lock)

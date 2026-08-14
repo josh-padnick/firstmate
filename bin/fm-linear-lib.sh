@@ -27,6 +27,19 @@ fm_linear_load_key() {
   [ -n "$FM_LINEAR_KEY" ]
 }
 
+fm_linear_activation_approved() {  # <activation-file>
+  local file=$1 value
+  [ -f "$file" ] && [ ! -L "$file" ] || return 1
+  exec 9< "$file" || return 1
+  IFS= read -r value <&9 || { exec 9<&-; return 1; }
+  if IFS= read -r _ <&9; then
+    exec 9<&-
+    return 1
+  fi
+  exec 9<&-
+  [ "$value" = approved ]
+}
+
 fm_linear_sha256() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 | awk '{print $1}'
@@ -143,6 +156,7 @@ fm_linear_fixture_next() {
 
 fm_linear_api_call() {  # <operation> <payload-file> <response-file>
   local operation=$1 payload=$2 response=$3 fixture base header code status fixture_comment fixture_expanded
+  local comment_store comment_id
   FM_LINEAR_API_ERROR=
   if [ -n "${FM_LINEAR_FIXTURE_DIR:-}" ]; then
     fm_linear_fixture_next || {
@@ -212,6 +226,25 @@ fm_linear_api_call() {  # <operation> <payload-file> <response-file>
   if ! jq -e 'type == "object"' "$response" >/dev/null 2>&1; then
     FM_LINEAR_API_ERROR="malformed JSON during $operation"
     return 1
+  fi
+  comment_store=${FM_LINEAR_FIXTURE_COMMENT_STORE:-}
+  if [ -n "$comment_store" ] && [ "$operation" = commentCreate ]; then
+    comment_id=$(jq -r '.variables.id // empty' "$payload" 2>/dev/null) || comment_id=
+    [ -n "$comment_id" ] || {
+      FM_LINEAR_API_ERROR="fixture comment ID missing"
+      return 1
+    }
+    if awk -v id="$comment_id" '$0 == id { found=1 } END { exit !found }' \
+      "$comment_store" 2>/dev/null; then
+      FM_LINEAR_API_ERROR="comment already exists"
+      return 1
+    fi
+    if jq -e '.data.commentCreate.success == true' "$response" >/dev/null 2>&1; then
+      printf '%s\n' "$comment_id" >> "$comment_store" || {
+        FM_LINEAR_API_ERROR="cannot persist fixture comment acceptance"
+        return 1
+      }
+    fi
   fi
   if jq -e '.errors != null and (.errors | length > 0)' "$response" >/dev/null 2>&1; then
     # shellcheck disable=SC2034 # Returned to the sourcing caller as the transport diagnostic.

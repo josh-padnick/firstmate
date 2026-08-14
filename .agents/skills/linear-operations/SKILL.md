@@ -21,8 +21,9 @@ Always enumerate every `state/linear-inbox/*.json` record that lacks its adjacen
 Sort the records by `created_at`, oldest first, before acting.
 Do not limit handling to the issue identifiers named in the wake.
 
-Each event record is a durable pointer plus a bounded excerpt.
-For a comment event, read the current Linear comment by `comment_id` before acting so content beyond the excerpt is never discarded.
+Each comment event record contains the complete body observed before its cursor advanced, plus a bounded excerpt for quick inspection.
+Act from that durable `body` value so a later edit or deletion cannot erase what the captain said.
+Read the current Linear comment by `comment_id` when reconciling whether the observed instruction has since changed.
 For board, description, label, and issue-created events, read the named issue and reconcile the server state before acting.
 An edited comment has the same `comment_id` and a different `body_sha256`; treat it as a new instruction and read the current body again.
 
@@ -60,7 +61,8 @@ Never edit a `state/linear-outbox` journal by hand.
 - `TURN-MARKER MISMATCH` means state and assignee disagree with the status truth table.
   Run `fm-linear-act.sh repair <BIG-n>` after confirming the current status.
 - `UNKNOWN STATUS` means the closed status table cannot safely infer an assignee.
-  Stop and update the table deliberately rather than guessing.
+  Stop and update the table deliberately rather than guessing, or run `fm-linear-poll.sh acknowledge-unknown-status <BIG-n> <status>` after explicitly accepting that exact issue-status occurrence.
+  The acknowledgment remains valid only while that issue continuously stays in that status.
 - `CURSOR ANOMALY` or `POLL STATE FAILURE` means the poller refused to advance.
   Captain input remains replayable, but the implementation or private state needs investigation.
 
