@@ -354,15 +354,8 @@ On a `Firstmate`-labelled issue, a bare top-level comment starts a thread and wa
 Every poll failure wakes immediately.
 Unknown statuses wake on every sweep until the exact issue-status occurrence is acknowledged through `fm-linear-poll.sh acknowledge-unknown-status`, and that acknowledgment expires after the issue leaves the status.
 Turn-marker mismatches use those canonical IDs and remain loud until a fetched matching assignment proves resolution.
-The `linear-operations` skill owns how a wake drains and acknowledges the durable inbox.
-
-All Firstmate state, assignee, and comment writes use `bin/fm-linear-act.sh`.
-It journals intent under `state/linear-outbox/`, maps the target status to a role and that role to its configured stable user ID, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
-The journal records the issue's provider `updatedAt`, so recovery refuses a stale mutation after any later captain restoration.
-Replies accept the target comment ID, resolve its issue and canonical root from Linear, and journal that root before posting.
-A comment containing both an exact `READY FOR YOUR REVIEW` line and a reviewable link is a reviewable handoff: the same journal moves the issue to `Approve Deliverable` with `LINEAR_CAPTAIN_ID`, and the write door rejects a Firstmate-owned state for that deliverable.
-Concurrent machinery and review work use separate issues.
-Unfinished journals are replayed with `fm-linear-act.sh resume`.
+The [`linear-operations`](../.agents/skills/linear-operations/SKILL.md) skill owns the complete inbox acknowledgment and outbound write, repair, and recovery procedure.
+Private records under `state/linear-outbox/` retain stable provider IDs, provider `updatedAt`, mutation provenance, canonical reply roots, and client-generated comment IDs.
 
 On its first successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.
 It removes them only after the replacement shim has been published and registered.

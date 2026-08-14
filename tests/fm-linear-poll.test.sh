@@ -151,6 +151,38 @@ out=$(run_poll "$home" "$fixtures") || fail "seen self-event reconciliation fail
   || fail "seen self-board event did not close the outbound observation loop"
 pass "seen self-events still reconcile a journal that completed after their first poll"
 
+home=$(make_home observation-marker-symlinks)
+fixtures="$TMP_ROOT/observation-marker-symlink-fixtures"
+self_comment=$(comment marker-self-comment 2026-08-14T11:58:00Z own firstmate-id shared-name BIG-44)
+self_history=$(history marker-self-history 2026-08-14T11:58:01Z firstmate-id shared-name Backlog Building \
+  firstmate-id shared-name)
+comments=$(jq -nc --argjson c "$self_comment" '[$c]')
+issues=$(jq -nc --argjson i "$(issue BIG-44 2026-08-14T11:58:02Z firstmate-id shared-name \
+  "$(jq -nc --argjson h "$self_history" '[$h]')" Building firstmate-id shared-name)" '[$i]')
+make_fixtures "$fixtures" "$comments" "$issues"
+run_poll "$home" "$fixtures" >/dev/null || fail "observation marker baseline poll failed"
+mkdir -p "$home/state/linear-outbox"
+jq -n '{issue:"BIG-44",target_state:"Building",state_id:"building-id",
+  assignee_id:"firstmate-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:58:02Z",comment_id:"marker-self-comment"}' \
+  > "$home/state/linear-outbox/observed-journal.done"
+comment_target="$home/dangling-comment-target"
+ln -s "$comment_target" "$home/state/linear-outbox/observed-journal.comment-observed"
+out=$(run_poll "$home" "$fixtures" 2>&1 || true)
+assert_contains "$out" "unsafe outbox observation marker: observed-journal.comment-observed" \
+  "comment observation followed a dangling marker symlink"
+[ ! -e "$comment_target" ] || fail "comment observation created the dangling symlink target"
+rm -f "$home/state/linear-outbox/observed-journal.comment-observed"
+board_target="$home/dangling-board-target"
+ln -s "$board_target" "$home/state/linear-outbox/observed-journal.board-observed"
+out=$(run_poll "$home" "$fixtures" 2>&1 || true)
+assert_contains "$out" "unsafe outbox observation marker: observed-journal.board-observed" \
+  "board observation followed a dangling marker symlink"
+[ ! -e "$board_target" ] || fail "board observation created the dangling symlink target"
+pass "outbox observation markers reject dangling symlinks"
+home=$idempotence_home
+fixtures=$idempotence_fixtures
+
 # T2 and T6: a rewind re-reads shuffled records and restores the true maximum.
 printf 'comments_updated_at=2026-08-14T10:00:00Z\nissues_updated_at=2026-08-14T10:00:00Z\n' > "$home/state/.linear-cursor"
 out=$(run_poll "$home" "$fixtures") || fail "rewound poll failed"
@@ -423,6 +455,61 @@ jq -s -e 'any(.[]; .source == "issue-snapshot"
   || fail "canonical state and assignee IDs were absent from the snapshot delta"
 pass "issue snapshots preserve history-free board transitions"
 
+home=$(make_home self-snapshot-board)
+fixtures="$TMP_ROOT/self-snapshot-board-a"
+baseline=$(issue BIG-45 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Building firstmate-id shared-name)
+baseline=$(printf '%s' "$baseline" | jq '.state.id="building-id"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "self snapshot board baseline failed"
+mkdir -p "$home/state/linear-outbox"
+jq -n '{issue:"BIG-45",target_state:"Approve Deliverable",state_id:"approve-id",
+  assignee_id:"captain-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:57:00Z",comment_id:null}' \
+  > "$home/state/linear-outbox/self-snapshot.done"
+fixtures="$TMP_ROOT/self-snapshot-board-b"
+changed=$(printf '%s' "$baseline" | jq '.updatedAt="2026-08-14T11:57:00Z"
+  | .state={id:"approve-id",name:"Approve Deliverable"}
+  | .assignee={id:"captain-id",displayName:"shared-name"}')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "proven self snapshot board poll failed"
+[ -z "$out" ] || fail "proven self snapshot board mutation produced a wake: $out"
+[ "$(pending_count "$home")" = 0 ] || fail "proven self snapshot board mutation entered the inbox"
+[ -f "$home/state/linear-outbox/self-snapshot.board-observed" ] \
+  || fail "proven self snapshot board mutation did not close observation"
+pass "proven self snapshot mutations are suppressed and observed"
+
+home=$(make_home unmatched-snapshot-board)
+fixtures="$TMP_ROOT/unmatched-snapshot-board-a"
+baseline=$(issue BIG-46 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Building firstmate-id shared-name)
+baseline=$(printf '%s' "$baseline" | jq '.state.id="building-id"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "unmatched snapshot board baseline failed"
+mkdir -p "$home/state/linear-outbox"
+jq -n '{issue:"BIG-46",target_state:"Approve Deliverable",state_id:"approve-id",
+  assignee_id:"captain-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:56:59Z",comment_id:null}' \
+  > "$home/state/linear-outbox/wrong-version.done"
+jq -n '{issue:"BIG-46",target_state:"Approve Deliverable",state_id:"other-approve-id",
+  assignee_id:"captain-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:57:00Z",comment_id:null}' \
+  > "$home/state/linear-outbox/wrong-id.done"
+fixtures="$TMP_ROOT/unmatched-snapshot-board-b"
+changed=$(printf '%s' "$baseline" | jq '.updatedAt="2026-08-14T11:57:00Z"
+  | .state={id:"approve-id",name:"Approve Deliverable"}
+  | .assignee={id:"captain-id",displayName:"shared-name"}')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "unmatched snapshot board poll failed"
+assert_contains "$out" "1 non-authoritative observation(s)" \
+  "unmatched snapshot board delta was suppressed as self"
+jq -s -e 'any(.[]; .source == "issue-snapshot" and .authority == "unattributed"
+  and .changes.state.id == "approve-id" and .changes.assignee.id == "captain-id")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "unmatched snapshot board delta was classified as self"
+[ ! -e "$home/state/linear-outbox/wrong-version.board-observed" ] \
+  && [ ! -e "$home/state/linear-outbox/wrong-id.board-observed" ] \
+  || fail "unmatched snapshot board delta marked an outbox write observed"
+pass "snapshot reconciliation requires exact IDs and mutation provenance"
+
 home=$(make_home description-authority)
 fixtures="$TMP_ROOT/description-authority-a"
 baseline=$(issue BIG-36 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Backlog firstmate-id shared-name A)
@@ -693,6 +780,7 @@ histories=$(jq -nc '[range(0;10) as $n | {id:("scan-initial-"+($n|tostring)),
   addedLabels:[],removedLabels:[]}]')
 scan_issue=$(issue BIG-37 2026-08-14T12:01:00Z captain-id shared-name "$histories")
 scan_issue=$(printf '%s' "$scan_issue" | jq '.createdAt="2026-08-14T11:56:00Z"
+  | .state={id:"qa-id",name:"QA"}
   | .history.pageInfo={hasNextPage:true,endCursor:"scan-page-one"}')
 later_issue=$(issue BIG-38 2026-08-14T12:10:00Z captain-id shared-name '[]')
 later_issue=$(printf '%s' "$later_issue" | jq '.createdAt="2026-08-14T12:09:30Z"')
@@ -706,6 +794,8 @@ jq -n --argjson node "$scan_page" \
 out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
   || fail "first resumable deep-history poll failed"
 assert_contains "$out" "BIG-38" "deep scan blocked a later captain issue"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-37)" \
+  "deep history scan hid the fetched issue's unknown status"
 [ -f "$home/state/.linear-history-scans/BIG-37.json" ] \
   || fail "incomplete deep-history pagination was not checkpointed durably"
 grep -qx 'issues_updated_at=2026-08-14T12:10:00.000000000Z' "$home/state/.linear-cursor" \
@@ -725,6 +815,32 @@ jq -s -e 'any(.[]; .history_id == "scan-middle") and any(.[]; .history_id == "sc
   "$home/state/linear-inbox"/*.json >/dev/null \
   || fail "resumed deep-history horizon did not preserve history and creation events"
 pass "deep history checkpoints retain their original ingestion horizon"
+
+home=$(make_home deep-scan-turn-mismatch)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \
+  > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/deep-scan-turn-mismatch-fixtures"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/01-comments.json"
+histories=$(jq -nc '[range(0;10) as $n | {id:("mismatch-history-"+($n|tostring)),
+  createdAt:"2026-08-14T11:58:00Z",updatedAt:"2026-08-14T11:58:00Z",changes:null,
+  actor:{id:"captain-id",displayName:"shared-name"},fromState:null,toState:null,
+  fromAssignee:null,toAssignee:null,updatedDescription:false,addedLabels:[],removedLabels:[]}]')
+scan_issue=$(issue BIG-47 2026-08-14T12:01:00Z captain-id shared-name "$histories" \
+  'Approve Deliverable' firstmate-id shared-name)
+scan_issue=$(printf '%s' "$scan_issue" | jq '.state.id="approve-id"
+  | .history.pageInfo={hasNextPage:true,endCursor:"mismatch-page-one"}')
+jq -n --argjson issue "$scan_issue" \
+  '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$issue]}}}' \
+  > "$fixtures/02-issues.json"
+jq -n '{data:{issue:{history:{pageInfo:{hasNextPage:true,endCursor:"mismatch-page-two"},nodes:[]}}}}' \
+  > "$fixtures/03-history.json"
+out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
+  || fail "deep scan turn-marker audit failed"
+assert_contains "$out" "TURN-MARKER MISMATCH BIG-47" \
+  "deep history scan hid the fetched issue's turn-marker mismatch"
+pass "fresh issue invariants remain loud during deep history scans"
 
 home=$(make_home nested-thread-resume)
 printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \

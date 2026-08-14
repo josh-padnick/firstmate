@@ -582,6 +582,7 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
   local cursor=$1 bootstrap_cutoff=$2 after='' since='' payload response page has_next end_cursor nodes query
   local history_list page_history_list issue history_after threshold scan issue_json history_json normalized scan_next
   printf '[]\n' > "$TMP_ROOT/issues.json"
+  printf '[]\n' > "$TMP_ROOT/issues-audit.json"
   printf '[]\n' > "$TMP_ROOT/history.json"
   fm_linear_private_dir "$HISTORY_SCAN_DIR" || return 1
   if [ -n "$cursor" ]; then
@@ -622,6 +623,9 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
     page_history_list="$TMP_ROOT/history-pagination-$page.tsv"
     fm_linear_normalize_json_timestamps issues < "$response" > "$normalized" || return 1
     mv -f -- "$normalized" "$response" || return 1
+    nodes="$TMP_ROOT/issues-audit-nodes-$page.json"
+    jq '.data.issues.nodes' "$response" > "$nodes" || return 1
+    json_array_append "$TMP_ROOT/issues-audit.json" "$nodes" || return 1
     threshold=$since
     jq -r --arg threshold "$threshold" '
       .data.issues.nodes[]
@@ -721,14 +725,33 @@ record_event_count() {  # <authority> <issue>
   fi
 }
 
+publish_outbox_observation_marker() {  # <marker>
+  local marker=$1
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || {
+      FM_LINEAR_API_ERROR="unsafe outbox observation marker: ${marker##*/}"
+      return 1
+    }
+    return 0
+  fi
+  fm_linear_atomic_file "$marker" 600 </dev/null || {
+    FM_LINEAR_API_ERROR="cannot publish outbox observation marker: ${marker##*/}"
+    return 1
+  }
+}
+
 mark_outbox_comment_observed() {  # <comment-id>
   local comment_id=$1 journal marker
   [ -d "$OUTBOX" ] || return 0
   for journal in "$OUTBOX"/*.done; do
     [ -f "$journal" ] || continue
+    [ ! -L "$journal" ] || {
+      FM_LINEAR_API_ERROR="unsafe completed write journal: ${journal##*/}"
+      return 1
+    }
     [ "$(jq -r '.comment_id // empty' "$journal" 2>/dev/null)" = "$comment_id" ] || continue
     marker="${journal%.*}.comment-observed"
-    [ -e "$marker" ] || (umask 077; : > "$marker") 2>/dev/null || true
+    publish_outbox_observation_marker "$marker" || return 1
   done
 }
 
@@ -737,14 +760,65 @@ mark_outbox_board_observed() {  # <issue> <to-state> <to-assignee-id>
   [ -d "$OUTBOX" ] || return 0
   for journal in "$OUTBOX"/*.done; do
     [ -f "$journal" ] || continue
+    [ ! -L "$journal" ] || {
+      FM_LINEAR_API_ERROR="unsafe completed write journal: ${journal##*/}"
+      return 1
+    }
     [ "$(jq -r '.issue // empty' "$journal" 2>/dev/null)" = "$issue" ] || continue
     target_state=$(jq -r '.target_state // empty' "$journal" 2>/dev/null)
     [ -n "$target_state" ] || continue
     expected_assignee_id=$(jq -r '.assignee_id // empty' "$journal" 2>/dev/null)
     [ "$to_state" = "$target_state" ] && [ "$to_assignee_id" = "$expected_assignee_id" ] || continue
     marker="${journal%.*}.board-observed"
-    [ -e "$marker" ] || (umask 077; : > "$marker") 2>/dev/null || true
+    publish_outbox_observation_marker "$marker" || return 1
   done
+}
+
+reconcile_outbox_snapshot_board() {  # <issue> <updated-at> <state-id> <assignee-id>
+  local issue=$1 updated=$2 state_id=$3 assignee_id=$4 journal journal_updated marker
+  [ -d "$OUTBOX" ] || return 1
+  updated=$(fm_linear_normalize_timestamp "$updated") || return 2
+  for journal in "$OUTBOX"/*.done; do
+    [ -f "$journal" ] || continue
+    [ ! -L "$journal" ] || {
+      FM_LINEAR_API_ERROR="unsafe completed write journal: ${journal##*/}"
+      return 2
+    }
+    [ "$(jq -r '.issue // empty' "$journal" 2>/dev/null)" = "$issue" ] || continue
+    [ "$(jq -r 'if has("mutation_sent") then .mutation_sent else false end' "$journal" 2>/dev/null)" = true ] \
+      || continue
+    [ "$(jq -r '.state_id // empty' "$journal" 2>/dev/null)" = "$state_id" ] || continue
+    [ "$(jq -r '.assignee_id // empty' "$journal" 2>/dev/null)" = "$assignee_id" ] || continue
+    journal_updated=$(jq -r '.mutated_updated_at // empty' "$journal" 2>/dev/null)
+    [ -n "$journal_updated" ] || continue
+    journal_updated=$(fm_linear_normalize_timestamp "$journal_updated") || {
+      FM_LINEAR_API_ERROR="invalid mutation provenance in completed write journal: ${journal##*/}"
+      return 2
+    }
+    [ "$journal_updated" = "$updated" ] || continue
+    marker="${journal%.*}.board-observed"
+    publish_outbox_observation_marker "$marker" || return 2
+    return 0
+  done
+  return 1
+}
+
+reconcile_fetched_outbox_boards() {
+  local row issue updated state_id assignee_id status
+  jq -c '.[]' "$TMP_ROOT/issues-audit.json" > "$TMP_ROOT/outbox-board-rows.jsonl" || return 1
+  while IFS= read -r row; do
+    issue=$(printf '%s' "$row" | jq -r '.identifier // empty') || return 1
+    updated=$(printf '%s' "$row" | jq -r '.updatedAt // empty') || return 1
+    state_id=$(printf '%s' "$row" | jq -r '.state.id // empty') || return 1
+    assignee_id=$(printf '%s' "$row" | jq -r '.assignee.id // empty') || return 1
+    [ -n "$issue" ] && [ -n "$updated" ] && [ -n "$state_id" ] || continue
+    if reconcile_outbox_snapshot_board "$issue" "$updated" "$state_id" "$assignee_id"; then
+      continue
+    else
+      status=$?
+      [ "$status" -eq 1 ] || return 1
+    fi
+  done < "$TMP_ROOT/outbox-board-rows.jsonl"
 }
 
 derive_comments() {  # <observed-at> <bootstrap-cutoff>
@@ -803,7 +877,7 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
     if comment_head_current "$id" "$hash" "$edited"; then
       if [ -n "$author_id" ] && [ "$author_id" = "$SELF_ID" ]; then
         thread_participation_set "$thread" "$observed" || return 1
-        mark_outbox_comment_observed "$id"
+        mark_outbox_comment_observed "$id" || return 1
       fi
       continue
     fi
@@ -821,7 +895,7 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
     if [ -n "$author_id" ] && [ "$author_id" = "$SELF_ID" ]; then
       comment_head_set "$id" "$hash" "$edited" "$observed" || return 1
       thread_participation_set "$thread" "$observed" || return 1
-      mark_outbox_comment_observed "$id"
+      mark_outbox_comment_observed "$id" || return 1
       continue
     fi
     body_file="$TMP_ROOT/comment-body-$id"
@@ -928,7 +1002,7 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     to_assignee_id=$(printf '%s' "$row" | jq -r '.toAssignee.id // empty')
     if history_hash_current "$id" "$hash"; then
       if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ] && [ "$has_board" = true ]; then
-        mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id"
+        mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id" || return 1
       fi
       continue
     fi
@@ -938,7 +1012,9 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     fi
     if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ]; then
       history_hash_set "$id" "$hash" "$updated" || return 1
-      [ "$has_board" != true ] || mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id"
+      if [ "$has_board" = true ]; then
+        mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id" || return 1
+      fi
       continue
     fi
     if [ "$actor_id" = "$FM_LINEAR_CAPTAIN_ID" ]; then
@@ -1014,7 +1090,7 @@ issue_creation_mark() {  # <issue>
 
 derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
   local observed=$1 row issue updated state description description_hash hash prior_hash prior_updated
-  local key record next snapshot prior_snapshot changes kind ownership_acquired
+  local key record next snapshot prior_snapshot changes kind ownership_acquired state_id assignee_id reconcile_status
   jq -c 'sort_by(.updatedAt, .identifier)[]' "$TMP_ROOT/issues.json" \
     > "$TMP_ROOT/issue-snapshot-rows.jsonl" || return 1
   while IFS= read -r row; do
@@ -1077,6 +1153,16 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
           | reduce ($delta | keys[]) as $field ($delta;
               if ($targets[$field].present // false) and $targets[$field].value == $after[$field]
               then del(.[$field]) else . end)') || return 1
+      if printf '%s' "$changes" | jq -e 'has("state") or has("assignee")' >/dev/null; then
+        state_id=$(printf '%s' "$snapshot" | jq -r '.state.id // empty') || return 1
+        assignee_id=$(printf '%s' "$snapshot" | jq -r '.assignee.id // empty') || return 1
+        if reconcile_outbox_snapshot_board "$issue" "$updated" "$state_id" "$assignee_id"; then
+          changes=$(printf '%s' "$changes" | jq 'del(.state,.assignee)') || return 1
+        else
+          reconcile_status=$?
+          [ "$reconcile_status" -eq 1 ] || return 1
+        fi
+      fi
       if [ "$(printf '%s' "$changes" | jq -r 'length')" -gt 0 ]; then
         ownership_acquired=$(jq -n --argjson before "$prior_snapshot" --argjson after "$snapshot" '
           (($before.labels // []) | index("Firstmate")) == null
@@ -1189,7 +1275,7 @@ audit_invariants() {
   else
     printf '[]\n' > "$mismatch_current"
   fi
-  jq -c '.[]' "$TMP_ROOT/issues.json" > "$TMP_ROOT/audit-rows.jsonl" || return 1
+  jq -c '.[]' "$TMP_ROOT/issues-audit.json" > "$TMP_ROOT/audit-rows.jsonl" || return 1
   while IFS= read -r row; do
     issue=$(printf '%s' "$row" | jq -r '.identifier // "unknown"')
     status=$(printf '%s' "$row" | jq -r '.state.name // "unknown"')
@@ -1524,6 +1610,10 @@ main() {
     return 1
   fi
   timing_mark issues-fetched
+  if ! reconcile_fetched_outbox_boards; then
+    record_failure "${FM_LINEAR_API_ERROR:-cannot reconcile Linear outbox observations}"
+    return 1
+  fi
 
   comments_max=$(jq -r '[.[].updatedAt] | max // empty' "$TMP_ROOT/comments.json")
   issues_max=$(jq -r '[.[].updatedAt] | max // empty' "$TMP_ROOT/issues.json")
@@ -1539,12 +1629,12 @@ main() {
   fi
 
   if ! derive_comments "$observed" "$bootstrap_cutoff"; then
-    record_failure "cannot persist Linear event ledger"
+    record_failure "${FM_LINEAR_API_ERROR:-cannot persist Linear event ledger}"
     return 1
   fi
   timing_mark comments-derived
   if ! derive_history "$observed" "$creation_cutoff" "$bootstrap_cutoff"; then
-    record_failure "cannot persist Linear event ledger"
+    record_failure "${FM_LINEAR_API_ERROR:-cannot persist Linear event ledger}"
     return 1
   fi
   timing_mark history-derived
@@ -1553,7 +1643,7 @@ main() {
     return 1
   fi
   if ! derive_issue_snapshots "$observed" "$creation_cutoff"; then
-    record_failure "cannot persist Linear issue snapshots"
+    record_failure "${FM_LINEAR_API_ERROR:-cannot persist Linear issue snapshots}"
     return 1
   fi
   timing_mark issues-derived
