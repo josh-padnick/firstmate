@@ -1019,10 +1019,9 @@ x_mode_setup() {
 # A successful arm publishes and hash-registers a byte-static shim before it
 # removes the old absorb, snapshot, id-only seen, and local-clock cursor files.
 linear_mode_setup() {
-  local env_file key shim trust cadence shim_body shim_home tool missing artifact changed
+  local env_file key shim cadence shim_body shim_home tool missing artifact changed
   env_file="$FM_HOME/.env"
   shim="$STATE/fm-linear-inbox.check.sh"
-  trust="$STATE/fm-linear-inbox.check-trust"
   cadence="$CONFIG/x-mode.env"
   key=
   [ -f "$env_file" ] && key=$(fm_linear_env_get LINEAR_API_KEY "$env_file")

@@ -347,12 +347,12 @@ resolve_thread_participation() {  # <parent-comment-id> <issue> <observed-at> <r
       '{query:$query,variables:{comment:$comment,after:(if $after == "" then null else $after end)}}' \
       > "$payload" || return 1
     api threadParticipants "$payload" "$response" || return 1
-    [ "$(jq -r '.data.comment.id // empty' "$response")" = "$node" ] \
-      && [ "$(jq -r '.data.comment.issue.identifier // empty' "$response")" = "$issue" ] \
-      && jq -e '.data.comment.children.nodes | type == "array"' "$response" >/dev/null 2>&1 || {
+    if [ "$(jq -r '.data.comment.id // empty' "$response")" != "$node" ] \
+      || [ "$(jq -r '.data.comment.issue.identifier // empty' "$response")" != "$issue" ] \
+      || ! jq -e '.data.comment.children.nodes | type == "array"' "$response" >/dev/null 2>&1; then
       FM_LINEAR_API_ERROR="malformed thread participation response for $node"
       return 1
-    }
+    fi
     if jq -e --arg self "$SELF_ID" 'any(.data.comment.children.nodes[]; .user.id == $self)' \
       "$response" >/dev/null; then
       thread_participation_set "$current" "$observed" || return 1
@@ -1028,7 +1028,7 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     elif [ "$has_labels" = true ] && [ "$has_other" != true ]; then
       kind=label
     elif [ "$has_other" = true ]; then
-      kind=issue-change
+      kind='issue-change'
     else
       history_hash_set "$id" "$hash" "$updated" || return 1
       continue
@@ -1174,7 +1174,7 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
           kind=label
           key="label-snapshot:$issue:$updated:$hash"
         else
-          kind=issue-change
+          kind='issue-change'
           key="issue-snapshot:$issue:$updated:$hash"
         fi
         record="$TMP_ROOT/inbox-issue-snapshot-$issue.json"
