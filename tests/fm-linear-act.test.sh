@@ -30,9 +30,11 @@ resolve_fixture() {  # <file> [current-status] [current-assignee] [current-assig
     --arg assignee_id "${4:-firstmate-id}" '
     {data:{viewer:{id:"firstmate-id"},issue:{id:"issue-1",
       updatedAt:"2026-08-14T11:50:00Z",
-      state:{id:(if $status == "Approve Deliverable" then "approve" else "building" end),name:$status},
+      state:{id:(if $status == "Approve Deliverable" then "approve"
+                 elif $status == "Approve Plan" then "approve-plan" else "building" end),name:$status},
       assignee:{id:$assignee_id,displayName:$assignee},team:{
-        states:{nodes:[{id:"approve",name:"Approve Deliverable"},{id:"building",name:"Building"},
+        states:{nodes:[{id:"approve",name:"Approve Deliverable"},{id:"approve-plan",name:"Approve Plan"},
+                       {id:"building",name:"Building"},
                        {id:"needs-firstmate",name:"Needs Firstmate Decision"},{id:"needs-captain",name:"Needs Decision"}]},
         members:{nodes:[{id:"wrong-captain-id",displayName:"josh.padnick"},
                         {id:"captain-id",displayName:"josh.padnick"},
@@ -293,6 +295,60 @@ printf 'READY FOR YOUR REVIEW\n' > "$home/no-link.md"
 out=$(run_act "$home" "$TMP_ROOT/no-review-link-fixtures" handoff-to-captain BIG-1 \
   --status 'Approve Deliverable' --comment-file "$home/no-link.md" 2>&1 || true)
 assert_contains "$out" "must contain a reviewable link" "review handoff accepted no reviewable link"
+
+home=$(make_home approve-plan)
+fixtures="$TMP_ROOT/approve-plan-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" 'Approve Plan' josh.padnick captain-id
+plan_log="$home/approve-plan.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$plan_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" handoff-to-captain BIG-1 --status 'Approve Plan' \
+    --comment-file "$home/review.md" >/dev/null \
+  || fail "Approve Plan handoff was rejected"
+awk -F '\t' '$1=="issueUpdate"{print $2}' "$plan_log" \
+  | jq -e '.variables.state == "approve-plan" and .variables.assignee == "captain-id"' >/dev/null \
+  || fail "Approve Plan did not use the captain-owned turn marker"
+pass "captain handoffs keep plan and deliverable review states reachable"
+
+home=$(make_home repair-race)
+fixtures="$TMP_ROOT/repair-race-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json" Building josh.padnick captain-id
+mutation_read_fixture "$fixtures/02-read.json" needs-captain 'Needs Decision' captain-id josh.padnick \
+  2026-08-14T11:51:00Z
+repair_log="$home/repair-race.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$repair_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" repair BIG-1 2>&1 || true)
+assert_contains "$out" "state mutation conflict" "repair did not reject a concurrent captain transition"
+[ "$(awk -F '\t' '$1=="resolve"{n++} END{print n+0}' "$repair_log")" = 1 ] \
+  || fail "repair read the board more than once before journaling intent"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$repair_log")" = 0 ] \
+  || fail "repair overwrote a concurrent captain transition"
+pass "repair journals one versioned board observation"
+
+home=$(make_home unfinished-issue)
+mkdir -p "$home/state/linear-outbox"
+printf '{"version":3,"issue":"BIG-1","phase":"mutated"}\n' \
+  > "$home/state/linear-outbox/existing.json"
+chmod 0600 "$home/state/linear-outbox/existing.json"
+mkdir -p "$TMP_ROOT/unfinished-issue-fixtures"
+unfinished_log="$home/unfinished-issue.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" \
+  FM_LINEAR_FIXTURE_DIR="$TMP_ROOT/unfinished-issue-fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$unfinished_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" reply BIG-1 --comment-file "$home/comment.md" --parent parent-1 2>&1 || true)
+assert_contains "$out" "unfinished write already exists for BIG-1" \
+  "a second same-issue write was journaled before the first completed"
+[ "$(find "$home/state/linear-outbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
+  || fail "same-issue refusal created another journal"
+[ ! -s "$unfinished_log" ] || fail "same-issue refusal reached the Linear API"
+pass "one issue cannot carry reordered unfinished writes"
 
 home=$(make_home reviewable-reply)
 fixtures="$TMP_ROOT/reviewable-reply-fixtures"

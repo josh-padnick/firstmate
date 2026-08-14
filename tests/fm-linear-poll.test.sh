@@ -436,6 +436,31 @@ out=$(run_poll "$home" "$fixtures") || fail "incomplete-head actual edit poll fa
 assert_contains "$out" "1 captain input(s)" "editedAt did not distinguish an old actual edit from a reply bump"
 pass "incomplete head bootstrap still surfaces actual old-comment edits"
 
+home=$(make_home incomplete-thread-participation)
+rm -f "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/incomplete-thread-participation-fixtures"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"next-old-page"},nodes:[]}}}' \
+  > "$fixtures/01-comment-heads.json"
+reply=$(comment bootstrap-thread-reply 2026-08-14T11:58:00Z followup captain-id shared-name BIG-31)
+reply=$(printf '%s' "$reply" | jq '.issue.labels.nodes=[] | .parent={id:"unscanned-firstmate-root"}')
+jq -n --argjson node "$reply" \
+  '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{
+    pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
+  > "$fixtures/02-comments.json"
+jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' \
+  > "$fixtures/03-issues.json"
+jq -n '{data:{comment:{id:"unscanned-firstmate-root",issue:{identifier:"BIG-31"},parent:null,
+  user:{id:"firstmate-id"}}}}' > "$fixtures/04-thread-root.json"
+out=$(run_poll "$home" "$fixtures") || fail "incomplete thread-participation poll failed"
+assert_contains "$out" "1 captain input(s)" \
+  "captain reply was suppressed before historical Firstmate participation was known"
+jq -s -e 'any(.[]; .comment_id == "bootstrap-thread-reply"
+  and .thread_id == "unscanned-firstmate-root" and .route == "thread")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "bootstrap reply did not persist its resolved canonical thread"
+pass "incomplete bootstrap resolves thread participation before suppression"
+
 home=$(make_home thread-routing)
 fixtures="$TMP_ROOT/thread-routing-ignored"
 bare=$(comment bare-unlabelled 2026-08-14T11:55:00Z hello captain-id shared-name BIG-14)
@@ -475,6 +500,24 @@ run_poll "$home" "$fixtures" >/dev/null || fail "label-only ownership poll faile
 jq -s -e 'length == 1 and .[0].kind == "issue-created" and .[0].issue == "BIG-16"' \
   "$home/state/linear-inbox"/*.json >/dev/null || fail "assignment or body mention established new-issue ownership without the label"
 pass "new issue ownership is established only by the Firstmate label"
+
+home=$(make_home label-acquisition)
+fixtures="$TMP_ROOT/label-acquisition-before"
+unlabelled=$(issue BIG-32 2026-08-14T11:57:00Z captain-id shared-name '[]')
+unlabelled=$(printf '%s' "$unlabelled" | jq '.createdAt="2026-08-14T11:56:30Z" | .labels.nodes=[]')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$unlabelled" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "unlabelled creation baseline poll failed"
+[ "$(pending_count "$home")" = 0 ] || fail "unlabelled creation established Firstmate ownership"
+fixtures="$TMP_ROOT/label-acquisition-after"
+labelled=$(printf '%s' "$unlabelled" | jq '.updatedAt="2026-08-14T11:58:00Z"
+  | .labels.nodes=[{name:"Firstmate"}]')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$labelled" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "creation-window label acquisition poll failed"
+jq -s -e 'length == 1 and .[0].kind == "label" and .[0].issue == "BIG-32"
+  and .[0].source == "issue-snapshot" and .[0].ownership_acquired == true
+  and .[0].changes.labels == ["Firstmate"]' "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "creation-window Firstmate label acquisition was not durable"
+pass "issue snapshots preserve Firstmate ownership acquired during creation"
 
 home=$(make_home amended-history)
 fixtures="$TMP_ROOT/amended-history-a"
@@ -526,6 +569,12 @@ FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures" >/dev/null \
   || fail "deep history overlap poll failed"
 [ "$(awk -F '\t' '$1=="history"{n++} END{print n+0}' "$request_log")" = 1 ] \
   || fail "deep history pagination continued beyond the overlap horizon"
+awk -F '\t' '$1=="issues"{print $2}' "$request_log" \
+  | jq -e '.query | contains("history(first:10,orderBy:updatedAt)")' >/dev/null \
+  || fail "initial history pages were not ordered by amendment time"
+awk -F '\t' '$1=="history"{print $2}' "$request_log" \
+  | jq -e '.query | contains("history(first:10,after:$after,orderBy:updatedAt)")' >/dev/null \
+  || fail "deep history pages were not ordered by amendment time"
 jq -s -e 'all(.[]; .history_id != "old-boundary")' "$home/state/linear-inbox"/*.json >/dev/null \
   || fail "history older than the overlap horizon became a captain event"
 pass "deep history pagination stops at the overlap horizon"

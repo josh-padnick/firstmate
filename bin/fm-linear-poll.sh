@@ -245,6 +245,70 @@ api() {  # <operation> <payload-file> <response-file>
   fm_linear_api_call "$1" "$2" "$3"
 }
 
+resolve_thread_participation() {  # <parent-comment-id> <issue> <observed-at> <root-output-var-name>
+  local current=$1 issue=$2 observed=$3 output_var=$4 depth=0 payload response query parent author_id after has_next end_cursor page
+  while :; do
+    depth=$((depth + 1))
+    [ "$depth" -le 50 ] || {
+      FM_LINEAR_API_ERROR="thread ancestry exceeded 50 comments"
+      return 1
+    }
+    payload="$TMP_ROOT/thread-root-$depth-payload.json"
+    response="$TMP_ROOT/thread-root-$depth-response.json"
+    # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+    query='query($comment:String!){comment(id:$comment){id issue{identifier} parent{id} user{id}}}'
+    jq -n --arg query "$query" --arg comment "$current" \
+      '{query:$query,variables:{comment:$comment}}' > "$payload" || return 1
+    api threadRoot "$payload" "$response" || return 1
+    [ "$(jq -r '.data.comment.id // empty' "$response")" = "$current" ] \
+      && [ "$(jq -r '.data.comment.issue.identifier // empty' "$response")" = "$issue" ] || {
+      FM_LINEAR_API_ERROR="thread root does not belong to $issue"
+      return 1
+    }
+    author_id=$(jq -r '.data.comment.user.id // empty' "$response")
+    parent=$(jq -r '.data.comment.parent.id // empty' "$response")
+    if [ -z "$parent" ]; then
+      [ "$author_id" != "$SELF_ID" ] || thread_participation_set "$current" "$observed" || return 1
+      break
+    fi
+    current=$parent
+  done
+  printf -v "$output_var" '%s' "$current"
+  thread_participated "$current" && return 0
+  after=
+  page=0
+  while :; do
+    page=$((page + 1))
+    payload="$TMP_ROOT/thread-participants-$page-payload.json"
+    response="$TMP_ROOT/thread-participants-$page-response.json"
+    # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+    query='query($comment:String!,$after:String){comment(id:$comment){id issue{identifier} children(first:50,after:$after,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{user{id}}}}}'
+    jq -n --arg query "$query" --arg comment "$current" --arg after "$after" \
+      '{query:$query,variables:{comment:$comment,after:(if $after == "" then null else $after end)}}' \
+      > "$payload" || return 1
+    api threadParticipants "$payload" "$response" || return 1
+    [ "$(jq -r '.data.comment.id // empty' "$response")" = "$current" ] \
+      && [ "$(jq -r '.data.comment.issue.identifier // empty' "$response")" = "$issue" ] \
+      && jq -e '.data.comment.children.nodes | type == "array"' "$response" >/dev/null 2>&1 || {
+      FM_LINEAR_API_ERROR="malformed thread participation response for $current"
+      return 1
+    }
+    if jq -e --arg self "$SELF_ID" 'any(.data.comment.children.nodes[]; .user.id == $self)' \
+      "$response" >/dev/null; then
+      thread_participation_set "$current" "$observed" || return 1
+      return 0
+    fi
+    has_next=$(jq -r '.data.comment.children.pageInfo.hasNextPage // false' "$response")
+    [ "$has_next" = true ] || return 0
+    end_cursor=$(jq -r '.data.comment.children.pageInfo.endCursor // empty' "$response")
+    [ -n "$end_cursor" ] || {
+      FM_LINEAR_API_ERROR="thread participation pagination omitted endCursor for $current"
+      return 1
+    }
+    after=$end_cursor
+  done
+}
+
 bootstrap_comment_heads() {  # <event-bootstrap-cutoff>
   local cutoff=$1 after='' payload response viewer_id has_next end_cursor id body_b64 updated edited hash author_id parent thread query
   if [ -e "$COMMENT_HEAD_BOOTSTRAP_FILE" ]; then
@@ -384,7 +448,7 @@ append_initial_histories() {  # <issues-response> <page-number>
 fetch_more_history() {  # <issue-id> <after> <threshold>
   local issue=$1 after=$2 threshold=$3 page=0 payload response nodes has_next end_cursor oldest query
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($id:String!,$after:String){issue(id:$id){description history(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}'
+  query='query($id:String!,$after:String){issue(id:$id){description history(first:10,after:$after,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}'
   while :; do
     page=$((page + 1))
     [ "$page" -le "${FM_LINEAR_MAX_HISTORY_PAGES:-100}" ] || {
@@ -446,10 +510,10 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
     response="$TMP_ROOT/issues-response-$page.json"
     if [ -n "$since" ]; then
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
+      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
     else
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
+      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
     fi
     jq -n --arg query "$query" --arg after "$after" \
       '{query:$query,variables:{after:(if $after == "" then null else $after end)}}' > "$payload" || return 1
@@ -562,6 +626,14 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
        ((.issue.labels.nodes // [] | map(.name) | tojson) | @base64)]
     | @tsv
   ' "$TMP_ROOT/comments.json" > "$TMP_ROOT/comment-rows.tsv" || return 1
+  jq -r --arg self "$SELF_ID" '.[]
+    | select(.user.id == $self)
+    | [(.parent.id // .id // ""), (.updatedAt // "")]
+    | @tsv' "$TMP_ROOT/comments.json" > "$TMP_ROOT/comment-participation.tsv" || return 1
+  while IFS="$(printf '\t')" read -r thread updated; do
+    [ -n "$thread" ] && [ -n "$updated" ] || continue
+    thread_participation_set "$thread" "$updated" || return 1
+  done < "$TMP_ROOT/comment-participation.tsv"
   while IFS="$(printf '\t')" read -r id body_b64 author_id author issue parent created updated edited labels_b64; do
     [ "$id" != __FM_LINEAR_EMPTY__ ] || id=
     body_b64=${body_b64#b:}
@@ -613,6 +685,12 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
     elif case "$body_lower" in *"$mention_lower"*) true ;; *) false ;; esac; then
       should_wake=1
       route=mention
+    elif [ -n "$parent" ] && [ "$bootstrap_complete" != true ]; then
+      resolve_thread_participation "$parent" "$issue" "$observed" thread || return 1
+      if thread_participated "$thread"; then
+        should_wake=1
+        route=thread
+      fi
     fi
     if [ "$should_wake" -eq 0 ]; then
       comment_head_set "$id" "$hash" "$edited" "$observed" || return 1
@@ -757,7 +835,7 @@ prepare_issue_heads() {
 
 derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
   local observed=$1 row issue updated state description description_hash hash prior_hash prior_updated
-  local key record next snapshot prior_snapshot changes kind
+  local key record next snapshot prior_snapshot changes kind ownership_acquired
   jq -c 'sort_by(.updatedAt, .identifier)[]' "$TMP_ROOT/issues.json" \
     > "$TMP_ROOT/issue-snapshot-rows.jsonl" || return 1
   while IFS= read -r row; do
@@ -767,7 +845,8 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
     description=$(printf '%s' "$row" | jq -r '.description // ""')
     [ -n "$issue" ] && [ -n "$updated" ] || continue
     snapshot=$(printf '%s' "$row" | jq -cS '{title:(.title // ""),description:(.description // ""),
-      priority:(.priority // null),project:(.project // null),parent:(.parent // null),due_date:(.dueDate // null)}') \
+      priority:(.priority // null),project:(.project // null),parent:(.parent // null),due_date:(.dueDate // null),
+      labels:((.labels.nodes // []) | map(.name) | sort)}') \
       || return 1
     hash=$(printf '%s' "$snapshot" | fm_linear_sha256) || return 1
     description_hash=$(printf '%s' "$description" | fm_linear_sha256) || return 1
@@ -789,13 +868,20 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
                 if .fromPriority != null or .toPriority != null then "priority" else empty end,
                 if .fromProject != null or .toProject != null then "project" else empty end,
                 if .fromParent != null or .toParent != null then "parent" else empty end,
-                if .fromDueDate != null or .toDueDate != null then "due_date" else empty end)]
+                if .fromDueDate != null or .toDueDate != null then "due_date" else empty end,
+                if ((.addedLabels // []) | length) + ((.removedLabels // []) | length) > 0 then "labels" else empty end)]
             | unique as $represented
           | reduce $represented[] as $field ($delta; del(.[$field]))') || return 1
       if [ "$(printf '%s' "$changes" | jq -r 'length')" -gt 0 ]; then
+        ownership_acquired=$(jq -n --argjson before "$prior_snapshot" --argjson after "$snapshot" '
+          (($before.labels // []) | index("Firstmate")) == null
+          and (($after.labels // []) | index("Firstmate")) != null') || return 1
         if [ "$(printf '%s' "$changes" | jq -r 'keys == ["description"]')" = true ]; then
           kind=description
           key="description-snapshot:$issue:$updated:$hash"
+        elif [ "$(printf '%s' "$changes" | jq -r 'keys == ["labels"]')" = true ]; then
+          kind=label
+          key="label-snapshot:$issue:$updated:$hash"
         else
           kind=issue-change
           key="issue-snapshot:$issue:$updated:$hash"
@@ -803,12 +889,14 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
         record="$TMP_ROOT/inbox-issue-snapshot-$issue.json"
         jq -n --arg kind "$kind" --arg issue "$issue" --arg updated "$updated" \
           --arg observed "$observed" --arg hash "$hash" --arg description "$description" \
-          --argjson changes "$changes" '
+          --argjson changes "$changes" --argjson snapshot "$snapshot" \
+          --argjson ownership_acquired "$ownership_acquired" '
           {kind:$kind,source:"issue-snapshot",issue:$issue,author:"unknown",author_id:null,
            authority:"unattributed",
            created_at:$updated,updated_at:$updated,observed_at:$observed,
            snapshot_sha256:$hash,changes:$changes}
           + (if $kind == "description" then {description:$description} else {} end)
+          + (if $ownership_acquired then {ownership_acquired:true,labels:$snapshot.labels} else {} end)
         ' > "$record" || return 1
         publish_inbox "$key" "$record" || return 1
         record_event_count unattributed "$issue"

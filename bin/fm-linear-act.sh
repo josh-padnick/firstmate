@@ -91,16 +91,16 @@ resolve_issue() {  # <BIG-n> <target-status-or-empty> <target-role-or-empty> <ou
     query='query($issue:String!){viewer{id} issue(id:$issue){id updatedAt state{id name} assignee{id displayName} team{states{nodes{id name}}}}}'
   else
     # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-    query='query($issue:String!){issue(id:$issue){id updatedAt state{id name} assignee{id displayName}}}'
+    query='query($issue:String!){viewer{id} issue(id:$issue){id updatedAt state{id name} assignee{id displayName}}}'
   fi
   jq -n --arg query "$query" --arg issue "$issue" \
     '{query:$query,variables:{issue:$issue}}' > "$payload" || die "cannot build issue lookup"
   api resolve "$payload" "$response"
   jq -e '.data.issue.id != null' "$response" >/dev/null 2>&1 || die "issue not found: $issue"
   if [ -z "$status" ]; then
-    jq '.data.issue | {issue_id:.id, current_updated_at:.updatedAt,
+    jq '{viewer_id:(.data.viewer.id // null)} + (.data.issue | {issue_id:.id, current_updated_at:.updatedAt,
         current_state:.state.name,current_state_id:.state.id,
-        current_assignee:(.assignee.displayName // ""),current_assignee_id:(.assignee.id // null)}' \
+        current_assignee:(.assignee.displayName // ""),current_assignee_id:(.assignee.id // null)})' \
       "$response" > "$output" || die "cannot parse issue lookup"
     return 0
   fi
@@ -144,17 +144,34 @@ resolve_reply_root() {  # <issue-id> <target-comment-id> <output-var-name>
   printf -v "$output_var" '%s' "$current"
 }
 
-create_journal() {  # <issue> <status> <body-file> <parent> <journal-output-var-name>
-  local issue=$1 status=$2 body_file=$3 parent=$4 output_var=$5 uuid comment_id role resolved journal_path created body resolved_parent reviewable
+ensure_issue_available() {  # <issue>
+  local issue=$1 journal existing_issue
+  for journal in "$OUTBOX"/*.json; do
+    [ ! -L "$journal" ] || die "unsafe write journal: $journal"
+    [ -f "$journal" ] || continue
+    existing_issue=$(jq -er '.issue | select(type == "string" and length > 0)' "$journal" 2>/dev/null) \
+      || die "malformed write journal: $journal"
+    [ "$existing_issue" != "$issue" ] \
+      || die "unfinished write already exists for $issue; run resume"
+  done
+}
+
+create_journal() {  # <issue> <status> <body-file> <parent> <journal-output-var-name> [resolved-issue]
+  local issue=$1 status=$2 body_file=$3 parent=$4 output_var=$5 supplied_resolved=${6:-}
+  local uuid comment_id role resolved journal_path created body resolved_parent reviewable
+  ensure_issue_available "$issue"
   uuid=$(fm_linear_uuid) || die "cannot generate journal UUID"
   comment_id=$(fm_linear_uuid) || die "cannot generate comment UUID"
   created=$(fm_linear_iso_from_epoch "${FM_LINEAR_NOW_EPOCH:-$(date +%s)}") || die "cannot timestamp journal"
   role=
-  resolved="$TMP_ROOT/resolved-$uuid.json"
+  resolved=$supplied_resolved
   if [ -n "$status" ]; then
     role=$(fm_linear_status_role "$status") || die "unknown state-carrying status: $status"
   fi
-  resolve_issue "$issue" "$status" "$role" "$resolved"
+  if [ -z "$resolved" ]; then
+    resolved="$TMP_ROOT/resolved-$uuid.json"
+    resolve_issue "$issue" "$status" "$role" "$resolved"
+  fi
   resolved_parent=
   if [ -n "$parent" ]; then
     resolve_reply_root "$(jq -r '.issue_id' "$resolved")" "$parent" resolved_parent
@@ -365,7 +382,7 @@ parse_write_args() {
 }
 
 main() {
-  local command=${1:-} journal role resolved status assignee lock_status reviewable
+  local command=${1:-} journal role resolved repair_lookup status assignee assignee_id lock_status reviewable
   [ -n "$command" ] || die "a subcommand is required"
   shift
   command -v jq >/dev/null 2>&1 || die "missing jq"
@@ -391,15 +408,28 @@ main() {
       [ "$#" -eq 1 ] || die "repair requires one issue"
       ISSUE=$1
       require_issue "$ISSUE"
+      repair_lookup="$TMP_ROOT/repair-lookup.json"
       resolved="$TMP_ROOT/repair-resolved.json"
-      resolve_issue "$ISSUE" "" "" "$resolved"
-      status=$(jq -r '.current_state // empty' "$resolved")
+      resolve_issue "$ISSUE" "" "" "$repair_lookup"
+      status=$(jq -r '.current_state // empty' "$repair_lookup")
       role=$(fm_linear_status_role "$status") || die "cannot repair unknown status: $status"
-      if [ "$role" = captain ]; then assignee=$CAPTAIN_NAME; else assignee=$SELF_NAME; fi
+      fm_linear_load_identity_ids || die "$FM_LINEAR_IDENTITY_ERROR"
+      [ "$(jq -r '.viewer_id // empty' "$repair_lookup")" = "$FM_LINEAR_FIRSTMATE_ID" ] \
+        || die "LINEAR_FIRSTMATE_ID does not match the authenticated Linear viewer"
+      if [ "$role" = captain ]; then
+        assignee=$CAPTAIN_NAME
+        assignee_id=$FM_LINEAR_CAPTAIN_ID
+      else
+        assignee=$SELF_NAME
+        assignee_id=$FM_LINEAR_FIRSTMATE_ID
+      fi
+      jq --arg assignee_id "$assignee_id" \
+        '. + {state_id:.current_state_id,assignee_id:$assignee_id}' "$repair_lookup" \
+        > "$resolved" || die "cannot prepare repair intent"
       COMMENT_FILE="$TMP_ROOT/repair-comment.md"
       make_repair_comment "$ISSUE" "$status" "$assignee" "$COMMENT_FILE"
       attachment_lint "$COMMENT_FILE"
-      create_journal "$ISSUE" "$status" "$COMMENT_FILE" "" journal
+      create_journal "$ISSUE" "$status" "$COMMENT_FILE" "" journal "$resolved"
       resume_journal "$journal"
       ;;
     handoff-to-captain|take-from-captain|reply|escalate)
@@ -412,8 +442,10 @@ main() {
         handoff-to-captain)
           review_readiness_lint "$COMMENT_FILE"
           [ -n "$STATUS" ] || die "handoff-to-captain requires --status"
-          [ "$STATUS" = 'Approve Deliverable' ] \
-            || die "reviewable handoffs must use Approve Deliverable"
+          case "$STATUS" in
+            'Approve Deliverable'|'Approve Plan') ;;
+            *) die "handoff status must be Approve Plan or Approve Deliverable" ;;
+          esac
           ;;
         take-from-captain)
           [ "$reviewable" -eq 0 ] \
