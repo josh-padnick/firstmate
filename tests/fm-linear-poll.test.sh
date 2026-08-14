@@ -744,7 +744,7 @@ jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' >
 jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-41"},parent:null,user:{id:"captain-id"}}}}' \
   > "$fixtures/04-root.json"
 jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-41"},children:{
-  pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"child-comment",user:{id:"other-id"}}]}}}}' \
+  pageInfo:{hasNextPage:true,endCursor:"root-page-two"},nodes:[{id:"child-earlier",user:{id:"other-id"}}]}}}}' \
   > "$fixtures/05-root-children.json"
 nested_status=0
 out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures" 2>&1) || nested_status=$?
@@ -752,6 +752,9 @@ out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures" 2>&1) || ne
 [ "$(pending_count "$home")" = 0 ] || fail "incomplete descendant traversal published the reply early"
 [ -d "$home/state/.linear-thread-descendant-scans" ] \
   || fail "descendant traversal did not checkpoint provider progress"
+scan=$(find "$home/state/.linear-thread-descendant-scans" -type f -name '*.json' | head -n 1)
+jq -e '.after == "root-page-two" and .children == ["child-earlier"]' "$scan" >/dev/null \
+  || fail "descendant traversal did not checkpoint the earlier child page with its cursor"
 fixtures="$TMP_ROOT/nested-thread-resume-two"
 mkdir -p "$fixtures"
 jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"oldest"},nodes:[]}}}' \
@@ -760,7 +763,25 @@ jq -n --argjson node "$captain_reply" \
   '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
   > "$fixtures/02-comments.json"
 jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/03-issues.json"
-jq -n '{data:{comment:{id:"child-comment",issue:{identifier:"BIG-41"},children:{
+jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-41"},children:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"child-later",user:{id:"other-id"}}]}}}}' \
+  > "$fixtures/04-root-children.json"
+out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
+  || fail "second nested participation sweep failed"
+[ "$(pending_count "$home")" = 0 ] || fail "completed parent pagination published the reply early"
+scan=$(find "$home/state/.linear-thread-descendant-scans" -type f -name '*.json' | head -n 1)
+jq -e '.after == null and .children == []
+  and .queue == ["child-earlier","child-later"]' "$scan" >/dev/null \
+  || fail "descendant traversal discarded a child from an earlier page"
+fixtures="$TMP_ROOT/nested-thread-resume-three"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"oldest"},nodes:[]}}}' \
+  > "$fixtures/01-bootstrap.json"
+jq -n --argjson node "$captain_reply" \
+  '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
+  > "$fixtures/02-comments.json"
+jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/03-issues.json"
+jq -n '{data:{comment:{id:"child-earlier",issue:{identifier:"BIG-41"},children:{
   pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"nested-self",user:{id:"firstmate-id"}}]}}}}' \
   > "$fixtures/04-child-children.json"
 out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
@@ -770,7 +791,7 @@ assert_contains "$out" "1 captain input(s)" \
 jq -s -e 'any(.[]; .comment_id == "nested-captain" and .route == "thread")' \
   "$home/state/linear-inbox"/*.json >/dev/null \
   || fail "deferred nested reply was not durably routed through its canonical thread"
-pass "nested participation traversal checkpoints and resumes before suppression"
+pass "nested participation retains every paginated descendant before suppression"
 
 home=$(make_home root-progress-resume)
 fixtures="$TMP_ROOT/root-progress-resume-one"

@@ -212,16 +212,68 @@ journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 fixtures="$TMP_ROOT/accepted-mutation-resume-fixtures"
 mkdir -p "$fixtures"
 mutation_read_fixture "$fixtures/01-read.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
-mutation_read_fixture "$fixtures/02-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick
 resume_log="$home/accepted-mutation-resume.log"
-FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
-  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume >/dev/null \
-  || fail "accepted mutation did not settle by read-back"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1 || true)
+assert_contains "$out" "ambiguous state mutation recovery" \
+  "unproven accepted mutation was adopted from its target pair"
 [ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
-  || fail "accepted mutation was replayed after exact target read-back"
-pass "accepted pre-phase state mutations settle without replay"
+  || fail "ambiguous accepted mutation was replayed"
+[ "$(awk -F '\t' '$1=="commentCreate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "ambiguous accepted mutation posted an irreversible comment"
+pass "accepted pre-phase mutations require durable provenance before comment"
+
+home=$(make_home mutation-same-pair-conflict)
+fixtures="$TMP_ROOT/mutation-same-pair-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/review.md"
+) >/dev/null 2>&1 || true
+fixtures="$TMP_ROOT/mutation-same-pair-resume-fixtures"
+mkdir -p "$fixtures"
+mutation_read_fixture "$fixtures/01-read.json" approve 'Approve Deliverable' captain-id josh.padnick \
+  2026-08-14T11:55:00Z
+resume_log="$home/mutation-same-pair-resume.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1 || true)
+assert_contains "$out" "ambiguous state mutation recovery" \
+  "later captain same-pair edit was adopted as Firstmate mutation provenance"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "same-pair recovery overwrote the later captain edit"
+[ "$(awk -F '\t' '$1=="commentCreate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "same-pair recovery posted a stale irreversible comment"
+pass "same-pair captain edits cannot supply mutation provenance"
+
+home=$(make_home noop-state-write)
+fixtures="$TMP_ROOT/noop-state-write-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json" 'Approve Deliverable' josh.padnick captain-id
+mutation_read_fixture "$fixtures/02-read.json" approve 'Approve Deliverable' captain-id josh.padnick \
+  2026-08-14T11:50:00Z
+mutation_read_fixture "$fixtures/03-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick \
+  2026-08-14T11:50:00Z
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick captain-id
+noop_log="$home/noop-state-write.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$noop_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+    --comment-file "$home/review.md" >/dev/null \
+  || fail "verified no-op state write did not complete"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$noop_log")" = 0 ] \
+  || fail "no-op state write sent an unnecessary issueUpdate"
+done_journal=$(find "$home/state/linear-outbox" -name '*.done' | head -n 1)
+[ "$(jq -r '.mutation_sent' "$done_journal")" = false ] \
+  || fail "no-op state write did not retain its mutation provenance"
+[ -f "${done_journal%.done}.board-observed" ] \
+  || fail "verified no-op snapshot did not satisfy board observation"
+pass "verified no-op writes satisfy board observation without self history"
 
 home=$(make_home mutation-conflict)
 fixtures="$TMP_ROOT/mutation-conflict-kill-fixtures"

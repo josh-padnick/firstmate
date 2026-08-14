@@ -320,11 +320,12 @@ resolve_thread_participation() {  # <parent-comment-id> <issue> <observed-at> <r
   if [ -e "$scan" ]; then
     [ -f "$scan" ] && [ ! -L "$scan" ] || return 1
     jq -e --arg root "$current" --arg issue "$issue" \
-      '.root == $root and .issue == $issue and (.queue | type == "array")' \
+      '.root == $root and .issue == $issue and (.queue | type == "array")
+       and ((.children // []) | type == "array")' \
       "$scan" >/dev/null 2>&1 || return 1
   else
     jq -n --arg root "$current" --arg issue "$issue" \
-      '{root:$root,issue:$issue,queue:[$root],current:null,after:null}' \
+      '{root:$root,issue:$issue,queue:[$root],current:null,after:null,children:[]}' \
       | fm_linear_atomic_file "$scan" 600 || return 1
   fi
   page=0
@@ -367,11 +368,12 @@ resolve_thread_participation() {  # <parent-comment-id> <issue> <observed-at> <r
     next="$TMP_ROOT/thread-descendants-$scan_id.json"
     jq --arg node "$node" --arg after "$end_cursor" --argjson has_next "$has_next" \
       --slurpfile response "$response" '
-      if $has_next then .current=$node | .after=$after
+      ($response[0].data.comment.children.nodes | map(.id // empty) | map(select(length > 0))) as $page_children
+      | (((.children // []) + $page_children) | unique) as $children
+      | if $has_next then .current=$node | .after=$after | .children=$children
       else
-        ($response[0].data.comment.children.nodes | map(.id // empty) | map(select(length > 0))) as $children
-        | .queue=((.queue[1:] + $children) | unique)
-        | .current=null | .after=null
+        .queue=((.queue[1:] + $children) | unique)
+        | .current=null | .after=null | .children=[]
       end' "$scan" > "$next" || return 1
     fm_linear_atomic_file "$scan" 600 < "$next" || return 1
   done

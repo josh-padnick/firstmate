@@ -192,6 +192,9 @@ create_journal() {  # <issue> <status> <body-file> <parent> <journal-output-var-
        original_state_id:($resolved[0].current_state_id // null),
        original_assignee_id:($resolved[0].current_assignee_id // null),
        original_updated_at:($resolved[0].current_updated_at // null),
+       mutation_required:(if $status == "" then false
+         else (($resolved[0].state_id // "") != ($resolved[0].current_state_id // "")
+           or ($resolved[0].assignee_id // "") != ($resolved[0].current_assignee_id // "")) end),
        comment_file:$body_file, comment_body:$body, comment_id:$comment_id,
        target_comment_id:(if $target_comment == "" then null else $target_comment end),
        parent_id:(if $parent == "" then null else $parent end), phase:"journaled"}
@@ -205,10 +208,12 @@ update_journal_phase() {  # <journal> <phase>
   fm_linear_atomic_file "$journal" 600 < "$updated" || die "cannot publish write journal phase"
 }
 
-update_journal_mutated() {  # <journal> <board-updated-at>
-  local journal=$1 updated_at=$2 updated="$TMP_ROOT/journal-mutated.json"
+update_journal_mutated() {  # <journal> <board-updated-at> <mutation-sent>
+  local journal=$1 updated_at=$2 mutation_sent=$3 updated="$TMP_ROOT/journal-mutated.json"
   [ -n "$updated_at" ] || die "mutation read-back omitted the board version"
-  jq --arg updated_at "$updated_at" '.phase="mutated" | .mutated_updated_at=$updated_at' \
+  case "$mutation_sent" in true|false) ;; *) die "invalid mutation provenance" ;; esac
+  jq --arg updated_at "$updated_at" --argjson mutation_sent "$mutation_sent" \
+    '.phase="mutated" | .mutated_updated_at=$updated_at | .mutation_sent=$mutation_sent' \
     "$journal" > "$updated" || die "cannot update write journal"
   fm_linear_atomic_file "$journal" 600 < "$updated" || die "cannot publish write journal phase"
 }
@@ -228,6 +233,7 @@ apply_state_mutation() {  # <journal>
   local journal=$1 payload="$TMP_ROOT/mutate-payload.json" response="$TMP_ROOT/mutate-response.json" query
   local read_payload="$TMP_ROOT/mutate-read-payload.json" read_response="$TMP_ROOT/mutate-read-response.json"
   local issue target_state target_assignee original_state original_assignee original_updated actual_state actual_assignee actual_updated
+  local mutation_required
   [ "$(jq -r '.target_state // empty' "$journal")" != "" ] || return 0
   [ "$(jq -r '.phase // "journaled"' "$journal")" = journaled ] || return 0
   issue=$(jq -r '.issue_id' "$journal")
@@ -244,9 +250,24 @@ apply_state_mutation() {  # <journal>
   actual_state=$(jq -r '.data.issue.state.id // empty' "$read_response")
   actual_assignee=$(jq -r '.data.issue.assignee.id // empty' "$read_response")
   actual_updated=$(jq -r '.data.issue.updatedAt // empty' "$read_response")
-  if [ "$actual_state" = "$target_state" ] && [ "$actual_assignee" = "$target_assignee" ]; then
-    update_journal_mutated "$journal" "$actual_updated"
+  mutation_required=$(jq -r '
+    if has("mutation_required") then .mutation_required
+    else ((.state_id // "") != (.original_state_id // "")
+      or (.assignee_id // "") != (.original_assignee_id // ""))
+    end' "$journal")
+  if [ "$mutation_required" = false ]; then
+    if [ "$actual_state" != "$target_state" ] \
+      || [ "$actual_assignee" != "$target_assignee" ] \
+      || [ "$actual_state" != "$original_state" ] \
+      || [ "$actual_assignee" != "$original_assignee" ] \
+      || [ "$actual_updated" != "$original_updated" ]; then
+      die "state mutation conflict for $(jq -r '.issue' "$journal"): no-op target changed after journaling"
+    fi
+    update_journal_mutated "$journal" "$actual_updated" false
     return 0
+  fi
+  if [ "$actual_state" = "$target_state" ] && [ "$actual_assignee" = "$target_assignee" ]; then
+    die "ambiguous state mutation recovery for $(jq -r '.issue' "$journal"): target board pair lacks journaled provenance"
   fi
   if [ -z "$original_state" ] || [ -z "$original_updated" ] || [ -z "$actual_updated" ] \
     || [ "$actual_state" != "$original_state" ] \
@@ -264,7 +285,7 @@ apply_state_mutation() {  # <journal>
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED:-0}" = 1 ]; then
     kill -KILL "$$"
   fi
-  update_journal_mutated "$journal" "$(jq -r '.data.issueUpdate.issue.updatedAt // empty' "$response")"
+  update_journal_mutated "$journal" "$(jq -r '.data.issueUpdate.issue.updatedAt // empty' "$response")" true
   test_pause_after_mutation
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION:-0}" = 1 ]; then
     kill -KILL "$$"
@@ -370,6 +391,11 @@ verify_journal() {  # <journal>
       || die "read-back mismatch for $(jq -r '.issue' "$journal"): state=$actual_state assignee=$actual_assignee ($actual_assignee_id)"
   fi
   update_journal_phase "$journal" verified
+  if [ -n "$target_state" ] \
+    && [ "$(jq -r 'if has("mutation_sent") then .mutation_sent else true end' "$journal")" = false ]; then
+    fm_linear_atomic_file "${journal%.json}.board-observed" 600 </dev/null \
+      || die "cannot publish verified no-op board observation"
+  fi
   completed=${journal%.json}.done
   mv -f -- "$journal" "$completed" || die "cannot complete write journal"
   printf 'linear: write verified for %s\n' "$(jq -r '.issue' "$completed")"
