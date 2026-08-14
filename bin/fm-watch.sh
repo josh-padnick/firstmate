@@ -386,8 +386,8 @@ busy_turn_over_age() {  # <task>
 # captain-held transfer never re-surfaces this pane at all, because the
 # decision itself is already durable in the captain-held backlog record
 # (fm-decision-hold.sh) - a periodic "still paused, come check" wake would only
-# cost a supervision turn to confirm nothing changed (Linear BIG-45). Called on
-# any stale poll once pause_state_class permits the bounded cadence, so it must
+# cost a supervision turn to confirm nothing changed. Called on any stale poll
+# once pause_state_class permits the bounded cadence, so it must
 # be cheap: it NEVER re-reads crew state. The re-surface age is anchored on the
 # status file mtime, not a per-hash marker, so a churny idle pane (a ticking
 # clock, a token counter) cannot keep resetting the cadence the way a hash-tied

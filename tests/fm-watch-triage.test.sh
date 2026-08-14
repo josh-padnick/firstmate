@@ -878,8 +878,8 @@ test_nonterminal_stale_paused_absorbed_then_resurfaced() {
 # paused, but the confirmed-dead agent plus the declared wait must retain
 # bounded pause handling. (The sibling captain-held case - same confirmed-dead
 # handling, but never re-surfaced at all - is covered separately by
-# test_exited_captain_held_never_resurfaces, since Linear BIG-45 gave it
-# different periodic-recheck behavior.)
+# test_exited_captain_held_never_resurfaces because the durable backlog transfer
+# gives it different periodic-recheck behavior.)
 # A still-live agent at an external-decision gate is the disconfirming case: it
 # must surface once, while the unchanged hash must not append the same wake on
 # every watcher re-arm.
@@ -963,8 +963,8 @@ test_exited_declared_pause_is_bounded_but_live_gate_surfaces() {
   pass "an exited declared-pause pane uses bounded pause cadence while a live decision gate still surfaces once"
 }
 
-# Linear BIG-45: a captain-held transfer is already durable in the captain-held
-# backlog record (fm-decision-hold.sh), so re-surfacing its idle pane on the
+# A captain-held transfer is already durable in the captain-held backlog record
+# (fm-decision-hold.sh), so re-surfacing its idle pane on the
 # same PAUSE_RESURFACE_SECS cadence used for a genuine declared external wait
 # only costs a supervision turn to confirm nothing changed. Same confirmed-dead
 # setup as the declared-pause case above (and the same tight threshold that
