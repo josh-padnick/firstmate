@@ -920,7 +920,7 @@ connector_cadence_publish() {  # <path>
 # applying a cadence transition to a running watcher is the caller's job via
 # the emitted harness-aware supervision repair instruction.
 x_mode_setup() {
-  local env_file token linear_token linear_active linear_activation linear_shim
+  local env_file token linear_token linear_active linear_shim
   local shim cadence shim_body tool missing shim_home
   env_file="$FM_HOME/.env"
   shim="$STATE/x-watch.check.sh"
@@ -930,13 +930,10 @@ x_mode_setup() {
   [ -f "$env_file" ] && token=$(fmx_env_get FMX_PAIRING_TOKEN "$env_file")
   linear_token=
   [ -f "$env_file" ] && linear_token=$(fm_linear_env_get LINEAR_API_KEY "$env_file")
-  linear_activation="$CONFIG/linear-event-ledger-activation"
   linear_shim="$STATE/fm-linear-inbox.check.sh"
   linear_active=0
-  if fm_linear_activation_approved "$linear_activation"; then
-    if { [ -f "$linear_shim" ] && [ ! -L "$linear_shim" ]; } || [ -n "$linear_token" ]; then
-      linear_active=1
-    fi
+  if { [ -f "$linear_shim" ] && [ ! -L "$linear_shim" ]; } || [ -n "$linear_token" ]; then
+    linear_active=1
   fi
 
   x_mode_remove_artifacts() {
@@ -1016,33 +1013,19 @@ x_mode_setup() {
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
-# Linear mode requires the captain-reviewed activation record for every arm.
-# Once approved and armed, losing the key deliberately leaves the check armed so
+# Once armed, losing the key deliberately leaves the check armed so
 # the poller announces a broken board channel instead of turning silent.
 # A successful arm publishes and hash-registers a byte-static shim before it
 # removes the old absorb, snapshot, id-only seen, and local-clock cursor files.
 linear_mode_setup() {
-  local env_file key activation shim trust cadence shim_body shim_home tool missing artifact changed disarmed
+  local env_file key shim trust cadence shim_body shim_home tool missing artifact changed
   env_file="$FM_HOME/.env"
-  activation="$CONFIG/linear-event-ledger-activation"
   shim="$STATE/fm-linear-inbox.check.sh"
   trust="$STATE/fm-linear-inbox.check-trust"
   cadence="$CONFIG/x-mode.env"
   key=
   [ -f "$env_file" ] && key=$(fm_linear_env_get LINEAR_API_KEY "$env_file")
 
-  if ! fm_linear_activation_approved "$activation"; then
-    disarmed=0
-    if x_mode_artifact_present "$shim" || x_mode_artifact_present "$trust"; then
-      x_mode_remove_artifact "$trust" && x_mode_remove_artifact "$shim" || {
-        echo "LINEAR: captain approval is absent and the staged poll could not be disarmed"
-        return 0
-      }
-      disarmed=1
-    fi
-    [ "$disarmed" -eq 0 ] || echo "LINEAR: unapproved event-ledger poll disarmed; captain approval is required"
-    return 0
-  fi
   if [ ! -f "$shim" ] || [ -L "$shim" ]; then
     [ -n "$key" ] || return 0
   else

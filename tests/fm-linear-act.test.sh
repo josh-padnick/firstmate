@@ -24,16 +24,24 @@ make_home() {  # <name>
   printf '%s\n' "$home"
 }
 
-resolve_fixture() {  # <file> [current-status] [current-assignee]
-  jq -n --arg status "${2:-Building}" --arg assignee "${3:-josh.padnickfirstmate}" '
-    {data:{viewer:{id:"firstmate-id"},issue:{id:"issue-1",state:{id:"building",name:$status},
-      assignee:{id:"firstmate-id",displayName:$assignee},team:{
+resolve_fixture() {  # <file> [current-status] [current-assignee] [current-assignee-id]
+  jq -n --arg status "${2:-Building}" --arg assignee "${3:-josh.padnickfirstmate}" \
+    --arg assignee_id "${4:-firstmate-id}" '
+    {data:{viewer:{id:"firstmate-id"},issue:{id:"issue-1",
+      state:{id:(if $status == "Approve Deliverable" then "approve" else "building" end),name:$status},
+      assignee:{id:$assignee_id,displayName:$assignee},team:{
         states:{nodes:[{id:"approve",name:"Approve Deliverable"},{id:"building",name:"Building"},
                        {id:"needs-firstmate",name:"Needs Firstmate Decision"},{id:"needs-captain",name:"Needs Decision"}]},
         members:{nodes:[{id:"wrong-captain-id",displayName:"josh.padnick"},
                         {id:"captain-id",displayName:"josh.padnick"},
                         {id:"wrong-firstmate-id",displayName:"josh.padnickfirstmate"},
                         {id:"firstmate-id",displayName:"renamed-firstmate"}]}}}}}
+  ' > "$1"
+}
+
+mutation_read_fixture() {  # <file> <state-id> <state-name> <assignee-id> <assignee-name>
+  jq -n --arg state_id "$2" --arg state "$3" --arg assignee_id "$4" --arg assignee "$5" '
+    {data:{issue:{state:{id:$state_id,name:$state},assignee:{id:$assignee_id,displayName:$assignee}}}}
   ' > "$1"
 }
 
@@ -54,6 +62,14 @@ verify_fixture() {  # <file> <status> <assignee> [assignee-id]
   ' > "$1"
 }
 
+comment_read_fixture() {  # <file> [present]
+  if [ "${2:-true}" = true ]; then
+    jq -n '{data:{comment:{id:"__COMMENT_ID__"}}}' > "$1"
+  else
+    jq -n '{data:{comment:null}}' > "$1"
+  fi
+}
+
 run_act() {  # <home> <fixtures> <args...>
   local home=$1 fixtures=$2
   shift 2
@@ -67,9 +83,10 @@ home=$(make_home mismatch)
 fixtures="$TMP_ROOT/mismatch-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-mutation_fixture "$fixtures/02-mutate.json"
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" Building josh.padnickfirstmate
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" Building josh.padnickfirstmate
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
   --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "stale board read-back did not fail loudly"
@@ -81,9 +98,10 @@ home=$(make_home assignee-id-mismatch)
 fixtures="$TMP_ROOT/assignee-id-mismatch-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-mutation_fixture "$fixtures/02-mutate.json"
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
   --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "same-name wrong-ID assignee passed read-back"
@@ -97,7 +115,8 @@ home=$(make_home resume)
 fixtures="$TMP_ROOT/kill-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-mutation_fixture "$fixtures/02-mutate.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
 log="$home/kill.log"
 (
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
@@ -135,13 +154,65 @@ awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -e '.variables.is
   || fail "comment mutation did not use the resolved Linear issue UUID"
 pass "a killed state-carrying write resumes without half state or duplicate comments"
 
+home=$(make_home accepted-mutation)
+fixtures="$TMP_ROOT/accepted-mutation-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/comment.md"
+) >/dev/null 2>&1 || true
+journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
+[ "$(jq -r '.phase' "$journal")" = journaled ] \
+  || fail "accepted mutation kill did not preserve the pre-publication journal phase"
+fixtures="$TMP_ROOT/accepted-mutation-resume-fixtures"
+mkdir -p "$fixtures"
+mutation_read_fixture "$fixtures/01-read.json" approve 'Approve Deliverable' captain-id josh.padnick
+comment_fixture "$fixtures/02-comment.json"
+verify_fixture "$fixtures/03-verify.json" 'Approve Deliverable' josh.padnick
+resume_log="$home/accepted-mutation-resume.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume >/dev/null \
+  || fail "accepted mutation did not settle by read-back"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "accepted mutation was replayed after exact target read-back"
+pass "accepted pre-phase state mutations settle without replay"
+
+home=$(make_home mutation-conflict)
+fixtures="$TMP_ROOT/mutation-conflict-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/comment.md"
+) >/dev/null 2>&1 || true
+fixtures="$TMP_ROOT/mutation-conflict-resume-fixtures"
+mkdir -p "$fixtures"
+mutation_read_fixture "$fixtures/01-read.json" needs-captain 'Needs Decision' captain-id josh.padnick
+resume_log="$home/mutation-conflict-resume.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1 || true)
+assert_contains "$out" "state mutation conflict" "captain's newer board state was not surfaced as a replay conflict"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "recovery overwrote the captain's divergent board state"
+pass "state replay refuses to overwrite a divergent captain change"
+
 home=$(make_home stable-firstmate-id)
 fixtures="$TMP_ROOT/stable-firstmate-id-fixtures"
 mkdir -p "$fixtures"
-resolve_fixture "$fixtures/01-resolve.json" 'Approve Deliverable' josh.padnick
-mutation_fixture "$fixtures/02-mutate.json"
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" Building renamed-firstmate firstmate-id
+resolve_fixture "$fixtures/01-resolve.json" 'Approve Deliverable' josh.padnick captain-id
+mutation_read_fixture "$fixtures/02-read.json" approve 'Approve Deliverable' captain-id josh.padnick
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" Building renamed-firstmate firstmate-id
 identity_log="$home/identity.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$identity_log" FM_LINEAR_NOW_EPOCH="$NOW" \
@@ -174,12 +245,36 @@ run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/comment.md" --pare
   || fail "comment-only reply did not complete its journal"
 pass "comment-only replies do not require assignee identities"
 
+home=$(make_home readiness-marker)
+printf 'The deliverable is ready.\n' > "$home/not-ready.md"
+out=$(run_act "$home" "$TMP_ROOT/no-readiness-fixtures" handoff-to-captain BIG-1 \
+  --status 'Approve Deliverable' --comment-file "$home/not-ready.md" 2>&1 || true)
+assert_contains "$out" "must contain READY FOR YOUR REVIEW" \
+  "handoff-to-captain accepted a comment without the readiness marker"
+[ "$(find "$home/state/linear-outbox" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+  || fail "rejected readiness handoff created a journal"
+pass "captain handoffs enforce the review-readiness marker"
+
+fake_time_bin="$TMP_ROOT/fake-time-bin"
+mkdir -p "$fake_time_bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case "$*" in *2026-08-14T12:00:00Z*) printf "1786712400\\n"; exit 0 ;; esac' \
+  'exec /bin/date "$@"' > "$fake_time_bin/date"
+chmod +x "$fake_time_bin/date"
+home=$(make_home time-self-check)
+out=$(PATH="$fake_time_bin:$PATH" run_act "$home" "$TMP_ROOT/no-time-fixtures" reply BIG-1 \
+  --comment-file "$home/comment.md" --parent parent-1 2>&1 || true)
+assert_contains "$out" "UTC timestamp conversion self-check failed" \
+  "write-door startup accepted the historical plus-one-hour conversion regression"
+pass "write-door startup rejects a plus-one-hour UTC conversion regression"
+
 home=$(make_home accepted-comment)
 fixtures="$TMP_ROOT/accepted-comment-kill-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-mutation_fixture "$fixtures/02-mutate.json"
-comment_fixture "$fixtures/03-comment.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
 accepted_store="$home/accepted-comment-ids"
 accepted_log="$home/accepted-kill.log"
 (
@@ -197,7 +292,8 @@ journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 fixtures="$TMP_ROOT/accepted-comment-resume-fixtures"
 mkdir -p "$fixtures"
 comment_fixture "$fixtures/01-comment.json"
-verify_fixture "$fixtures/02-verify.json" 'Approve Deliverable' josh.padnick
+comment_read_fixture "$fixtures/02-comment-read.json"
+verify_fixture "$fixtures/03-verify.json" 'Approve Deliverable' josh.padnick
 retry_log="$home/accepted-retry.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$retry_log" FM_LINEAR_FIXTURE_COMMENT_STORE="$accepted_store" \
@@ -215,9 +311,10 @@ chmod 0600 "$home/state/.linear-comment-head-bootstrap.json"
 fixtures="$TMP_ROOT/overlap-act-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-mutation_fixture "$fixtures/02-mutate.json"
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick
 control="$home/mutation-pause"
 mkdir -p "$control"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
@@ -243,7 +340,7 @@ jq -n '
     pageInfo:{hasNextPage:false,endCursor:null},nodes:[
       {id:"captain-during-write",createdAt:"2026-08-14T11:59:01Z",updatedAt:"2026-08-14T11:59:01Z",
        body:"captain input during write",user:{id:"captain-id",displayName:"shared-name"},
-       issue:{identifier:"BIG-1"},parent:null}]}}}
+       issue:{identifier:"BIG-1",labels:{nodes:[{name:"Firstmate"}]}},parent:null}]}}}
 ' > "$poll_fixtures/01-comments.json"
 jq -n '
   {data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[{
@@ -252,7 +349,7 @@ jq -n '
     assignee:{id:"captain-id",displayName:"josh.padnick"},
     creator:{id:"firstmate-id",displayName:"shared-name"},labels:{nodes:[]},history:{
       pageInfo:{hasNextPage:false,endCursor:null},nodes:[{
-        id:"self-write-history",createdAt:"2026-08-14T11:59:00Z",
+        id:"self-write-history",createdAt:"2026-08-14T11:59:00Z",updatedAt:"2026-08-14T11:59:00Z",changes:null,
         actor:{id:"firstmate-id",displayName:"shared-name"},fromState:{name:"Building"},
         toState:{name:"Approve Deliverable"},fromAssignee:null,
         toAssignee:{id:"captain-id",displayName:"josh.padnick"},updatedDescription:null,

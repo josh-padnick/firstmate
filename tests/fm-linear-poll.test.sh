@@ -39,15 +39,16 @@ make_fixtures() {  # <dir> <comments-json> <issues-json>
 
 comment() {  # <id> <updated> <body> <author-id> <author-name> <issue>
   jq -nc --arg id "$1" --arg updated "$2" --arg body "$3" --arg author_id "$4" --arg author "$5" --arg issue "$6" '
-    {id:$id,createdAt:$updated,updatedAt:$updated,body:$body,
-     user:{id:$author_id,displayName:$author},issue:{identifier:$issue},parent:null}
+    {id:$id,createdAt:$updated,updatedAt:$updated,editedAt:null,body:$body,
+     user:{id:$author_id,displayName:$author},
+     issue:{identifier:$issue,labels:{nodes:[{name:"Firstmate"}]}},parent:null}
   '
 }
 
 history() {  # <id> <created> <actor-id> <actor-name> <from> <to> [to-assignee-id] [to-assignee-name]
   jq -nc --arg id "$1" --arg created "$2" --arg actor_id "$3" --arg actor "$4" --arg from "$5" --arg to "$6" \
     --arg to_assignee_id "${7:-}" --arg to_assignee "${8:-}" '
-    {id:$id,createdAt:$created,actor:{id:$actor_id,displayName:$actor},
+    {id:$id,createdAt:$created,updatedAt:$created,changes:null,actor:{id:$actor_id,displayName:$actor},
      fromState:{name:$from},toState:{name:$to},fromAssignee:null,
      toAssignee:(if $to_assignee_id == "" then null else {id:$to_assignee_id,displayName:$to_assignee} end),
      updatedDescription:null,addedLabels:[],removedLabels:[]}
@@ -58,10 +59,11 @@ issue() {  # <id> <updated> <creator-id> <creator-name> <history-json> [status] 
   jq -nc --arg id "$1" --arg updated "$2" --arg creator_id "$3" --arg creator "$4" --argjson history "$5" \
     --arg status "${6:-Backlog}" --arg assignee_id "${7:-}" --arg assignee "${8:-}" \
     --arg description "${9:-}" '
-    {identifier:$id,title:"fixture",description:$description,updatedAt:$updated,
+    {identifier:$id,title:"fixture",description:$description,priority:0,dueDate:null,
+     project:null,parent:null,updatedAt:$updated,
      createdAt:"2026-08-01T00:00:00Z",state:{name:$status},
      assignee:(if $assignee_id == "" then null else {id:$assignee_id,displayName:$assignee} end),
-     creator:{id:$creator_id,displayName:$creator},labels:{nodes:[]},
+     creator:{id:$creator_id,displayName:$creator},labels:{nodes:[{name:"Firstmate"}]},
      history:{pageInfo:{hasNextPage:false,endCursor:null},nodes:$history}}
   '
 }
@@ -91,7 +93,7 @@ make_fixtures "$fixtures" "$comments" "$issues"
 out1=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") || fail "initial interleaved poll failed"
 assert_contains "$out1" "2 captain input(s)" "interleaved poll did not surface exactly the captain's events"
 [ "$(pending_count "$home")" = 2 ] || fail "interleaved poll did not persist exactly two captain events"
-[ "$(wc -l < "$home/state/.linear-seen.tsv" | tr -d ' ')" = 2 ] || fail "self history was not retained in the seen ledger"
+[ "$(wc -l < "$home/state/.linear-history-heads.tsv" | tr -d ' ')" = 2 ] || fail "history content heads were not retained"
 [ "$(wc -l < "$home/state/.linear-comment-heads.tsv" | tr -d ' ')" = 2 ] || fail "latest hashes were not retained for both comments"
 out2=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") || fail "second identical poll failed"
 [ -z "$out2" ] || fail "second identical poll was not silent: $out2"
@@ -316,6 +318,177 @@ jq -s -e 'any(.[]; .kind == "issue-created" and .description == "A")
   || fail "creation-window description snapshots did not preserve both observed bodies"
 pass "issue snapshots preserve history-free creation-window description edits"
 
+home=$(make_home bootstrap-horizon-retry)
+rm -f "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/bootstrap-horizon-fail"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' \
+  > "$fixtures/01-comment-heads.json"
+printf '{}\n' > "$fixtures/02-fail-500.json"
+run_poll "$home" "$fixtures" >/dev/null 2>&1 && fail "bootstrap failure unexpectedly succeeded"
+[ "$(cat "$home/state/.linear-bootstrap-horizon")" = 2026-08-14T10:00:00Z ] \
+  || fail "initial bootstrap horizon was not durably fixed before fetching"
+fixtures="$TMP_ROOT/bootstrap-horizon-retry-fixtures"
+make_fixtures "$fixtures" '[]' '[]'
+request_log="$home/horizon-retry.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$request_log" FM_LINEAR_NOW_EPOCH=$((NOW + 10800)) \
+  FM_LINEAR_PENDING_ALARM_SECONDS=9999 "$POLL" >/dev/null \
+  || fail "bootstrap horizon retry failed"
+awk -F '\t' '$1 == "comments" || $1 == "issues" { print $2 }' "$request_log" \
+  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}"))' \
+  >/dev/null || fail "cursorless retry drifted its initial ingestion horizon"
+[ ! -e "$home/state/.linear-bootstrap-horizon" ] || fail "completed cursor establishment retained a stale horizon"
+pass "cursorless retries reuse one durable bootstrap horizon"
+
+home=$(make_home incomplete-head-bump)
+rm -f "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/incomplete-head-bump-fixtures"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"next-old-page"},nodes:[]}}}' \
+  > "$fixtures/01-comment-heads.json"
+unseeded=$(comment unseeded-old 2026-08-14T11:58:00Z unchanged captain-id shared-name BIG-13)
+unseeded=$(printf '%s' "$unseeded" | jq '.createdAt="2025-01-01T00:00:00Z"')
+make_fixtures "$fixtures/normal" "$(jq -nc --argjson c "$unseeded" '[$c]')" '[]'
+mv "$fixtures/normal/01-comments.json" "$fixtures/02-comments.json"
+mv "$fixtures/normal/02-issues.json" "$fixtures/03-issues.json"
+rmdir "$fixtures/normal"
+out=$(run_poll "$home" "$fixtures") || fail "incomplete-head unchanged bump poll failed"
+[ -z "$out" ] || fail "unseeded old reply bump woke while bootstrap was incomplete: $out"
+[ "$(pending_count "$home")" = 0 ] || fail "unseeded old reply bump created a captain event"
+pass "incomplete head bootstrap lazily silences old reply bumps"
+
+home=$(make_home incomplete-head-edit)
+rm -f "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/incomplete-head-edit-fixtures"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"next-old-page"},nodes:[]}}}' \
+  > "$fixtures/01-comment-heads.json"
+unseeded=$(comment unseeded-edit 2026-08-14T11:58:00Z changed captain-id shared-name BIG-13)
+unseeded=$(printf '%s' "$unseeded" | jq '.createdAt="2025-01-01T00:00:00Z" | .editedAt=.updatedAt')
+make_fixtures "$fixtures/normal" "$(jq -nc --argjson c "$unseeded" '[$c]')" '[]'
+mv "$fixtures/normal/01-comments.json" "$fixtures/02-comments.json"
+mv "$fixtures/normal/02-issues.json" "$fixtures/03-issues.json"
+rmdir "$fixtures/normal"
+out=$(run_poll "$home" "$fixtures") || fail "incomplete-head actual edit poll failed"
+assert_contains "$out" "1 captain input(s)" "editedAt did not distinguish an old actual edit from a reply bump"
+pass "incomplete head bootstrap still surfaces actual old-comment edits"
+
+home=$(make_home thread-routing)
+fixtures="$TMP_ROOT/thread-routing-ignored"
+bare=$(comment bare-unlabelled 2026-08-14T11:55:00Z hello captain-id shared-name BIG-14)
+bare=$(printf '%s' "$bare" | jq '.issue.labels.nodes=[]')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$bare" '[$c]')" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "unlabelled bare comment poll failed"
+[ "$(pending_count "$home")" = 0 ] || fail "unlabelled bare comment started a thread without a mention"
+fixtures="$TMP_ROOT/thread-routing-mention"
+mentioned=$(comment thread-root 2026-08-14T11:56:00Z '@josh.padnickfirstmate please look' captain-id shared-name BIG-14)
+mentioned=$(printf '%s' "$mentioned" | jq '.issue.labels.nodes=[]')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$mentioned" '[$c]')" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "unlabelled mentioned comment poll failed"
+fixtures="$TMP_ROOT/thread-routing-self"
+self_reply=$(comment self-thread-reply 2026-08-14T11:57:00Z acknowledged firstmate-id shared-name BIG-14)
+self_reply=$(printf '%s' "$self_reply" | jq '.issue.labels.nodes=[] | .parent={id:"thread-root"}')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$self_reply" '[$c]')" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "Firstmate thread participation poll failed"
+fixtures="$TMP_ROOT/thread-routing-followup"
+followup=$(comment bare-followup 2026-08-14T11:58:00Z followup captain-id shared-name BIG-14)
+followup=$(printf '%s' "$followup" | jq '.issue.labels.nodes=[] | .parent={id:"thread-root"}')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$followup" '[$c]')" '[]'
+out=$(run_poll "$home" "$fixtures") || fail "participated-thread follow-up poll failed"
+assert_contains "$out" "1 captain input(s)" "bare follow-up after Firstmate participation was silent"
+jq -s -e 'any(.[]; .comment_id == "thread-root" and .route == "mention")
+  and any(.[]; .comment_id == "bare-followup" and .route == "thread")' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "durable comment routes did not encode mention and thread continuation"
+pass "comment routing persists Firstmate thread participation"
+
+home=$(make_home label-only-ownership)
+fixtures="$TMP_ROOT/label-only-ownership-fixtures"
+assigned=$(issue BIG-15 2026-08-14T11:58:00Z captain-id shared-name '[]' Backlog firstmate-id shared-name 'firstmate please own')
+assigned=$(printf '%s' "$assigned" | jq '.createdAt="2026-08-14T11:57:59Z" | .labels.nodes=[]')
+labelled=$(issue BIG-16 2026-08-14T11:58:01Z captain-id shared-name '[]')
+labelled=$(printf '%s' "$labelled" | jq '.createdAt="2026-08-14T11:58:00Z"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson a "$assigned" --argjson b "$labelled" '[$a,$b]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "label-only ownership poll failed"
+jq -s -e 'length == 1 and .[0].kind == "issue-created" and .[0].issue == "BIG-16"' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "assignment or body mention established new-issue ownership without the label"
+pass "new issue ownership is established only by the Firstmate label"
+
+home=$(make_home amended-history)
+fixtures="$TMP_ROOT/amended-history-a"
+title_history=$(history amended-title 2026-08-14T11:58:00Z captain-id shared-name Backlog Backlog)
+title_history=$(printf '%s' "$title_history" | jq '.fromState=null | .toState=null
+  | .fromTitle="A" | .toTitle="B" | .fromPriority=1 | .toPriority=2
+  | .fromProject={id:"p1",name:"Old"} | .toProject={id:"p2",name:"New"}
+  | .fromParent={id:"i1",identifier:"BIG-1"} | .toParent={id:"i2",identifier:"BIG-2"}
+  | .fromDueDate="2026-08-20" | .toDueDate="2026-08-21"
+  | .changes={title:["A","B"],priority:[1,2]}')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$(issue BIG-17 2026-08-14T11:58:01Z captain-id shared-name "$(jq -nc --argjson h "$title_history" '[ $h ]')")" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "first amended history poll failed"
+fixtures="$TMP_ROOT/amended-history-b"
+title_history=$(printf '%s' "$title_history" | jq '.updatedAt="2026-08-14T11:59:00Z" | .toTitle="C" | .changes={title:["A","C"]}')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$(issue BIG-17 2026-08-14T11:59:01Z captain-id shared-name "$(jq -nc --argjson h "$title_history" '[ $h ]')")" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "amended history poll failed"
+assert_contains "$out" "1 captain input(s)" "content-amended history ID was suppressed"
+jq -s -e 'map(select(.history_id == "amended-title")) | length == 2
+  and any(.[]; .kind == "issue-change" and .to_title == "C" and .to_priority == 2
+    and .to_project.id == "p2" and .to_parent.identifier == "BIG-2"
+    and .to_due_date == "2026-08-21")' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "amended title history was not preserved by derived content"
+[ "$(wc -l < "$home/state/.linear-history-heads.tsv" | tr -d ' ')" = 1 ] \
+  || fail "amended history retained more than one latest content head"
+pass "history content heads surface amended issue properties"
+
+home=$(make_home deep-history-overlap)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/deep-history-overlap-fixtures"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' \
+  > "$fixtures/01-comments.json"
+histories=$(jq -nc '[range(0;10) as $n | {id:("recent-"+($n|tostring)),
+  createdAt:"2026-08-14T11:56:00Z",updatedAt:"2026-08-14T11:56:00Z",changes:null,
+  actor:{id:"captain-id",displayName:"shared-name"},fromState:null,toState:null,
+  fromAssignee:null,toAssignee:null,fromTitle:"A",toTitle:"B",updatedDescription:false,
+  addedLabels:[],removedLabels:[]}]')
+deep_issue=$(issue BIG-20 2026-08-14T11:59:00Z captain-id shared-name "$histories")
+deep_issue=$(printf '%s' "$deep_issue" | jq '.history.pageInfo={hasNextPage:true,endCursor:"deep-page"}')
+jq -n --argjson node "$deep_issue" \
+  '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
+  > "$fixtures/02-issues.json"
+old_history=$(history old-boundary 2026-08-14T11:54:00Z captain-id shared-name Backlog Building)
+jq -n --argjson node "$old_history" \
+  '{data:{issue:{description:"",history:{pageInfo:{hasNextPage:true,endCursor:"too-old"},nodes:[$node]}}}}' \
+  > "$fixtures/03-history.json"
+request_log="$home/deep-history.log"
+FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures" >/dev/null \
+  || fail "deep history overlap poll failed"
+[ "$(awk -F '\t' '$1=="history"{n++} END{print n+0}' "$request_log")" = 1 ] \
+  || fail "deep history pagination continued beyond the overlap horizon"
+jq -s -e 'all(.[]; .history_id != "old-boundary")' "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "history older than the overlap horizon became a captain event"
+pass "deep history pagination stops at the overlap horizon"
+
+home=$(make_home cursor-clamp)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/cursor-clamp-fixtures"
+older=$(comment older-visible 2026-08-14T11:59:00Z old captain-id shared-name BIG-18)
+lagged=$(issue BIG-19 2026-08-14T11:59:01Z captain-id shared-name '[]')
+lagged=$(printf '%s' "$lagged" | jq '.createdAt="2026-08-14T11:58:00Z"')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$older" '[$c]')" \
+  "$(jq -nc --argjson i "$lagged" '[$i]')"
+request_log="$home/overlap.log"
+out=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") || fail "monotonic cursor clamp poll failed"
+grep -qx 'comments_updated_at=2026-08-14T12:00:00Z' "$home/state/.linear-cursor" \
+  || fail "deleted newest comment moved the cursor backwards"
+grep -qx 'issues_updated_at=2026-08-14T12:00:00Z' "$home/state/.linear-cursor" \
+  || fail "empty issue page moved the cursor backwards"
+awk -F '\t' '$1 == "comments" || $1 == "issues" { print $2 }' "$request_log" \
+  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T11:55:00Z\"}"))' \
+  >/dev/null || fail "incremental polling did not use the five-minute overlap"
+jq -s -e 'any(.[]; .kind == "issue-created" and .issue == "BIG-19")' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "lagged issue creation inside overlap was skipped"
+pass "cursor maxima clamp monotonically while creation and queries retain overlap"
+
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)
 printf 'comments_updated_at=2026-08-14T11:00:00Z\nissues_updated_at=2026-08-14T11:00:00Z\n' > "$home/state/.linear-cursor"
@@ -339,6 +512,20 @@ home=$(make_home missing-key)
 out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$POLL" 2>&1 || true)
 assert_contains "$out" "missing LINEAR_API_KEY" "missing key failed silently"
 pass "every inability to poll becomes a loud, durable failure episode"
+
+fake_time_bin="$TMP_ROOT/fake-time-bin"
+mkdir -p "$fake_time_bin"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case "$*" in *2026-08-14T12:00:00Z*) printf "1786712400\\n"; exit 0 ;; esac' \
+  'exec /bin/date "$@"' > "$fake_time_bin/date"
+chmod +x "$fake_time_bin/date"
+home=$(make_home time-self-check)
+fixtures="$TMP_ROOT/time-self-check-fixtures"
+make_fixtures "$fixtures" '[]' '[]'
+out=$(PATH="$fake_time_bin:$PATH" run_poll "$home" "$fixtures" 2>&1 || true)
+assert_contains "$out" "UTC timestamp conversion self-check failed" \
+  "poll startup accepted the historical plus-one-hour conversion regression"
+pass "poll startup rejects a plus-one-hour UTC conversion regression"
 
 # T9 and T11: old pending inputs and turn-marker drift announce every sweep.
 home=$(make_home alarms)
@@ -421,21 +608,12 @@ out=$(run_poll "$home" "$fixtures") || fail "returned unknown-status poll failed
 assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "acknowledgment survived after the issue left its status"
 pass "unknown statuses stay loud with issue-scoped expiring acknowledgments"
 
-# Migration contract: credentials stage the replacement without cutover, and a
-# separate captain-reviewed activation record permits bootstrap to arm it.
+# Migration contract: configured credentials arm the reviewed replacement on
+# the next bootstrap without touching a real operational home in this test.
 home=$(make_home bootstrap)
 for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
   printf 'legacy\n' > "$home/state/$legacy"
 done
-out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-assert_not_contains "$out" "LINEAR:" "credentials alone emitted a cutover result"
-[ ! -e "$home/state/fm-linear-inbox.check.sh" ] || fail "credentials alone armed the replacement poll"
-[ ! -e "$home/config/x-mode.env" ] || fail "credentials alone changed the watcher cadence"
-for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
-  [ -e "$home/state/$legacy" ] || fail "credentials alone removed legacy state/$legacy"
-done
-mkdir -p "$home/config"
-printf 'approved\n' > "$home/config/linear-event-ledger-activation"
 out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
 assert_contains "$out" "LINEAR: event-ledger poll armed" "bootstrap did not arm the Linear replacement"
 [ -x "$home/state/fm-linear-inbox.check.sh" ] || fail "bootstrap did not publish an executable Linear shim"
@@ -461,22 +639,12 @@ out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
 assert_contains "$out" "missing LINEAR_API_KEY" "established shim did not announce a missing key"
 printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\nLINEAR_CAPTAIN_ID=captain-id\n' \
   > "$home/.env"
-rm -f "$home/config/linear-event-ledger-activation"
-for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
-  printf 'legacy\n' > "$home/state/$legacy"
-done
 out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
-assert_contains "$out" "unapproved event-ledger poll disarmed" \
-  "bootstrap did not report disarming a pre-existing unapproved replacement"
-[ ! -e "$home/state/fm-linear-inbox.check.sh" ] || fail "pre-existing shim bypassed captain approval"
-[ ! -e "$home/state/fm-linear-inbox.check-trust" ] || fail "pre-existing shim retained watcher trust without approval"
-[ ! -e "$home/config/x-mode.env" ] || fail "unapproved replacement retained the 30-second cadence"
-for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
-  [ -e "$home/state/$legacy" ] || fail "unapproved replacement removed legacy state/$legacy"
-done
-pass "captain approval is required for pre-existing replacement artifacts"
+[ -x "$home/state/fm-linear-inbox.check.sh" ] || fail "configured credentials did not preserve the armed replacement"
+[ -f "$home/state/fm-linear-inbox.check-trust" ] || fail "configured credentials lost watcher trust"
+[ -f "$home/config/x-mode.env" ] || fail "configured credentials lost the connector cadence"
+pass "configured credentials arm and preserve the reviewed replacement"
 
-printf 'approved\n' > "$home/config/linear-event-ledger-activation"
 FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
 fake_bin="$TMP_ROOT/slow-linear-bin"
 mkdir -p "$fake_bin"

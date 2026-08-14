@@ -18,14 +18,14 @@ This skill owns the agent-side handler contract.
 
 The wake line is an announcement, not a complete event list.
 Always enumerate every `state/linear-inbox/*.json` record that lacks its adjacent `.handled` marker.
-Sort the records by `created_at`, oldest first, before acting.
+Sort the records by `updated_at // created_at`, oldest first, with the inbox filename as the deterministic tie-breaker before acting.
 Do not limit handling to the issue identifiers named in the wake.
 
 Each comment event record contains the complete body observed before its cursor advanced, plus a bounded excerpt for quick inspection.
 Act from that durable `body` value so a later edit or deletion cannot erase what the captain said.
-Read the current Linear comment by `comment_id` when reconciling whether the observed instruction has since changed.
+Read the current Linear comment by `comment_id` only to reconcile whether a later event superseded the durable observation.
 For board, description, label, and issue-created events, read the named issue and reconcile the server state before acting.
-An edited comment has the same `comment_id` and a different `body_sha256`; treat it as a new instruction and read the current body again.
+An edited comment has the same `comment_id` and a different `body_sha256`; treat each durable observed body as a distinct instruction in event-time order.
 
 Process an event idempotently.
 Before dispatching or creating local work, reconcile whether the demanded action is already done or durably queued.
@@ -45,9 +45,14 @@ Use `reply` for a comment-only response in the captain's existing thread.
 Use `escalate` for a visible Firstmate or captain decision gate.
 Use `resume` whenever an unfinished journal is announced.
 Use `repair` whenever the poll reports a turn-marker mismatch.
+Every `handoff-to-captain` comment must contain `READY FOR YOUR REVIEW` on its own line.
 
 The script journals the intent before mutation, derives assignee from status, changes state and assignee in one API mutation, reuses one client-generated comment ID across retries, and verifies the board by read-back.
 Never edit a `state/linear-outbox` journal by hand.
+
+Before dispatching work for an issue event, read its current state.
+`Canceled` means stop: do not dispatch, resume, or write more work for that issue, and mark the pending event handled after recording that the captain canceled it.
+The event ledger deliberately does not detect deleted issues or comments, so cancellation is the supported stop signal.
 
 ## Treat loud lines as operational failures
 
@@ -63,7 +68,7 @@ Never edit a `state/linear-outbox` journal by hand.
 - `UNKNOWN STATUS` means the closed status table cannot safely infer an assignee.
   Stop and update the table deliberately rather than guessing, or run `fm-linear-poll.sh acknowledge-unknown-status <BIG-n> <status>` after explicitly accepting that exact issue-status occurrence.
   The acknowledgment remains valid only while that issue continuously stays in that status.
-- `CURSOR ANOMALY` or `POLL STATE FAILURE` means the poller refused to advance.
+- `POLL STATE FAILURE` means the poller refused to advance.
   Captain input remains replayable, but the implementation or private state needs investigation.
 
 Never suppress a Linear wake by refreshing state or running an absorb pass.

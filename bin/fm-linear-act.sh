@@ -66,6 +66,11 @@ attachment_lint() {  # <body-file>
   done < "$file"
 }
 
+review_readiness_lint() {  # <body-file>
+  grep -Fqx 'READY FOR YOUR REVIEW' "$1" \
+    || die "handoff-to-captain comment must contain READY FOR YOUR REVIEW on its own line"
+}
+
 api() {  # <operation> <payload-file> <response-file>
   fm_linear_api_call "$1" "$2" "$3" || die "${FM_LINEAR_API_ERROR:-$1 failed}"
 }
@@ -86,8 +91,8 @@ resolve_issue() {  # <BIG-n> <target-status-or-empty> <target-role-or-empty> <ou
   api resolve "$payload" "$response"
   jq -e '.data.issue.id != null' "$response" >/dev/null 2>&1 || die "issue not found: $issue"
   if [ -z "$status" ]; then
-    jq '.data.issue | {issue_id:.id, current_state:.state.name,
-        current_assignee:(.assignee.displayName // "")}' \
+    jq '.data.issue | {issue_id:.id, current_state:.state.name,current_state_id:.state.id,
+        current_assignee:(.assignee.displayName // ""),current_assignee_id:(.assignee.id // null)}' \
       "$response" > "$output" || die "cannot parse issue lookup"
     return 0
   fi
@@ -99,8 +104,9 @@ resolve_issue() {  # <BIG-n> <target-status-or-empty> <target-role-or-empty> <ou
     .data.issue as $issue
     | ($issue.team.states.nodes | map(select(.name == $status)) | .[0]) as $state
     | if $state == null then error("target status not found")
-      else {issue_id:$issue.id, current_state:$issue.state.name,
+      else {issue_id:$issue.id, current_state:$issue.state.name,current_state_id:$issue.state.id,
             current_assignee:($issue.assignee.displayName // ""),
+            current_assignee_id:($issue.assignee.id // null),
             state_id:$state.id, assignee_id:$assignee_id}
       end
   ' "$response" > "$output" 2>/dev/null || die "cannot resolve status or assignee for $issue"
@@ -122,11 +128,13 @@ create_journal() {  # <issue> <status> <body-file> <parent> <journal-output-var-
   jq -n --slurpfile resolved "$resolved" --arg id "$uuid" --arg issue "$issue" \
     --arg status "$status" --arg body_file "$body_file" --arg body "$body" \
     --arg parent "$parent" --arg comment_id "$comment_id" --arg created "$created" '
-      {version:1, id:$id, issue:$issue, created_at:$created,
+      {version:2, id:$id, issue:$issue, created_at:$created,
        issue_id:$resolved[0].issue_id,
        target_state:(if $status == "" then null else $status end),
        state_id:($resolved[0].state_id // null),
        assignee_id:($resolved[0].assignee_id // null),
+       original_state_id:($resolved[0].current_state_id // null),
+       original_assignee_id:($resolved[0].current_assignee_id // null),
        comment_file:$body_file, comment_body:$body, comment_id:$comment_id,
        parent_id:(if $parent == "" then null else $parent end), phase:"journaled"}
     ' | fm_linear_atomic_file "$journal_path" 600 || die "cannot publish write journal"
@@ -152,22 +160,56 @@ test_pause_after_mutation() {
 
 apply_state_mutation() {  # <journal>
   local journal=$1 payload="$TMP_ROOT/mutate-payload.json" response="$TMP_ROOT/mutate-response.json" query
+  local read_payload="$TMP_ROOT/mutate-read-payload.json" read_response="$TMP_ROOT/mutate-read-response.json"
+  local issue target_state target_assignee original_state original_assignee actual_state actual_assignee
   [ "$(jq -r '.target_state // empty' "$journal")" != "" ] || return 0
   [ "$(jq -r '.phase // "journaled"' "$journal")" = journaled ] || return 0
+  issue=$(jq -r '.issue_id' "$journal")
+  target_state=$(jq -r '.state_id' "$journal")
+  target_assignee=$(jq -r '.assignee_id' "$journal")
+  original_state=$(jq -r '.original_state_id // empty' "$journal")
+  original_assignee=$(jq -r '.original_assignee_id // empty' "$journal")
+  # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+  query='query($issue:String!){issue(id:$issue){state{id name} assignee{id displayName}}}'
+  jq -n --arg query "$query" --arg issue "$issue" \
+    '{query:$query,variables:{issue:$issue}}' > "$read_payload" || die "cannot build mutation read-back"
+  api mutationReadback "$read_payload" "$read_response"
+  actual_state=$(jq -r '.data.issue.state.id // empty' "$read_response")
+  actual_assignee=$(jq -r '.data.issue.assignee.id // empty' "$read_response")
+  if [ "$actual_state" = "$target_state" ] && [ "$actual_assignee" = "$target_assignee" ]; then
+    update_journal_phase "$journal" mutated
+    return 0
+  fi
+  if [ -z "$original_state" ] \
+    || [ "$actual_state" != "$original_state" ] \
+    || [ "$actual_assignee" != "$original_assignee" ]; then
+    die "state mutation conflict for $(jq -r '.issue' "$journal"): board changed after journaling"
+  fi
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
   query='mutation($issue:String!,$state:String!,$assignee:String!){issueUpdate(id:$issue,input:{stateId:$state,assigneeId:$assignee}){success issue{id state{name} assignee{displayName}}}}'
   jq -n --arg query "$query" \
-    --arg issue "$(jq -r '.issue_id' "$journal")" \
-    --arg state "$(jq -r '.state_id' "$journal")" \
-    --arg assignee "$(jq -r '.assignee_id' "$journal")" \
+    --arg issue "$issue" --arg state "$target_state" --arg assignee "$target_assignee" \
     '{query:$query,variables:{issue:$issue,state:$state,assignee:$assignee}}' > "$payload" || die "cannot build state mutation"
   api issueUpdate "$payload" "$response"
   jq -e '.data.issueUpdate.success == true' "$response" >/dev/null 2>&1 || die "atomic state and assignee mutation was not accepted"
+  if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED:-0}" = 1 ]; then
+    kill -KILL "$$"
+  fi
   update_journal_phase "$journal" mutated
   test_pause_after_mutation
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION:-0}" = 1 ]; then
     kill -KILL "$$"
   fi
+}
+
+comment_id_exists() {  # <comment-id>
+  local comment_id=$1 payload="$TMP_ROOT/comment-read-payload.json" response="$TMP_ROOT/comment-read-response.json" query
+  # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+  query='query($comment:String!){comment(id:$comment){id}}'
+  jq -n --arg query "$query" --arg comment "$comment_id" \
+    '{query:$query,variables:{comment:$comment}}' > "$payload" || return 1
+  fm_linear_api_call commentReadback "$payload" "$response" || return 1
+  [ "$(jq -r '.data.comment.id // empty' "$response")" = "$comment_id" ]
 }
 
 post_comment() {  # <journal>
@@ -188,12 +230,17 @@ post_comment() {  # <journal>
        parent:(if $parent == "" then null else $parent end)}}
     ' > "$payload" || die "cannot build comment mutation"
   if ! fm_linear_api_call commentCreate "$payload" "$response"; then
-    case "$FM_LINEAR_API_ERROR" in
-      *already*exist*|*duplicate*|*taken*) ;;
-      *) die "${FM_LINEAR_API_ERROR:-comment creation failed}" ;;
-    esac
+    if comment_id_exists "$(jq -r '.comment_id' "$journal")"; then
+      accepted=1
+    else
+      die "comment creation failed and the journaled client ID was not observed"
+    fi
   elif ! jq -e '.data.commentCreate.success == true' "$response" >/dev/null 2>&1; then
-    die "comment mutation was not accepted"
+    if comment_id_exists "$(jq -r '.comment_id' "$journal")"; then
+      accepted=1
+    else
+      die "comment mutation was not accepted and the journaled client ID was not observed"
+    fi
   else
     accepted=1
   fi
@@ -278,6 +325,7 @@ main() {
   [ -n "$command" ] || die "a subcommand is required"
   shift
   command -v jq >/dev/null 2>&1 || die "missing jq"
+  fm_linear_time_self_check || die "Linear UTC timestamp conversion self-check failed"
   fm_linear_private_dir "$STATE" || die "state directory unavailable"
   fm_linear_private_dir "$OUTBOX" || die "outbox unavailable"
   fm_linear_lock_acquire "$LOCK"
@@ -316,6 +364,7 @@ main() {
       attachment_lint "$COMMENT_FILE"
       case "$command" in
         handoff-to-captain)
+          review_readiness_lint "$COMMENT_FILE"
           [ -n "$STATUS" ] || die "handoff-to-captain requires --status"
           [ "$(fm_linear_status_role "$STATUS" 2>/dev/null || true)" = captain ] \
             || die "handoff status does not belong to the captain"

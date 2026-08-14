@@ -27,9 +27,12 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 CURSOR_FILE="$STATE/.linear-cursor"
+BOOTSTRAP_HORIZON_FILE="$STATE/.linear-bootstrap-horizon"
 SEEN_FILE="$STATE/.linear-seen.tsv"
 COMMENT_HEADS_FILE="$STATE/.linear-comment-heads.tsv"
 COMMENT_HEAD_BOOTSTRAP_FILE="$STATE/.linear-comment-head-bootstrap.json"
+HISTORY_HEADS_FILE="$STATE/.linear-history-heads.tsv"
+THREAD_PARTICIPATION_FILE="$STATE/.linear-thread-participation.tsv"
 ISSUE_HEADS_FILE="$STATE/.linear-issue-heads.json"
 HEALTH_FILE="$STATE/.linear-poll-health"
 ERROR_FILE="$STATE/.linear-poll-error"
@@ -48,6 +51,7 @@ NEW_EVENTS=0
 NEW_ISSUES=
 SEEN_KEYS=
 SELF_NAME=${FM_LINEAR_SELF_NAME:-josh.padnickfirstmate}
+SELF_MENTION=${FM_LINEAR_SELF_MENTION:-@josh.padnickfirstmate}
 SELF_ID=${FM_LINEAR_SELF_ID:-}
 CAPTAIN_NAME=${FM_LINEAR_CAPTAIN_NAME:-josh.padnick}
 FM_LINEAR_FIRSTMATE_ID=
@@ -164,6 +168,69 @@ comment_hash_seed() {  # <comment-id> <body-hash> <observed-at>
   comment_hash_set "$@"
 }
 
+comment_hash_known() {  # <comment-id>
+  awk -F '\t' -v id="$1" '$1 == id { found=1 } END { exit !found }' \
+    "$COMMENT_HEADS_FILE" 2>/dev/null
+}
+
+history_hash_current() {  # <history-id> <content-hash>
+  awk -F '\t' -v id="$1" -v hash="$2" \
+    '$1 == id && $2 == hash { found=1 } END { exit !found }' \
+    "$HISTORY_HEADS_FILE" 2>/dev/null
+}
+
+history_hash_set() {  # <history-id> <content-hash> <updated-at>
+  local id=$1 hash=$2 updated=$3 next="$TMP_ROOT/history-heads-next.tsv"
+  if [ -e "$HISTORY_HEADS_FILE" ]; then
+    [ -f "$HISTORY_HEADS_FILE" ] && [ ! -L "$HISTORY_HEADS_FILE" ] || return 1
+    awk -F '\t' -v id="$id" '$1 != id' "$HISTORY_HEADS_FILE" > "$next" || return 1
+  else
+    : > "$next"
+  fi
+  printf '%s\t%s\t%s\n' "$id" "$hash" "$updated" >> "$next" || return 1
+  fm_linear_atomic_file "$HISTORY_HEADS_FILE" 600 < "$next"
+}
+
+thread_participated() {  # <thread-id>
+  awk -F '\t' -v id="$1" '$1 == id { found=1 } END { exit !found }' \
+    "$THREAD_PARTICIPATION_FILE" 2>/dev/null
+}
+
+thread_participation_set() {  # <thread-id> <observed-at>
+  local id=$1 observed=$2 next="$TMP_ROOT/thread-participation-next.tsv"
+  [ -n "$id" ] || return 0
+  thread_participated "$id" && return 0
+  if [ -e "$THREAD_PARTICIPATION_FILE" ]; then
+    [ -f "$THREAD_PARTICIPATION_FILE" ] && [ ! -L "$THREAD_PARTICIPATION_FILE" ] || return 1
+    cp "$THREAD_PARTICIPATION_FILE" "$next" || return 1
+  else
+    : > "$next"
+  fi
+  printf '%s\t%s\n' "$id" "$observed" >> "$next" || return 1
+  fm_linear_atomic_file "$THREAD_PARTICIPATION_FILE" 600 < "$next"
+}
+
+bootstrap_horizon() {  # <comments-cursor> <issues-cursor>
+  local comments_cursor=$1 issues_cursor=$2 horizon
+  if [ -n "$comments_cursor" ] && [ -n "$issues_cursor" ]; then
+    return 0
+  fi
+  if [ -e "$BOOTSTRAP_HORIZON_FILE" ]; then
+    [ -f "$BOOTSTRAP_HORIZON_FILE" ] && [ ! -L "$BOOTSTRAP_HORIZON_FILE" ] || return 1
+    horizon=$(sed -n '1p' "$BOOTSTRAP_HORIZON_FILE")
+    [ -n "$horizon" ] && fm_linear_epoch "$horizon" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$horizon"
+    return 0
+  fi
+  horizon=$(fm_linear_iso_from_epoch "$((${FM_LINEAR_NOW_EPOCH:-$(date +%s)} - 7200))") || return 1
+  printf '%s\n' "$horizon" | fm_linear_atomic_file "$BOOTSTRAP_HORIZON_FILE" 600 || return 1
+  printf '%s\n' "$horizon"
+}
+
+timestamp_max() {  # <left> <right>
+  printf '%s\n%s\n' "$1" "$2" | sed '/^$/d' | LC_ALL=C sort | tail -n 1
+}
+
 json_array_append() {  # <array-file> <new-array-file>
   local destination=$1 addition=$2 output="$TMP_ROOT/array-merge.$$.json"
   jq -n --slurpfile old "$destination" --slurpfile new "$addition" \
@@ -176,7 +243,7 @@ api() {  # <operation> <payload-file> <response-file>
 }
 
 bootstrap_comment_heads() {  # <event-bootstrap-cutoff>
-  local cutoff=$1 after='' payload response viewer_id has_next end_cursor id body_b64 updated hash query
+  local cutoff=$1 after='' payload response viewer_id has_next end_cursor id body_b64 updated hash author_id parent thread query
   if [ -e "$COMMENT_HEAD_BOOTSTRAP_FILE" ]; then
     [ -f "$COMMENT_HEAD_BOOTSTRAP_FILE" ] && [ ! -L "$COMMENT_HEAD_BOOTSTRAP_FILE" ] || return 1
     jq -e 'type == "object" and (.complete | type == "boolean")' \
@@ -197,7 +264,7 @@ bootstrap_comment_heads() {  # <event-bootstrap-cutoff>
   payload="$TMP_ROOT/comment-head-bootstrap-payload.json"
   response="$TMP_ROOT/comment-head-bootstrap-response.json"
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($after:String,$team:String!){viewer{id} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}},updatedAt:{lt:"'"$cutoff"'"}}){pageInfo{hasNextPage endCursor} nodes{id updatedAt body}}}'
+  query='query($after:String,$team:String!){viewer{id} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}},updatedAt:{lt:"'"$cutoff"'"}}){pageInfo{hasNextPage endCursor} nodes{id updatedAt body user{id} parent{id}}}}'
   jq -n --arg query "$query" --arg after "$after" --arg team BIG \
     '{query:$query,variables:{after:(if $after == "" then null else $after end),team:$team}}' \
     > "$payload" || return 1
@@ -213,13 +280,20 @@ bootstrap_comment_heads() {  # <event-bootstrap-cutoff>
     return 1
   }
   jq -r '.data.comments.nodes[]
-    | [(.id // ""), ("b:" + ((.body // "") | @base64)), (.updatedAt // "")]
+    | [(.id // ""), ("b:" + ((.body // "") | @base64)), (.updatedAt // ""),
+       (.user.id // "__FM_LINEAR_EMPTY__"),(.parent.id // "__FM_LINEAR_EMPTY__")]
     | @tsv' "$response" > "$TMP_ROOT/comment-head-bootstrap.tsv" || return 1
-  while IFS="$(printf '\t')" read -r id body_b64 updated; do
+  while IFS="$(printf '\t')" read -r id body_b64 updated author_id parent; do
     [ -n "$id" ] && [ -n "$updated" ] || return 1
     body_b64=${body_b64#b:}
     hash=$(printf '%s' "$body_b64" | base64 --decode | fm_linear_sha256) || return 1
     comment_hash_seed "$id" "$hash" "$updated" || return 1
+    [ "$author_id" != __FM_LINEAR_EMPTY__ ] || author_id=
+    [ "$parent" != __FM_LINEAR_EMPTY__ ] || parent=
+    if [ -n "$author_id" ] && [ "$author_id" = "$SELF_ID" ]; then
+      thread=${parent:-$id}
+      thread_participation_set "$thread" "$updated" || return 1
+    fi
   done < "$TMP_ROOT/comment-head-bootstrap.tsv"
   has_next=$(jq -r '.data.comments.pageInfo.hasNextPage // false' "$response")
   end_cursor=$(jq -r '.data.comments.pageInfo.endCursor // empty' "$response")
@@ -256,10 +330,10 @@ fetch_comments() {  # <cursor> <bootstrap-cutoff>
     response="$TMP_ROOT/comments-response-$page.json"
     if [ -n "$since" ]; then
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
+      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt editedAt body user{id displayName} issue{identifier labels{nodes{name}}} parent{id}}}}'
     else
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
+      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt editedAt body user{id displayName} issue{identifier labels{nodes{name}}} parent{id}}}}'
     fi
     jq -n --arg query "$query" --arg after "$after" --arg team BIG \
       '{query:$query,variables:{after:(if $after == "" then null else $after end),team:$team}}' \
@@ -302,10 +376,10 @@ append_initial_histories() {  # <issues-response> <page-number>
   json_array_append "$TMP_ROOT/history.json" "$nodes"
 }
 
-fetch_more_history() {  # <issue-id> <after>
-  local issue=$1 after=$2 page=0 payload response nodes has_next end_cursor query
+fetch_more_history() {  # <issue-id> <after> <threshold>
+  local issue=$1 after=$2 threshold=$3 page=0 payload response nodes has_next end_cursor oldest query
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($id:String!,$after:String){issue(id:$id){description history(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id createdAt actor{id displayName} fromState{name} toState{name} fromAssignee{id displayName} toAssignee{id displayName} updatedDescription addedLabels{name} removedLabels{name}}}}}'
+  query='query($id:String!,$after:String){issue(id:$id){description history(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}'
   while :; do
     page=$((page + 1))
     [ "$page" -le "${FM_LINEAR_MAX_HISTORY_PAGES:-100}" ] || {
@@ -327,6 +401,10 @@ fetch_more_history() {  # <issue-id> <after>
       "$response" > "$nodes" || return 1
     json_array_append "$TMP_ROOT/history.json" "$nodes" || return 1
     has_next=$(jq -r '.data.issue.history.pageInfo.hasNextPage // false' "$response")
+    oldest=$(jq -r '[.data.issue.history.nodes[].updatedAt] | min // empty' "$response")
+    if [ -n "$threshold" ] && [ -n "$oldest" ] && [[ "$oldest" < "$threshold" ]]; then
+      break
+    fi
     [ "$has_next" = true ] || break
     end_cursor=$(jq -r '.data.issue.history.pageInfo.endCursor // empty' "$response")
     [ -n "$end_cursor" ] || {
@@ -363,10 +441,10 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
     response="$TMP_ROOT/issues-response-$page.json"
     if [ -n "$since" ]; then
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{identifier title description updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt actor{id displayName} fromState{name} toState{name} fromAssignee{id displayName} toAssignee{id displayName} updatedDescription addedLabels{name} removedLabels{name}}}}}}'
+      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
     else
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}}}){pageInfo{hasNextPage endCursor} nodes{identifier title description updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt actor{id displayName} fromState{name} toState{name} fromAssignee{id displayName} toAssignee{id displayName} updatedDescription addedLabels{name} removedLabels{name}}}}}}'
+      query='query($after:String){issues(first:50,after:$after,orderBy:updatedAt,filter:{team:{key:{eq:"BIG"}}}){pageInfo{hasNextPage endCursor} nodes{identifier title description priority dueDate updatedAt createdAt state{name} assignee{id displayName} creator{id displayName} project{id name} parent{id identifier} labels{nodes{name}} history(first:10){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt changes actor{id displayName} fromState{id name} toState{id name} fromAssignee{id displayName} toAssignee{id displayName} fromTitle toTitle fromPriority toPriority fromProject{id name} toProject{id name} fromParent{id identifier} toParent{id identifier} fromDueDate toDueDate updatedDescription addedLabels{id name} removedLabels{id name}}}}}}'
     fi
     jq -n --arg query "$query" --arg after "$after" \
       '{query:$query,variables:{after:(if $after == "" then null else $after end)}}' > "$payload" || return 1
@@ -379,12 +457,12 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
     jq '.data.issues.nodes' "$response" > "$nodes" || return 1
     json_array_append "$TMP_ROOT/issues.json" "$nodes" || return 1
     append_initial_histories "$response" "$page" || return 1
-    threshold=${cursor:-$bootstrap_cutoff}
+    threshold=$since
     jq -r --arg threshold "$threshold" '
       .data.issues.nodes[]
       | select(.history.pageInfo.hasNextPage == true)
       | (.history.nodes | length) as $count
-      | ([.history.nodes[].createdAt] | min // "") as $oldest
+      | ([.history.nodes[].updatedAt] | min // "") as $oldest
       | select($count == 10 and ($threshold == "" or $oldest >= $threshold))
       | [.identifier, (.history.pageInfo.endCursor // ""), $oldest, ($count|tostring)]
       | @tsv
@@ -404,7 +482,7 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
       FM_LINEAR_API_ERROR="history pagination omitted endCursor for $issue"
       return 1
     }
-    fetch_more_history "$issue" "$history_after" || return 1
+    fetch_more_history "$issue" "$history_after" "$since" || return 1
   done < "$history_list"
 }
 
@@ -450,48 +528,88 @@ mark_outbox_board_observed() {  # <issue> <to-state> <to-assignee-id>
 }
 
 derive_comments() {  # <observed-at> <bootstrap-cutoff>
-  local observed=$1 bootstrap_cutoff=$2 id body_b64 body_file author_id author issue parent created updated hash key record
+  local observed=$1 bootstrap_cutoff=$2 id body_b64 body_file author_id author issue parent created updated edited hash key record
+  local labels_b64 labels labeled body_lower mention_lower should_wake route thread bootstrap_complete head_cutoff
+  bootstrap_complete=$(jq -r '.complete // false' "$COMMENT_HEAD_BOOTSTRAP_FILE" 2>/dev/null || printf false)
+  head_cutoff=$(jq -r '.before // empty' "$COMMENT_HEAD_BOOTSTRAP_FILE" 2>/dev/null || true)
+  [ -n "$head_cutoff" ] || head_cutoff=$bootstrap_cutoff
+  mention_lower=$(printf '%s' "$SELF_MENTION" | tr '[:upper:]' '[:lower:]')
   jq -r 'sort_by(.updatedAt, .id)[]
     | [(.id // "__FM_LINEAR_EMPTY__"), ("b:" + ((.body // "") | @base64)),
        (.user.id // "__FM_LINEAR_EMPTY__"), (.user.displayName // "unknown"),
        (.issue.identifier // "unknown"), (.parent.id // "__FM_LINEAR_EMPTY__"),
-       (.createdAt // "__FM_LINEAR_EMPTY__"), (.updatedAt // "__FM_LINEAR_EMPTY__")]
+       (.createdAt // "__FM_LINEAR_EMPTY__"), (.updatedAt // "__FM_LINEAR_EMPTY__"),
+       (.editedAt // "__FM_LINEAR_EMPTY__"),
+       ((.issue.labels.nodes // [] | map(.name) | tojson) | @base64)]
     | @tsv
   ' "$TMP_ROOT/comments.json" > "$TMP_ROOT/comment-rows.tsv" || return 1
-  while IFS="$(printf '\t')" read -r id body_b64 author_id author issue parent created updated; do
+  while IFS="$(printf '\t')" read -r id body_b64 author_id author issue parent created updated edited labels_b64; do
     [ "$id" != __FM_LINEAR_EMPTY__ ] || id=
     body_b64=${body_b64#b:}
     [ "$author_id" != __FM_LINEAR_EMPTY__ ] || author_id=
     [ "$parent" != __FM_LINEAR_EMPTY__ ] || parent=
     [ "$created" != __FM_LINEAR_EMPTY__ ] || created=
     [ "$updated" != __FM_LINEAR_EMPTY__ ] || updated=
+    [ "$edited" != __FM_LINEAR_EMPTY__ ] || edited=
     [ -n "$id" ] && [ -n "$updated" ] || return 1
+    labels=$(printf '%s' "$labels_b64" | base64 --decode) || return 1
+    labeled=$(printf '%s' "$labels" | jq -r 'any(. == "Firstmate")') || return 1
+    thread=${parent:-$id}
     hash=$(printf '%s' "$body_b64" | base64 --decode | fm_linear_sha256) || return 1
     if comment_hash_current "$id" "$hash"; then
-      [ -z "$author_id" ] || [ "$author_id" != "$SELF_ID" ] || mark_outbox_comment_observed "$id"
+      if [ -n "$author_id" ] && [ "$author_id" = "$SELF_ID" ]; then
+        thread_participation_set "$thread" "$observed" || return 1
+        mark_outbox_comment_observed "$id"
+      fi
       continue
     fi
     key="comment:$id:$updated:$hash"
+    if ! comment_hash_known "$id" && [ "$bootstrap_complete" != true ] \
+      && [ -n "$head_cutoff" ] && [ -n "$created" ] && [[ "$created" < "$head_cutoff" ]] \
+      && { [ -z "$edited" ] || [[ "$edited" < "$head_cutoff" ]]; }; then
+      comment_hash_set "$id" "$hash" "$observed" || return 1
+      continue
+    fi
     if [ -n "$bootstrap_cutoff" ] && [[ "$updated" < "$bootstrap_cutoff" ]]; then
       comment_hash_set "$id" "$hash" "$observed" || return 1
       continue
     fi
     if [ -n "$author_id" ] && [ "$author_id" = "$SELF_ID" ]; then
       comment_hash_set "$id" "$hash" "$observed" || return 1
+      thread_participation_set "$thread" "$observed" || return 1
       mark_outbox_comment_observed "$id"
       continue
     fi
-    record="$TMP_ROOT/inbox-comment-$id.json"
     body_file="$TMP_ROOT/comment-body-$id"
     printf '%s' "$body_b64" | base64 --decode > "$body_file" || return 1
+    body_lower=$(tr '[:upper:]' '[:lower:]' < "$body_file")
+    should_wake=0
+    route=ignored
+    if [ "$labeled" = true ]; then
+      should_wake=1
+      route=label
+    elif [ -n "$parent" ] && thread_participated "$thread"; then
+      should_wake=1
+      route=thread
+    elif case "$body_lower" in *"$mention_lower"*) true ;; *) false ;; esac; then
+      should_wake=1
+      route=mention
+    fi
+    if [ "$should_wake" -eq 0 ]; then
+      comment_hash_set "$id" "$hash" "$observed" || return 1
+      continue
+    fi
+    record="$TMP_ROOT/inbox-comment-$id.json"
     jq -n --arg issue "$issue" --arg id "$id" \
       --arg parent "$parent" --arg author "$author" --arg created "$created" \
       --arg author_id "$author_id" \
       --arg updated "$updated" --arg hash "$hash" --rawfile body "$body_file" \
-      --arg observed "$observed" --arg cutoff "$bootstrap_cutoff" '
+      --arg observed "$observed" --arg cutoff "$bootstrap_cutoff" \
+      --arg thread "$thread" --arg route "$route" '
         {kind:"comment", issue:$issue, comment_id:$id,
          parent_id:(if $parent == "" then null else $parent end), author:$author,
          author_id:(if $author_id == "" then null else $author_id end),
+         thread_id:$thread, route:$route,
          created_at:$created, updated_at:$updated, body_sha256:$hash, body:$body,
          excerpt:($body[0:300]), observed_at:$observed}
         + (if $cutoff != "" and $updated >= $cutoff then {bootstrap:true} else {} end)
@@ -503,84 +621,94 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
   done < "$TMP_ROOT/comment-rows.tsv"
 }
 
-derive_history() {  # <observed-at> <bootstrap-cutoff>
-  local observed=$1 bootstrap_cutoff=$2 id actor_id actor issue created key kind record has_board has_description has_labels
-  local to_state to_assignee_id to_assignee from_state from_assignee added_b64 removed_b64
-  jq -r 'sort_by(.createdAt, .id)[]
-    | [(.id // "__FM_LINEAR_EMPTY__"), (.actor.id // "__FM_LINEAR_EMPTY__"),
-       (.actor.displayName // "unknown"), (.issue // "unknown"),
-       (.createdAt // "__FM_LINEAR_EMPTY__"),
-       ((.fromState != null or .toState != null or .fromAssignee != null or .toAssignee != null) | tostring),
-       ((.updatedDescription != null) | tostring),
-       ((((.addedLabels // []) | length) + ((.removedLabels // []) | length) > 0) | tostring),
-       (.toState.name // "__FM_LINEAR_EMPTY__"),
-       (.toAssignee.id // "__FM_LINEAR_EMPTY__"),
-       (.toAssignee.displayName // "__FM_LINEAR_EMPTY__"),
-       (.fromState.name // "__FM_LINEAR_EMPTY__"),
-       (.fromAssignee.displayName // "__FM_LINEAR_EMPTY__"),
-       ((.addedLabels // [] | map(.name) | tojson) | @base64),
-       ((.removedLabels // [] | map(.name) | tojson) | @base64)]
-    | @tsv
-  ' "$TMP_ROOT/history.json" > "$TMP_ROOT/history-rows.tsv" || return 1
-  while IFS="$(printf '\t')" read -r id actor_id actor issue created has_board has_description has_labels \
-    to_state to_assignee_id to_assignee from_state from_assignee added_b64 removed_b64; do
-    [ "$id" != __FM_LINEAR_EMPTY__ ] || id=
-    [ "$actor_id" != __FM_LINEAR_EMPTY__ ] || actor_id=
-    [ "$created" != __FM_LINEAR_EMPTY__ ] || created=
-    [ "$to_state" != __FM_LINEAR_EMPTY__ ] || to_state=
-    [ "$to_assignee_id" != __FM_LINEAR_EMPTY__ ] || to_assignee_id=
-    [ "$to_assignee" != __FM_LINEAR_EMPTY__ ] || to_assignee=
-    [ "$from_state" != __FM_LINEAR_EMPTY__ ] || from_state=
-    [ "$from_assignee" != __FM_LINEAR_EMPTY__ ] || from_assignee=
-    [ -n "$id" ] && [ -n "$created" ] || return 1
-    key="history:$id"
-    if seen_has "$key"; then
+derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
+  local observed=$1 event_cutoff=$2 bootstrap_cutoff=$3 row content id actor_id issue created updated hash key kind record
+  local has_board has_description has_labels has_other to_state to_assignee_id
+  jq -c 'sort_by((.updatedAt // .createdAt), .id)[]' "$TMP_ROOT/history.json" \
+    > "$TMP_ROOT/history-rows.jsonl" || return 1
+  while IFS= read -r row; do
+    id=$(printf '%s' "$row" | jq -r '.id // empty')
+    actor_id=$(printf '%s' "$row" | jq -r '.actor.id // empty')
+    issue=$(printf '%s' "$row" | jq -r '.issue // "unknown"')
+    created=$(printf '%s' "$row" | jq -r '.createdAt // empty')
+    updated=$(printf '%s' "$row" | jq -r '.updatedAt // .createdAt // empty')
+    [ -n "$id" ] && [ -n "$created" ] && [ -n "$updated" ] || return 1
+    content=$(printf '%s' "$row" | jq -cS '{actor_id:(.actor.id // null),changes:(.changes // null),
+      from_state:(.fromState // null),to_state:(.toState // null),
+      from_assignee:(.fromAssignee // null),to_assignee:(.toAssignee // null),
+      from_title:(.fromTitle // null),to_title:(.toTitle // null),
+      from_priority:(.fromPriority // null),to_priority:(.toPriority // null),
+      from_project:(.fromProject // null),to_project:(.toProject // null),
+      from_parent:(.fromParent // null),to_parent:(.toParent // null),
+      from_due_date:(.fromDueDate // null),to_due_date:(.toDueDate // null),
+      description_updated:(.updatedDescription == true),
+      description:(if .updatedDescription == true then (.observedDescription // "") else null end),
+      added_labels:((.addedLabels // []) | map({id:(.id // null),name})),
+      removed_labels:((.removedLabels // []) | map({id:(.id // null),name}))}') || return 1
+    hash=$(printf '%s' "$content" | fm_linear_sha256) || return 1
+    has_board=$(printf '%s' "$row" | jq -r '.fromState != null or .toState != null or .fromAssignee != null or .toAssignee != null')
+    has_description=$(printf '%s' "$row" | jq -r '.updatedDescription == true')
+    has_labels=$(printf '%s' "$row" | jq -r '((.addedLabels // []) | length) + ((.removedLabels // []) | length) > 0')
+    has_other=$(printf '%s' "$row" | jq -r '.fromTitle != null or .toTitle != null
+      or .fromPriority != null or .toPriority != null or .fromProject != null or .toProject != null
+      or .fromParent != null or .toParent != null or .fromDueDate != null or .toDueDate != null')
+    to_state=$(printf '%s' "$row" | jq -r '.toState.name // empty')
+    to_assignee_id=$(printf '%s' "$row" | jq -r '.toAssignee.id // empty')
+    if history_hash_current "$id" "$hash"; then
       if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ] && [ "$has_board" = true ]; then
         mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id"
       fi
       continue
     fi
-    if [ -n "$bootstrap_cutoff" ] && [[ "$created" < "$bootstrap_cutoff" ]]; then
-      seen_append "$key" "$observed" || return 1
+    if [ -n "$event_cutoff" ] && [[ "$updated" < "$event_cutoff" ]]; then
+      history_hash_set "$id" "$hash" "$updated" || return 1
       continue
     fi
     if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ]; then
-      seen_append "$key" "$observed" || return 1
+      history_hash_set "$id" "$hash" "$updated" || return 1
       [ "$has_board" != true ] || mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id"
       continue
     fi
     if [ "$has_board" = true ]; then
       kind=board
-    elif [ "$has_labels" = true ]; then
+    elif [ "$has_description" = true ] && [ "$has_labels" != true ] && [ "$has_other" != true ]; then
+      kind=description
+    elif [ "$has_labels" = true ] && [ "$has_other" != true ]; then
       kind=label
+    elif [ "$has_other" = true ]; then
+      kind=issue-change
     else
-      seen_append "$key" "$observed" || return 1
+      history_hash_set "$id" "$hash" "$updated" || return 1
       continue
     fi
+    key="history:$id:$hash"
     record="$TMP_ROOT/inbox-history-$id.json"
-    jq -n --arg kind "$kind" --arg actor "$actor" --arg actor_id "$actor_id" --arg observed "$observed" \
-      --arg cutoff "$bootstrap_cutoff" --arg issue "$issue" --arg id "$id" \
-      --arg created "$created" --arg from_state "$from_state" --arg to_state "$to_state" \
-      --arg from_assignee "$from_assignee" --arg to_assignee "$to_assignee" \
-      --arg description_updated "$has_description" \
-      --arg added "$added_b64" --arg removed "$removed_b64" '
-        {kind:$kind, issue:$issue, history_id:$id, author:$actor,
-         author_id:(if $actor_id == "" then null else $actor_id end),
-         created_at:$created, updated_at:$created, observed_at:$observed,
-         from_state:(if $from_state == "" then null else $from_state end),
-         to_state:(if $to_state == "" then null else $to_state end),
-         from_assignee:(if $from_assignee == "" then null else $from_assignee end),
-         to_assignee:(if $to_assignee == "" then null else $to_assignee end),
-         description_updated:($description_updated == "true"),
-         added_labels:($added | @base64d | fromjson),
-         removed_labels:($removed | @base64d | fromjson)}
-        + (if $cutoff != "" and $created >= $cutoff then {bootstrap:true} else {} end)
-      ' > "$record" || return 1
+    printf '%s' "$row" | jq --arg kind "$kind" --arg observed "$observed" \
+      --arg cutoff "$bootstrap_cutoff" --arg hash "$hash" '
+      {kind:$kind, issue:.issue, history_id:.id, history_sha256:$hash,
+       author:(.actor.displayName // "unknown"), author_id:(.actor.id // null),
+       created_at:.createdAt, updated_at:(.updatedAt // .createdAt), observed_at:$observed,
+       changes:(.changes // null),
+       from_state:(.fromState.name // null), from_state_id:(.fromState.id // null),
+       to_state:(.toState.name // null), to_state_id:(.toState.id // null),
+       from_assignee:(.fromAssignee.displayName // null), from_assignee_id:(.fromAssignee.id // null),
+       to_assignee:(.toAssignee.displayName // null), to_assignee_id:(.toAssignee.id // null),
+       from_title:(.fromTitle // null), to_title:(.toTitle // null),
+       from_priority:(.fromPriority // null), to_priority:(.toPriority // null),
+       from_project:(.fromProject // null), to_project:(.toProject // null),
+       from_parent:(.fromParent // null), to_parent:(.toParent // null),
+       from_due_date:(.fromDueDate // null), to_due_date:(.toDueDate // null),
+       description_updated:(.updatedDescription == true),
+       description:(if .updatedDescription == true then (.observedDescription // "") else null end),
+       added_labels:((.addedLabels // []) | map({id:(.id // null),name})),
+       removed_labels:((.removedLabels // []) | map({id:(.id // null),name}))}
+      + (if $cutoff != "" and (.updatedAt // .createdAt) >= $cutoff then {bootstrap:true} else {} end)
+    ' > "$record" || return 1
     publish_inbox "$key" "$record" || return 1
-    seen_append "$key" "$observed" || return 1
+    history_hash_set "$id" "$hash" "$updated" || return 1
     NEW_EVENTS=$((NEW_EVENTS + 1))
     note_issue "$issue"
-  done < "$TMP_ROOT/history-rows.tsv"
+  done < "$TMP_ROOT/history-rows.jsonl"
 }
 
 prepare_issue_heads() {
@@ -595,58 +723,65 @@ prepare_issue_heads() {
 }
 
 derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
-  local observed=$1 creation_cutoff=$2 row issue updated created state description_b64 hash prior_hash prior_updated
-  local actor_id actor history_id key record next
+  local observed=$1 row issue updated state description description_hash hash prior_hash prior_updated
+  local history_id key record next snapshot prior_snapshot changes kind
   jq -c 'sort_by(.updatedAt, .identifier)[]' "$TMP_ROOT/issues.json" \
     > "$TMP_ROOT/issue-snapshot-rows.jsonl" || return 1
   while IFS= read -r row; do
     issue=$(printf '%s' "$row" | jq -r '.identifier // empty')
     updated=$(printf '%s' "$row" | jq -r '.updatedAt // empty')
-    created=$(printf '%s' "$row" | jq -r '.createdAt // empty')
     state=$(printf '%s' "$row" | jq -r '.state.name // "unknown"')
-    description_b64=$(printf '%s' "$row" | jq -r '"b:" + ((.description // "") | @base64)')
-    description_b64=${description_b64#b:}
+    description=$(printf '%s' "$row" | jq -r '.description // ""')
     [ -n "$issue" ] && [ -n "$updated" ] || continue
-    hash=$(printf '%s' "$description_b64" | base64 --decode | fm_linear_sha256) || return 1
-    prior_hash=$(jq -r --arg issue "$issue" '.[$issue].description_sha256 // empty' \
+    snapshot=$(printf '%s' "$row" | jq -cS '{title:(.title // ""),description:(.description // ""),
+      priority:(.priority // null),project:(.project // null),parent:(.parent // null),due_date:(.dueDate // null)}') \
+      || return 1
+    hash=$(printf '%s' "$snapshot" | fm_linear_sha256) || return 1
+    description_hash=$(printf '%s' "$description" | fm_linear_sha256) || return 1
+    prior_hash=$(jq -r --arg issue "$issue" '.[$issue].snapshot_sha256 // empty' \
       "$TMP_ROOT/issue-heads-before.json") || return 1
     prior_updated=$(jq -r --arg issue "$issue" '.[$issue].updated_at // empty' \
       "$TMP_ROOT/issue-heads-before.json") || return 1
-    if [ "$hash" != "$prior_hash" ] && { [ -n "$prior_hash" ] \
-      || { [ -n "$description_b64" ] && [ -n "$creation_cutoff" ] \
-        && [[ "$created" < "$creation_cutoff" ]]; }; }; then
+    prior_snapshot=$(jq -c --arg issue "$issue" '.[$issue].snapshot // null' \
+      "$TMP_ROOT/issue-heads-before.json") || return 1
+    if [ -n "$prior_hash" ] && [ "$hash" != "$prior_hash" ]; then
       history_id=$(jq -r --arg issue "$issue" --arg prior "$prior_updated" '
-        [.[] | select(.issue == $issue and .updatedDescription != null
-          and ($prior == "" or .createdAt > $prior))]
-        | sort_by(.createdAt, .id) | last | .id // empty
+        [.[] | select(.issue == $issue and ($prior == "" or (.updatedAt // .createdAt) > $prior)
+          and (.updatedDescription == true or .fromTitle != null or .toTitle != null
+            or .fromPriority != null or .toPriority != null or .fromProject != null or .toProject != null
+            or .fromParent != null or .toParent != null or .fromDueDate != null or .toDueDate != null))]
+        | sort_by((.updatedAt // .createdAt), .id) | last | .id // empty
       ' "$TMP_ROOT/history.json") || return 1
-      actor_id=
-      actor=unknown
-      if [ -n "$history_id" ]; then
-        actor_id=$(jq -r --arg id "$history_id" '.[] | select(.id == $id) | .actor.id // empty' \
-          "$TMP_ROOT/history.json" | tail -n 1) || return 1
-        actor=$(jq -r --arg id "$history_id" '.[] | select(.id == $id) | .actor.displayName // "unknown"' \
-          "$TMP_ROOT/history.json" | tail -n 1) || return 1
-      fi
-      if [ -z "$actor_id" ] || [ "$actor_id" != "$SELF_ID" ]; then
-        key="description-snapshot:$issue:$updated:$hash"
-        record="$TMP_ROOT/inbox-description-$issue.json"
-        printf '%s' "$description_b64" | base64 --decode \
-          | jq -Rs --arg issue "$issue" --arg updated "$updated" --arg observed "$observed" \
-            --arg actor "$actor" --arg actor_id "$actor_id" --arg hash "$hash" '
-              {kind:"description", source:"issue-snapshot", issue:$issue,
-               author:$actor, author_id:(if $actor_id == "" then null else $actor_id end),
-               created_at:$updated, updated_at:$updated, observed_at:$observed,
-               description_sha256:$hash, description:.}
-            ' > "$record" || return 1
+      if [ -z "$history_id" ]; then
+        changes=$(jq -n --argjson before "$prior_snapshot" --argjson after "$snapshot" '
+          reduce ($after | keys[]) as $key ({};
+            if $before[$key] == $after[$key] then . else .[$key]=$after[$key] end)') || return 1
+        if [ "$(printf '%s' "$changes" | jq -r 'keys == ["description"]')" = true ]; then
+          kind=description
+          key="description-snapshot:$issue:$updated:$hash"
+        else
+          kind=issue-change
+          key="issue-snapshot:$issue:$updated:$hash"
+        fi
+        record="$TMP_ROOT/inbox-issue-snapshot-$issue.json"
+        jq -n --arg kind "$kind" --arg issue "$issue" --arg updated "$updated" \
+          --arg observed "$observed" --arg hash "$hash" --arg description "$description" \
+          --argjson changes "$changes" '
+          {kind:$kind,source:"issue-snapshot",issue:$issue,author:"unknown",author_id:null,
+           created_at:$updated,updated_at:$updated,observed_at:$observed,
+           snapshot_sha256:$hash,changes:$changes}
+          + (if $kind == "description" then {description:$description} else {} end)
+        ' > "$record" || return 1
         publish_inbox "$key" "$record" || return 1
         NEW_EVENTS=$((NEW_EVENTS + 1))
         note_issue "$issue"
       fi
     fi
     next="$TMP_ROOT/issue-head-updated.json"
-    jq --arg issue "$issue" --arg updated "$updated" --arg state "$state" --arg hash "$hash" '
-      .[$issue]={updated_at:$updated,state:$state,description_sha256:$hash}
+    jq --arg issue "$issue" --arg updated "$updated" --arg state "$state" --arg hash "$hash" \
+      --arg description_hash "$description_hash" --argjson snapshot "$snapshot" '
+      .[$issue]={updated_at:$updated,state:$state,snapshot:$snapshot,snapshot_sha256:$hash,
+        description_sha256:$description_hash}
     ' "$TMP_ROOT/issue-heads-next.json" > "$next" || return 1
     mv -f -- "$next" "$TMP_ROOT/issue-heads-next.json" || return 1
   done < "$TMP_ROOT/issue-snapshot-rows.jsonl"
@@ -654,7 +789,7 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
 }
 
 derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
-  local observed=$1 creation_cutoff=$2 bootstrap_cutoff=$3 row issue creator_id created key labels assignee_id text record should_wake
+  local observed=$1 creation_cutoff=$2 bootstrap_cutoff=$3 row issue creator_id created key labels record should_wake
   jq -c 'sort_by(.createdAt, .identifier)[]' "$TMP_ROOT/issues.json" > "$TMP_ROOT/issue-rows.jsonl" || return 1
   while IFS= read -r row; do
     issue=$(printf '%s' "$row" | jq -r '.identifier // empty')
@@ -665,12 +800,8 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
     key="issue-created:$issue"
     seen_has "$key" && continue
     labels=$(printf '%s' "$row" | jq -r '[.labels.nodes[].name] | join(",")')
-    assignee_id=$(printf '%s' "$row" | jq -r '.assignee.id // empty')
-    text=$(printf '%s' "$row" | jq -r '[(.title // ""),(.description // "")] | join(" ") | ascii_downcase')
     should_wake=0
     case ",$labels," in *,Firstmate,*) should_wake=1 ;; esac
-    [ -z "$assignee_id" ] || [ "$assignee_id" != "$SELF_ID" ] || should_wake=1
-    case "$text" in *firstmate*) should_wake=1 ;; esac
     if { [ -n "$creator_id" ] && [ "$creator_id" = "$SELF_ID" ]; } || [ "$should_wake" -eq 0 ]; then
       seen_append "$key" "$observed" || return 1
       continue
@@ -680,7 +811,10 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
       {kind:"issue-created", issue:.identifier, author:(.creator.displayName // "unknown"),
        author_id:(.creator.id // null),
        created_at:.createdAt, updated_at:.updatedAt, observed_at:$observed,
-       title:(.title // ""), description:(.description // ""), labels:[.labels.nodes[].name]}
+       title:(.title // ""), description:(.description // ""),
+       state:(.state.name // null), assignee:(.assignee // null),
+       priority:(.priority // null), project:(.project // null), parent:(.parent // null),
+       due_date:(.dueDate // null), labels:[.labels.nodes[].name]}
       + (if $cutoff != "" and .createdAt >= $cutoff then {bootstrap:true} else {} end)
     ' > "$record" || return 1
     publish_inbox "$key" "$record" || return 1
@@ -691,7 +825,7 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
 }
 
 audit_invariants() {
-  local row issue status updated assignee assignee_id role expected expected_id current next kept previous previous_status occurrence entry_id
+  local row issue status updated assignee assignee_id role expected expected_id current next kept previous previous_status occurrence entry_id entry_hash
   local previous_head_status previous_head_updated mismatch_current mismatch_next
   current="$TMP_ROOT/unknown-status-current.tsv"
   next="$TMP_ROOT/unknown-status-next.tsv"
@@ -755,7 +889,8 @@ audit_invariants() {
         | sort_by(.createdAt, .id) | last | .id // empty
       ' "$TMP_ROOT/history.json") || return 1
       if [ -n "$entry_id" ]; then
-        occurrence="history:$entry_id"
+        entry_hash=$(awk -F '\t' -v id="$entry_id" '$1 == id { print $2; exit }' "$HISTORY_HEADS_FILE" 2>/dev/null)
+        occurrence="history:$entry_id:${entry_hash:-unknown}"
       elif [ "$previous_status" = "$status" ] \
         && [ "$previous_head_status" = "$status" ] \
         && [ "$previous_head_updated" = "$updated" ]; then
@@ -787,15 +922,15 @@ audit_invariants() {
 }
 
 announce_stale_pending() {
-  local now oldest_epoch=0 oldest_issue=unknown count=0 file created epoch age
+  local now oldest_epoch=0 oldest_issue=unknown count=0 file event_at epoch age
   now=${FM_LINEAR_NOW_EPOCH:-$(date +%s)}
   [ -d "$INBOX" ] || return 0
   for file in "$INBOX"/*.json; do
     [ -f "$file" ] || continue
     [ -e "${file%.json}.handled" ] && continue
     count=$((count + 1))
-    created=$(jq -r '.created_at // empty' "$file" 2>/dev/null)
-    epoch=$(fm_linear_epoch "$created" 2>/dev/null || true)
+    event_at=$(jq -r '.updated_at // .created_at // empty' "$file" 2>/dev/null)
+    epoch=$(fm_linear_epoch "$event_at" 2>/dev/null || true)
     case "$epoch" in ''|*[!0-9]*) continue ;; esac
     if [ "$oldest_epoch" -eq 0 ] || [ "$epoch" -lt "$oldest_epoch" ]; then
       oldest_epoch=$epoch
@@ -943,6 +1078,10 @@ main() {
     record_failure "missing jq"
     return 1
   fi
+  if ! fm_linear_time_self_check; then
+    record_failure "Linear UTC timestamp conversion self-check failed"
+    return 1
+  fi
   if ! fm_linear_load_key; then
     record_failure "missing LINEAR_API_KEY in $FM_HOME/.env"
     return 1
@@ -959,13 +1098,10 @@ main() {
 
   comments_cursor=$(cursor_get comments_updated_at)
   issues_cursor=$(cursor_get issues_updated_at)
-  bootstrap_cutoff=
-  if [ -z "$comments_cursor" ] || [ -z "$issues_cursor" ]; then
-    bootstrap_cutoff=$(fm_linear_iso_from_epoch "$((${FM_LINEAR_NOW_EPOCH:-$(date +%s)} - 7200))") || {
-      record_failure "cannot calculate bootstrap horizon"
-      return 1
-    }
-  fi
+  bootstrap_cutoff=$(bootstrap_horizon "$comments_cursor" "$issues_cursor") || {
+    record_failure "cannot persist bootstrap horizon"
+    return 1
+  }
 
   if ! bootstrap_comment_heads "$bootstrap_cutoff"; then
     record_failure "${FM_LINEAR_API_ERROR:-comment-head bootstrap failed}"
@@ -986,14 +1122,21 @@ main() {
   comments_max=$(jq -r '[.[].updatedAt] | max // empty' "$TMP_ROOT/comments.json")
   issues_max=$(jq -r '[.[].updatedAt] | max // empty' "$TMP_ROOT/issues.json")
   observed=$(printf '%s\n%s\n' "$comments_max" "$issues_max" | sed '/^$/d' | LC_ALL=C sort | tail -n 1)
-  creation_cutoff=${issues_cursor:-$bootstrap_cutoff}
+  if [ -n "$issues_cursor" ]; then
+    creation_cutoff=$(fm_linear_overlap_timestamp "$issues_cursor") || {
+      record_failure "cannot calculate issue creation overlap"
+      return 1
+    }
+  else
+    creation_cutoff=$bootstrap_cutoff
+  fi
 
   if ! derive_comments "$observed" "$bootstrap_cutoff"; then
     record_failure "cannot persist Linear event ledger"
     return 1
   fi
   timing_mark comments-derived
-  if ! derive_history "$observed" "$bootstrap_cutoff"; then
+  if ! derive_history "$observed" "$creation_cutoff" "$bootstrap_cutoff"; then
     record_failure "cannot persist Linear event ledger"
     return 1
   fi
@@ -1012,26 +1155,19 @@ main() {
     return 1
   fi
 
-  next_comments_cursor=${comments_max:-${comments_cursor:-$bootstrap_cutoff}}
-  next_issues_cursor=${issues_max:-${issues_cursor:-$bootstrap_cutoff}}
+  next_comments_cursor=$(timestamp_max "${comments_cursor:-$bootstrap_cutoff}" "$comments_max")
+  next_issues_cursor=$(timestamp_max "${issues_cursor:-$bootstrap_cutoff}" "$issues_max")
   if [ -n "$next_comments_cursor" ] && [ -n "$next_issues_cursor" ]; then
     cursor_tmp="$TMP_ROOT/cursor"
     {
       printf 'comments_updated_at=%s\n' "$next_comments_cursor"
       printf 'issues_updated_at=%s\n' "$next_issues_cursor"
     } > "$cursor_tmp"
-    if [ -n "$comments_cursor" ] && [ -n "$comments_max" ] && [ "$comments_max" "<" "$comments_cursor" ]; then
-      record_failure "CURSOR ANOMALY comments would move backwards"
-      return 1
-    fi
-    if [ -n "$issues_cursor" ] && [ -n "$issues_max" ] && [ "$issues_max" "<" "$issues_cursor" ]; then
-      record_failure "CURSOR ANOMALY issues would move backwards"
-      return 1
-    fi
     fm_linear_atomic_file "$CURSOR_FILE" 600 < "$cursor_tmp" || {
       record_failure "cannot publish Linear cursor"
       return 1
     }
+    rm -f -- "$BOOTSTRAP_HORIZON_FILE" 2>/dev/null || true
   fi
 
   record_success "$observed" || {

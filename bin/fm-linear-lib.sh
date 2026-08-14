@@ -51,19 +51,6 @@ fm_linear_load_identity_ids() {
   fi
 }
 
-fm_linear_activation_approved() {  # <activation-file>
-  local file=$1 value
-  [ -f "$file" ] && [ ! -L "$file" ] || return 1
-  exec 9< "$file" || return 1
-  IFS= read -r value <&9 || { exec 9<&-; return 1; }
-  if IFS= read -r _ <&9; then
-    exec 9<&-
-    return 1
-  fi
-  exec 9<&-
-  [ "$value" = approved ]
-}
-
 fm_linear_sha256() {
   if command -v shasum >/dev/null 2>&1; then
     shasum -a 256 | awk '{print $1}'
@@ -107,6 +94,16 @@ fm_linear_overlap_timestamp() {
   epoch=$(fm_linear_epoch "$1") || return 1
   [ -n "$epoch" ] || return 1
   fm_linear_iso_from_epoch "$((epoch - ${FM_LINEAR_OVERLAP_SECONDS:-300}))"
+}
+
+fm_linear_time_self_check() {
+  local epoch iso overlap
+  epoch=$(fm_linear_epoch 2026-08-14T12:00:00Z) || return 1
+  [ "$epoch" = 1786708800 ] || return 1
+  iso=$(fm_linear_iso_from_epoch 1786708800) || return 1
+  [ "$iso" = 2026-08-14T12:00:00Z ] || return 1
+  overlap=$(fm_linear_overlap_timestamp 2026-08-14T12:00:00Z) || return 1
+  [ "$overlap" = 2026-08-14T11:55:00Z ]
 }
 
 fm_linear_private_dir() {  # <path>

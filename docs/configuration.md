@@ -335,17 +335,20 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 
 ## Linear event ledger
 
-A home stages Linear credentials by placing a non-empty `LINEAR_API_KEY` in its private `.env`.
+A home activates Linear by placing a non-empty `LINEAR_API_KEY` in its private `.env`.
 Polling and state-carrying writes also require the canonical stable user IDs `LINEAR_FIRSTMATE_ID` and `LINEAR_CAPTAIN_ID` in that file, while comment-only replies require only the API key.
-Credentials alone never activate the event ledger or retire the old poller.
-After the captain reviews and approves the cutover, the exact single line `approved` in `config/linear-event-ledger-activation` records that separate decision.
 The next locked bootstrap pass writes and hash-registers `state/fm-linear-inbox.check.sh`, which dispatches the tracked `bin/fm-linear-poll.sh`, and writes the shared connector cadence file `config/x-mode.env` with a 30-second interval.
 Bootstrap never copies the key into generated state.
 
-The poller reads stable user IDs on comments and issue history, atomically publishes complete captain events under `state/linear-inbox/`, records immutable event keys in `state/.linear-seen.tsv`, each comment's latest hash in `state/.linear-comment-heads.tsv`, and issue snapshots in `state/.linear-issue-heads.json`, and only then advances the server-timestamp cursors in `state/.linear-cursor`.
-Initial activation bounds normal event ingestion to two hours and advances a resumable one-page-per-sweep historical comment-head scan, so a mature board cannot block activation while unchanged old parent bumps remain silent after the scan completes.
+The poller reads stable user IDs on comments and issue history, atomically publishes complete captain events under `state/linear-inbox/`, records immutable event keys in `state/.linear-seen.tsv`, each comment's latest hash in `state/.linear-comment-heads.tsv`, each history record's latest derived-content hash in `state/.linear-history-heads.tsv`, durable Firstmate thread participation in `state/.linear-thread-participation.tsv`, and issue snapshots in `state/.linear-issue-heads.json`, and only then advances the server-timestamp cursors in `state/.linear-cursor`.
+Initial activation durably fixes its normal event-ingestion horizon at two hours before the first fetch and advances a resumable one-page-per-sweep historical comment-head scan, so retries cannot move that horizon and a mature board cannot block activation.
+An old comment not yet reached by that scan is classified from Linear's `editedAt` signal, so a reply-only parent bump seeds its current head silently while an actual edit still wakes.
 It retains self-authored events in the ledger without waking, so Firstmate's own writes never absorb a time window that could contain captain input.
 Comment transitions include the body hash and server update timestamp, so an A-to-B-to-A edit wakes three times while reply-only `updatedAt` bumps with unchanged bodies remain silent.
+New issue ownership is label-only: only the `Firstmate` label wakes Firstmate for an issue-created event, while assignment and body text do not establish ownership.
+On an unlabelled issue, a mention is required to start a comment thread; after Firstmate has commented in that thread, every later reply wakes without another mention.
+On a `Firstmate`-labelled issue, a bare top-level comment starts a thread and wakes.
+`FM_LINEAR_SELF_MENTION` can override the exact mention token used for that routing and defaults to `@josh.padnickfirstmate`.
 Every poll failure wakes immediately.
 Unknown statuses wake on every sweep until the exact issue-status occurrence is acknowledged through `fm-linear-poll.sh acknowledge-unknown-status`, and that acknowledgment expires after the issue leaves the status.
 Turn-marker mismatches use those canonical IDs and remain loud until a fetched matching assignment proves resolution.
@@ -355,9 +358,11 @@ All Firstmate state, assignee, and comment writes use `bin/fm-linear-act.sh`.
 It journals intent under `state/linear-outbox/`, maps the target status to a role and that role to its configured stable user ID, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
 Unfinished journals are replayed with `fm-linear-act.sh resume`.
 
-On its first captain-approved successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.
+On its first successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.
 It removes them only after the replacement shim has been published and registered.
 If the key later disappears, bootstrap preserves the armed shim so the next sweep emits a loud board-channel failure instead of silently disabling observation.
+Removing the key before the first arm is the deliberate local opt-out; after an arm, key removal is a credential failure rather than an opt-out because silently stopping observation could lose captain input.
+Linear deletion events are deliberately not covered by this polling contract, and moving an issue to `Canceled` means stop work on it.
 
 ## Relay (.env)
 
