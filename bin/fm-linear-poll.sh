@@ -181,13 +181,14 @@ fetch_comments() {  # <cursor>
     response="$TMP_ROOT/comments-response-$page.json"
     if [ -n "$since" ]; then
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
+      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}},updatedAt:{gte:"'"$since"'"}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
     else
       # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-      query='query($after:String){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
+      query='query($after:String,$team:String!){viewer{id displayName} comments(first:50,after:$after,orderBy:updatedAt,filter:{issue:{team:{key:{eq:$team}}}}){pageInfo{hasNextPage endCursor} nodes{id createdAt updatedAt body user{id displayName} issue{identifier} parent{id}}}}'
     fi
-    jq -n --arg query "$query" --arg after "$after" \
-      '{query:$query,variables:{after:(if $after == "" then null else $after end)}}' > "$payload" || return 1
+    jq -n --arg query "$query" --arg after "$after" --arg team BIG \
+      '{query:$query,variables:{after:(if $after == "" then null else $after end),team:$team}}' \
+      > "$payload" || return 1
     api comments "$payload" "$response" || return 1
     jq -e '(.data.viewer.id | type == "string" and length > 0)
       and (.data.comments.nodes | type == "array")' "$response" >/dev/null 2>&1 || {
@@ -675,7 +676,7 @@ announce_outbox() {
 }
 
 prune_retained_state() {
-  local file cutoff seen_tmp heads_tmp
+  local file cutoff seen_tmp
   cutoff=
   [ -d "$INBOX" ] || return 0
   find "$INBOX" -type f -name '*.handled' -mtime +14 -print 2>/dev/null | while IFS= read -r file; do
@@ -688,11 +689,6 @@ prune_retained_state() {
       awk -F '\t' -v cutoff="$cutoff" '$2 >= cutoff' "$SEEN_FILE" > "$seen_tmp" || return 1
       fm_linear_atomic_file "$SEEN_FILE" 600 < "$seen_tmp" || return 1
     fi
-  fi
-  if [ -f "$COMMENT_HEADS_FILE" ] && [ ! -L "$COMMENT_HEADS_FILE" ] && [ -n "$cutoff" ]; then
-    heads_tmp="$TMP_ROOT/comment-heads-pruned.tsv"
-    awk -F '\t' -v cutoff="$cutoff" '$3 >= cutoff' "$COMMENT_HEADS_FILE" > "$heads_tmp" || return 1
-    fm_linear_atomic_file "$COMMENT_HEADS_FILE" 600 < "$heads_tmp" || return 1
   fi
   [ -d "$OUTBOX" ] || return 0
   find "$OUTBOX" -type f -name '*.done' -mtime +7 -print 2>/dev/null | while IFS= read -r file; do

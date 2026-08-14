@@ -17,7 +17,8 @@ NOW=$(jq -nr '"2026-08-14T12:00:00Z" | fromdateiso8601')
 make_home() {  # <name>
   local home="$TMP_ROOT/$1"
   mkdir -p "$home/state"
-  printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
+  printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\nLINEAR_CAPTAIN_ID=captain-id\n' \
+    > "$home/.env"
   printf 'READY FOR YOUR REVIEW\n' > "$home/comment.md"
   chmod 0600 "$home/.env"
   printf '%s\n' "$home"
@@ -25,12 +26,14 @@ make_home() {  # <name>
 
 resolve_fixture() {  # <file> [current-status] [current-assignee]
   jq -n --arg status "${2:-Building}" --arg assignee "${3:-josh.padnickfirstmate}" '
-    {data:{issue:{id:"issue-1",state:{id:"building",name:$status},
+    {data:{viewer:{id:"firstmate-id"},issue:{id:"issue-1",state:{id:"building",name:$status},
       assignee:{id:"firstmate-id",displayName:$assignee},team:{
         states:{nodes:[{id:"approve",name:"Approve Deliverable"},{id:"building",name:"Building"},
                        {id:"needs-firstmate",name:"Needs Firstmate Decision"},{id:"needs-captain",name:"Needs Decision"}]},
-        members:{nodes:[{id:"captain-id",displayName:"josh.padnick"},
-                        {id:"firstmate-id",displayName:"josh.padnickfirstmate"}]}}}}}
+        members:{nodes:[{id:"wrong-captain-id",displayName:"josh.padnick"},
+                        {id:"captain-id",displayName:"josh.padnick"},
+                        {id:"wrong-firstmate-id",displayName:"josh.padnickfirstmate"},
+                        {id:"firstmate-id",displayName:"renamed-firstmate"}]}}}}}
   ' > "$1"
 }
 
@@ -108,6 +111,8 @@ journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 mutate_payload=$(awk -F '\t' '$1=="issueUpdate"{print $2}' "$log")
 printf '%s' "$mutate_payload" | jq -e '.variables.state != "" and .variables.assignee != ""' >/dev/null \
   || fail "state and assignee were not present in one mutation request"
+printf '%s' "$mutate_payload" | jq -e '.variables.assignee == "captain-id"' >/dev/null \
+  || fail "captain handoff did not use the configured stable captain ID"
 printf '%s' "$mutate_payload" | jq -e '.variables.issue == "issue-1"' >/dev/null \
   || fail "state mutation did not use the resolved Linear issue UUID"
 
@@ -129,6 +134,32 @@ posted_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -r '.
 awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -e '.variables.issue == "issue-1"' >/dev/null \
   || fail "comment mutation did not use the resolved Linear issue UUID"
 pass "a killed state-carrying write resumes without half state or duplicate comments"
+
+home=$(make_home stable-firstmate-id)
+fixtures="$TMP_ROOT/stable-firstmate-id-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json" 'Approve Deliverable' josh.padnick
+mutation_fixture "$fixtures/02-mutate.json"
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" Building renamed-firstmate firstmate-id
+identity_log="$home/identity.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$identity_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" take-from-captain BIG-1 --status Building --comment-file "$home/comment.md" >/dev/null \
+  || fail "stable Firstmate identity handoff failed"
+awk -F '\t' '$1=="issueUpdate"{print $2}' "$identity_log" \
+  | jq -e '.variables.assignee == "firstmate-id"' >/dev/null \
+  || fail "Firstmate handoff resolved through a display-name collision"
+pass "state transitions resolve assignees from canonical stable IDs"
+
+home=$(make_home missing-captain-id)
+printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\n' > "$home/.env"
+out=$(run_act "$home" "$TMP_ROOT/no-identity-fixtures" handoff-to-captain BIG-1 \
+  --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
+assert_contains "$out" "missing LINEAR_CAPTAIN_ID" "missing canonical captain ID did not fail loudly"
+[ "$(find "$home/state/linear-outbox" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+  || fail "missing canonical captain ID created a write journal"
+pass "writes refuse to journal without canonical identity IDs"
 
 home=$(make_home accepted-comment)
 fixtures="$TMP_ROOT/accepted-comment-kill-fixtures"

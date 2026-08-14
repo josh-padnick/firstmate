@@ -65,6 +65,7 @@ issue() {  # <id> <updated> <creator-id> <creator-name> <history-json> [status] 
 
 run_poll() {  # <home> <fixtures>
   FM_HOME="$1" FM_STATE_OVERRIDE="$1/state" FM_LINEAR_FIXTURE_DIR="$2" \
+    FM_LINEAR_FIXTURE_LOG="${FM_LINEAR_FIXTURE_LOG:-}" \
     FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_PENDING_ALARM_SECONDS="${FM_LINEAR_PENDING_ALARM_SECONDS:-9999}" "$POLL"
 }
 
@@ -75,6 +76,7 @@ pending_count() {  # <home>
 # T1, T5, and the author-identity half of the concurrent-write regression.
 home=$(make_home idempotence)
 fixtures="$TMP_ROOT/idempotence-fixtures"
+request_log="$home/request.log"
 self_comment=$(comment self-comment 2026-08-14T11:58:00Z own firstmate-id shared-name BIG-1)
 captain_comment=$(comment captain-comment 2026-08-14T11:58:01Z captain captain-id shared-name BIG-1)
 self_history=$(history self-history 2026-08-14T11:58:02Z firstmate-id shared-name Backlog Building firstmate-id shared-name)
@@ -83,14 +85,19 @@ comments=$(jq -nc --argjson a "$self_comment" --argjson b "$captain_comment" '[$
 histories=$(jq -nc --argjson a "$self_history" --argjson b "$captain_history" '[$a,$b]')
 issues=$(jq -nc --argjson a "$(issue BIG-1 2026-08-14T11:58:04Z firstmate-id shared-name "$histories")" '[$a]')
 make_fixtures "$fixtures" "$comments" "$issues"
-out1=$(run_poll "$home" "$fixtures") || fail "initial interleaved poll failed"
+out1=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") || fail "initial interleaved poll failed"
 assert_contains "$out1" "2 captain input(s)" "interleaved poll did not surface exactly the captain's events"
 [ "$(pending_count "$home")" = 2 ] || fail "interleaved poll did not persist exactly two captain events"
 [ "$(wc -l < "$home/state/.linear-seen.tsv" | tr -d ' ')" = 2 ] || fail "self history was not retained in the seen ledger"
 [ "$(wc -l < "$home/state/.linear-comment-heads.tsv" | tr -d ' ')" = 2 ] || fail "latest hashes were not retained for both comments"
-out2=$(run_poll "$home" "$fixtures") || fail "second identical poll failed"
+out2=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") || fail "second identical poll failed"
 [ -z "$out2" ] || fail "second identical poll was not silent: $out2"
 [ "$(pending_count "$home")" = 2 ] || fail "second identical poll duplicated an inbox event"
+awk -F '\t' '$1 == "comments" { print $2 }' "$request_log" \
+  | jq -s -e 'length == 2 and all(.[];
+      .variables.team == "BIG"
+      and (.query | contains("issue:{team:{key:{eq:$team}}}")))' >/dev/null \
+  || fail "comment request protocol did not scope both cursor modes to BIG"
 pass "poller is idempotent and filters only by author identity"
 
 captured=$(find "$home/state/linear-inbox" -type f -name '*.json' -exec jq -r 'select(.comment_id == "captain-comment") | .author_id' {} +)
@@ -188,6 +195,21 @@ out=$(run_poll "$home" "$fixtures") || fail "reverted comment poll failed"
 assert_contains "$out" "1 captain input(s)" "A-to-B-to-A edit did not surface the final A"
 [ "$(pending_count "$home")" = 3 ] || fail "A-to-B-to-A did not persist three comment transitions"
 pass "comment transitions surface A-to-B-to-A and silence same-body bumps"
+
+home=$(make_home retained-head)
+fixtures="$TMP_ROOT/retained-head-old-fixtures"
+comments=$(jq -nc --argjson c "$(comment retained-head-id 2026-07-01T00:00:00Z unchanged captain-id shared-name BIG-4)" '[$c]')
+make_fixtures "$fixtures" "$comments" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "old comment-head seed poll failed"
+[ "$(wc -l < "$home/state/.linear-comment-heads.tsv" | tr -d ' ')" = 1 ] \
+  || fail "latest comment head expired with retained event state"
+fixtures="$TMP_ROOT/retained-head-bump-fixtures"
+comments=$(jq -nc --argjson c "$(comment retained-head-id 2026-08-14T11:58:00Z unchanged captain-id shared-name BIG-4)" '[$c]')
+make_fixtures "$fixtures" "$comments" '[]'
+out=$(run_poll "$home" "$fixtures") || fail "old unchanged parent bump poll failed"
+[ -z "$out" ] || fail "old unchanged parent bump resurfaced captain input: $out"
+[ "$(pending_count "$home")" = 0 ] || fail "old unchanged parent bump created a durable duplicate"
+pass "latest comment heads outlive event retention and silence old bumps"
 
 home=$(make_home complete-body)
 long_body=$(printf 'captain-%0500d' 7)

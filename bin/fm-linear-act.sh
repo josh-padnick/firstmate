@@ -32,6 +32,9 @@ FM_LINEAR_FIXTURE_INDEX=0
 FM_LINEAR_FIXTURE_NEXT=
 FM_LINEAR_API_ERROR=
 FM_LINEAR_KEY=
+FM_LINEAR_FIRSTMATE_ID=
+FM_LINEAR_CAPTAIN_ID=
+FM_LINEAR_IDENTITY_ERROR=
 TMP_ROOT=
 LOCK_HELD=0
 
@@ -69,29 +72,31 @@ api() {  # <operation> <payload-file> <response-file>
 
 resolve_issue() {  # <BIG-n> <target-status-or-empty> <target-role-or-empty> <output>
   local issue=$1 status=$2 role=$3 output=$4 payload="$TMP_ROOT/resolve-payload.json" response="$TMP_ROOT/resolve-response.json"
-  local query assignee_name
+  local query assignee_id viewer_id
+  fm_linear_load_identity_ids || die "$FM_LINEAR_IDENTITY_ERROR"
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($issue:String!){issue(id:$issue){id state{id name} assignee{id displayName} team{states{nodes{id name}} members{nodes{id displayName}}}}}'
+  query='query($issue:String!){viewer{id} issue(id:$issue){id state{id name} assignee{id displayName} team{states{nodes{id name}}}}}'
   jq -n --arg query "$query" --arg issue "$issue" \
     '{query:$query,variables:{issue:$issue}}' > "$payload" || die "cannot build issue lookup"
   api resolve "$payload" "$response"
   jq -e '.data.issue.id != null' "$response" >/dev/null 2>&1 || die "issue not found: $issue"
+  viewer_id=$(jq -r '.data.viewer.id // empty' "$response")
+  [ "$viewer_id" = "$FM_LINEAR_FIRSTMATE_ID" ] \
+    || die "LINEAR_FIRSTMATE_ID does not match the authenticated Linear viewer"
   if [ -z "$status" ]; then
     jq '.data.issue | {issue_id:.id, current_state:.state.name,
         current_assignee:(.assignee.displayName // "")}' \
       "$response" > "$output" || die "cannot parse issue lookup"
     return 0
   fi
-  if [ "$role" = captain ]; then assignee_name=$CAPTAIN_NAME; else assignee_name=$SELF_NAME; fi
-  jq --arg status "$status" --arg assignee "$assignee_name" '
+  if [ "$role" = captain ]; then assignee_id=$FM_LINEAR_CAPTAIN_ID; else assignee_id=$FM_LINEAR_FIRSTMATE_ID; fi
+  jq --arg status "$status" --arg assignee_id "$assignee_id" '
     .data.issue as $issue
     | ($issue.team.states.nodes | map(select(.name == $status)) | .[0]) as $state
-    | ($issue.team.members.nodes | map(select(.displayName == $assignee)) | .[0]) as $member
     | if $state == null then error("target status not found")
-      elif $member == null then error("target assignee not found")
       else {issue_id:$issue.id, current_state:$issue.state.name,
             current_assignee:($issue.assignee.displayName // ""),
-            state_id:$state.id, assignee_id:$member.id}
+            state_id:$state.id, assignee_id:$assignee_id}
       end
   ' "$response" > "$output" 2>/dev/null || die "cannot resolve status or assignee for $issue"
 }

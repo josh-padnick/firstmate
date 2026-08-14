@@ -336,6 +336,7 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 ## Linear event ledger
 
 A home stages Linear credentials by placing a non-empty `LINEAR_API_KEY` in its private `.env`.
+State-carrying writes also require the canonical stable user IDs `LINEAR_FIRSTMATE_ID` and `LINEAR_CAPTAIN_ID` in that file.
 Credentials alone never activate the event ledger or retire the old poller.
 After the captain reviews and approves the cutover, the exact single line `approved` in `config/linear-event-ledger-activation` records that separate decision.
 The next locked bootstrap pass writes and hash-registers `state/fm-linear-inbox.check.sh`, which dispatches the tracked `bin/fm-linear-poll.sh`, and writes the shared connector cadence file `config/x-mode.env` with a 30-second interval.
@@ -349,7 +350,7 @@ Unknown statuses wake on every sweep until the exact issue-status occurrence is 
 The `linear-operations` skill owns how a wake drains and acknowledges the durable inbox.
 
 All Firstmate state, assignee, and comment writes use `bin/fm-linear-act.sh`.
-It journals intent under `state/linear-outbox/`, derives assignee from the target status, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
+It journals intent under `state/linear-outbox/`, maps the target status to a role and that role to its configured stable user ID, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
 Unfinished journals are replayed with `fm-linear-act.sh resume`.
 
 On its first captain-approved successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.

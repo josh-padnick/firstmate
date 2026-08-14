@@ -28,6 +28,28 @@ fm_linear_load_key() {
   [ -n "$FM_LINEAR_KEY" ]
 }
 
+fm_linear_load_identity_ids() {
+  FM_LINEAR_FIRSTMATE_ID=${LINEAR_FIRSTMATE_ID:-}
+  FM_LINEAR_CAPTAIN_ID=${LINEAR_CAPTAIN_ID:-}
+  [ -n "$FM_LINEAR_FIRSTMATE_ID" ] \
+    || FM_LINEAR_FIRSTMATE_ID=$(fm_linear_env_get LINEAR_FIRSTMATE_ID "$FM_HOME/.env")
+  [ -n "$FM_LINEAR_CAPTAIN_ID" ] \
+    || FM_LINEAR_CAPTAIN_ID=$(fm_linear_env_get LINEAR_CAPTAIN_ID "$FM_HOME/.env")
+  FM_LINEAR_IDENTITY_ERROR=
+  if [ -z "$FM_LINEAR_FIRSTMATE_ID" ]; then
+    FM_LINEAR_IDENTITY_ERROR="missing LINEAR_FIRSTMATE_ID in $FM_HOME/.env"
+    return 1
+  fi
+  if [ -z "$FM_LINEAR_CAPTAIN_ID" ]; then
+    FM_LINEAR_IDENTITY_ERROR="missing LINEAR_CAPTAIN_ID in $FM_HOME/.env"
+    return 1
+  fi
+  if [ "$FM_LINEAR_FIRSTMATE_ID" = "$FM_LINEAR_CAPTAIN_ID" ]; then
+    FM_LINEAR_IDENTITY_ERROR="LINEAR_FIRSTMATE_ID and LINEAR_CAPTAIN_ID must differ"
+    return 1
+  fi
+}
+
 fm_linear_activation_approved() {  # <activation-file>
   local file=$1 value
   [ -f "$file" ] && [ ! -L "$file" ] || return 1
