@@ -205,6 +205,14 @@ update_journal_phase() {  # <journal> <phase>
   fm_linear_atomic_file "$journal" 600 < "$updated" || die "cannot publish write journal phase"
 }
 
+update_journal_mutated() {  # <journal> <board-updated-at>
+  local journal=$1 updated_at=$2 updated="$TMP_ROOT/journal-mutated.json"
+  [ -n "$updated_at" ] || die "mutation read-back omitted the board version"
+  jq --arg updated_at "$updated_at" '.phase="mutated" | .mutated_updated_at=$updated_at' \
+    "$journal" > "$updated" || die "cannot update write journal"
+  fm_linear_atomic_file "$journal" 600 < "$updated" || die "cannot publish write journal phase"
+}
+
 test_pause_after_mutation() {
   local control=${FM_LINEAR_TEST_PAUSE_AFTER_MUTATION_DIR:-} attempts=0
   [ -n "$control" ] || return 0
@@ -237,7 +245,7 @@ apply_state_mutation() {  # <journal>
   actual_assignee=$(jq -r '.data.issue.assignee.id // empty' "$read_response")
   actual_updated=$(jq -r '.data.issue.updatedAt // empty' "$read_response")
   if [ "$actual_state" = "$target_state" ] && [ "$actual_assignee" = "$target_assignee" ]; then
-    update_journal_phase "$journal" mutated
+    update_journal_mutated "$journal" "$actual_updated"
     return 0
   fi
   if [ -z "$original_state" ] || [ -z "$original_updated" ] || [ -z "$actual_updated" ] \
@@ -247,7 +255,7 @@ apply_state_mutation() {  # <journal>
     die "state mutation conflict for $(jq -r '.issue' "$journal"): board changed after journaling"
   fi
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='mutation($issue:String!,$state:String!,$assignee:String!){issueUpdate(id:$issue,input:{stateId:$state,assigneeId:$assignee}){success issue{id state{name} assignee{displayName}}}}'
+  query='mutation($issue:String!,$state:String!,$assignee:String!){issueUpdate(id:$issue,input:{stateId:$state,assigneeId:$assignee}){success issue{id updatedAt state{id name} assignee{id displayName}}}}'
   jq -n --arg query "$query" \
     --arg issue "$issue" --arg state "$target_state" --arg assignee "$target_assignee" \
     '{query:$query,variables:{issue:$issue,state:$state,assignee:$assignee}}' > "$payload" || die "cannot build state mutation"
@@ -256,7 +264,7 @@ apply_state_mutation() {  # <journal>
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED:-0}" = 1 ]; then
     kill -KILL "$$"
   fi
-  update_journal_phase "$journal" mutated
+  update_journal_mutated "$journal" "$(jq -r '.data.issueUpdate.issue.updatedAt // empty' "$response")"
   test_pause_after_mutation
   if [ "${FM_LINEAR_TEST_KILL_AFTER_MUTATION:-0}" = 1 ]; then
     kill -KILL "$$"
@@ -273,6 +281,35 @@ comment_id_exists() {  # <comment-id>
   [ "$(jq -r '.data.comment.id // empty' "$response")" = "$comment_id" ]
 }
 
+validate_pre_comment() {  # <journal>
+  local journal=$1 payload="$TMP_ROOT/pre-comment-payload.json" response="$TMP_ROOT/pre-comment-response.json" query
+  local target_state expected_state expected_assignee expected_updated actual_state actual_assignee actual_updated
+  target_state=$(jq -r '.target_state // empty' "$journal")
+  if [ -n "$target_state" ]; then
+    expected_state=$(jq -r '.state_id // empty' "$journal")
+    expected_assignee=$(jq -r '.assignee_id // empty' "$journal")
+    expected_updated=$(jq -r '.mutated_updated_at // empty' "$journal")
+  else
+    expected_state=$(jq -r '.original_state_id // empty' "$journal")
+    expected_assignee=$(jq -r '.original_assignee_id // empty' "$journal")
+    expected_updated=$(jq -r '.original_updated_at // empty' "$journal")
+  fi
+  [ -n "$expected_state" ] && [ -n "$expected_updated" ] \
+    || die "journal lacks a versioned pre-comment board expectation"
+  # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+  query='query($issue:String!){issue(id:$issue){updatedAt state{id} assignee{id}}}'
+  jq -n --arg query "$query" --arg issue "$(jq -r '.issue_id' "$journal")" \
+    '{query:$query,variables:{issue:$issue}}' > "$payload" || die "cannot build pre-comment read-back"
+  api preCommentReadback "$payload" "$response"
+  actual_state=$(jq -r '.data.issue.state.id // empty' "$response")
+  actual_assignee=$(jq -r '.data.issue.assignee.id // empty' "$response")
+  actual_updated=$(jq -r '.data.issue.updatedAt // empty' "$response")
+  [ "$actual_state" = "$expected_state" ] \
+    && [ "$actual_assignee" = "$expected_assignee" ] \
+    && [ "$actual_updated" = "$expected_updated" ] \
+    || die "pre-comment conflict for $(jq -r '.issue' "$journal"): board changed after journaling"
+}
+
 post_comment() {  # <journal>
   local journal=$1 phase payload="$TMP_ROOT/comment-payload.json" response="$TMP_ROOT/comment-response.json" query accepted=0
   phase=$(jq -r '.phase // "journaled"' "$journal")
@@ -280,6 +317,7 @@ post_comment() {  # <journal>
   if [ "$(jq -r '.target_state // empty' "$journal")" != "" ] && [ "$phase" = journaled ]; then
     return 0
   fi
+  [ "$phase" = commented ] || validate_pre_comment "$journal"
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
   query='mutation($id:String!,$issue:String!,$body:String!,$parent:String){commentCreate(input:{id:$id,issueId:$issue,body:$body,parentId:$parent}){success comment{id}}}'
   jq -n --arg query "$query" \

@@ -692,9 +692,10 @@ histories=$(jq -nc '[range(0;10) as $n | {id:("scan-initial-"+($n|tostring)),
   fromAssignee:null,toAssignee:null,fromTitle:"A",toTitle:"B",updatedDescription:false,
   addedLabels:[],removedLabels:[]}]')
 scan_issue=$(issue BIG-37 2026-08-14T12:01:00Z captain-id shared-name "$histories")
-scan_issue=$(printf '%s' "$scan_issue" | jq '.history.pageInfo={hasNextPage:true,endCursor:"scan-page-one"}')
-later_issue=$(issue BIG-38 2026-08-14T12:02:00Z captain-id shared-name '[]')
-later_issue=$(printf '%s' "$later_issue" | jq '.createdAt="2026-08-14T12:01:30Z"')
+scan_issue=$(printf '%s' "$scan_issue" | jq '.createdAt="2026-08-14T11:56:00Z"
+  | .history.pageInfo={hasNextPage:true,endCursor:"scan-page-one"}')
+later_issue=$(issue BIG-38 2026-08-14T12:10:00Z captain-id shared-name '[]')
+later_issue=$(printf '%s' "$later_issue" | jq '.createdAt="2026-08-14T12:09:30Z"')
 jq -n --argjson a "$scan_issue" --argjson b "$later_issue" \
   '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$a,$b]}}}' \
   > "$fixtures/02-issues.json"
@@ -707,7 +708,7 @@ out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
 assert_contains "$out" "BIG-38" "deep scan blocked a later captain issue"
 [ -f "$home/state/.linear-history-scans/BIG-37.json" ] \
   || fail "incomplete deep-history pagination was not checkpointed durably"
-grep -qx 'issues_updated_at=2026-08-14T12:02:00.000000000Z' "$home/state/.linear-cursor" \
+grep -qx 'issues_updated_at=2026-08-14T12:10:00.000000000Z' "$home/state/.linear-cursor" \
   || fail "an incomplete issue scan blocked the global issue cursor"
 fixtures="$TMP_ROOT/resumable-deep-history-two"
 make_fixtures "$fixtures" '[]' '[]'
@@ -719,10 +720,83 @@ out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
   || fail "resumed deep-history poll failed"
 [ ! -e "$home/state/.linear-history-scans/BIG-37.json" ] \
   || fail "completed deep-history scan retained its checkpoint"
-jq -s -e 'any(.[]; .history_id == "scan-middle") and any(.[]; .history_id == "scan-final")' \
+jq -s -e 'any(.[]; .history_id == "scan-middle") and any(.[]; .history_id == "scan-final")
+  and any(.[]; .kind == "issue-created" and .issue == "BIG-37")' \
   "$home/state/linear-inbox"/*.json >/dev/null \
-  || fail "resumed deep-history pages were not durably emitted"
-pass "deep history checkpoints resume without blocking later issues"
+  || fail "resumed deep-history horizon did not preserve history and creation events"
+pass "deep history checkpoints retain their original ingestion horizon"
+
+home=$(make_home nested-thread-resume)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \
+  > "$home/state/.linear-cursor"
+printf '{"after":null,"before":"2026-08-14T11:55:00.000000000Z","complete":false}\n' \
+  > "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/nested-thread-resume-one"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"older"},nodes:[]}}}' \
+  > "$fixtures/01-bootstrap.json"
+captain_reply=$(comment nested-captain 2026-08-14T11:58:00Z 'bare nested reply' captain-id shared-name BIG-41)
+captain_reply=$(printf '%s' "$captain_reply" | jq '.issue.labels.nodes=[] | .parent={id:"root-comment"}')
+jq -n --argjson node "$captain_reply" \
+  '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
+  > "$fixtures/02-comments.json"
+jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/03-issues.json"
+jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-41"},parent:null,user:{id:"captain-id"}}}}' \
+  > "$fixtures/04-root.json"
+jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-41"},children:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"child-comment",user:{id:"other-id"}}]}}}}' \
+  > "$fixtures/05-root-children.json"
+nested_status=0
+out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures" 2>&1) || nested_status=$?
+[ "$nested_status" -eq 0 ] || fail "first nested participation sweep failed: $out"
+[ "$(pending_count "$home")" = 0 ] || fail "incomplete descendant traversal published the reply early"
+[ -d "$home/state/.linear-thread-descendant-scans" ] \
+  || fail "descendant traversal did not checkpoint provider progress"
+fixtures="$TMP_ROOT/nested-thread-resume-two"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:true,endCursor:"oldest"},nodes:[]}}}' \
+  > "$fixtures/01-bootstrap.json"
+jq -n --argjson node "$captain_reply" \
+  '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}' \
+  > "$fixtures/02-comments.json"
+jq -n '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/03-issues.json"
+jq -n '{data:{comment:{id:"child-comment",issue:{identifier:"BIG-41"},children:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[{id:"nested-self",user:{id:"firstmate-id"}}]}}}}' \
+  > "$fixtures/04-child-children.json"
+out=$(FM_LINEAR_THREAD_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
+  || fail "resumed nested participation sweep failed"
+assert_contains "$out" "1 captain input(s)" \
+  "nested Firstmate participation did not wake the deferred captain reply"
+jq -s -e 'any(.[]; .comment_id == "nested-captain" and .route == "thread")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "deferred nested reply was not durably routed through its canonical thread"
+pass "nested participation traversal checkpoints and resumes before suppression"
+
+home=$(make_home root-progress-resume)
+fixtures="$TMP_ROOT/root-progress-resume-one"
+mkdir -p "$fixtures"
+root_reply=$(comment root-progress-reply 2026-08-14T11:58:00Z 'root progress' captain-id shared-name BIG-43)
+root_reply=$(printf '%s' "$root_reply" | jq '.parent={id:"child-comment"}')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$root_reply" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"child-comment",issue:{identifier:"BIG-43"},parent:{id:"root-comment"},user:{id:"other-id"}}}}' \
+  > "$fixtures/03-child-root.json"
+run_poll "$home" "$fixtures" >/dev/null 2>&1 \
+  && fail "incomplete root fixture unexpectedly completed"
+scan=$(find "$home/state/.linear-thread-root-scans" -type f -name '*.json' | head -n 1)
+[ -n "$scan" ] && [ "$(jq -r '.current' "$scan")" = root-comment ] \
+  || fail "canonical-root traversal did not checkpoint its last provider edge"
+fixtures="$TMP_ROOT/root-progress-resume-two"
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$root_reply" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"root-comment",issue:{identifier:"BIG-43"},parent:null,user:{id:"captain-id"}}}}' \
+  > "$fixtures/03-root.json"
+request_log="$home/root-progress.log"
+out=$(FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures") \
+  || fail "canonical-root traversal did not resume"
+assert_contains "$out" "1 captain input(s)" "resumed root traversal starved later captain input"
+awk -F '\t' '$1 == "threadRoot" { print $2 }' "$request_log" \
+  | jq -e '.variables.comment == "root-comment"' >/dev/null \
+  || fail "resumed root traversal restarted from the already-checkpointed child"
+pass "canonical-root traversal resumes from durable edge progress"
 
 home=$(make_home cursor-clamp)
 printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' > "$home/state/.linear-cursor"
@@ -773,13 +847,29 @@ for file in "$home/state/linear-inbox"/*.json; do
   : > "${file%.json}.handled"
   rm -f -- "$file" "${file%.json}.handled"
 done
-: > "$home/state/.linear-seen.tsv"
 printf 'comments_updated_at=2026-08-14T11:55:00Z\nissues_updated_at=2026-08-14T11:55:00Z\n' \
   > "$home/state/.linear-cursor"
 out=$(run_poll "$home" "$fixtures") || fail "rewound retained issue-creation poll failed"
 [ -z "$out" ] || fail "retained issue creation replayed after event retention: $out"
 [ "$(pending_count "$home")" = 0 ] || fail "persistent issue head did not suppress recreated issue input"
 pass "issue heads retain immutable creation identity"
+
+home=$(make_home guarded-acknowledgment)
+fixtures="$TMP_ROOT/guarded-acknowledgment-fixtures"
+comments=$(jq -nc --argjson c "$(comment ack-event 2026-08-14T11:58:00Z acknowledge captain-id shared-name BIG-42)" '[$c]')
+make_fixtures "$fixtures" "$comments" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "acknowledgment baseline poll failed"
+event=$(find "$home/state/linear-inbox" -type f -name '*.json' | head -n 1)
+event_name=${event##*/}
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$POLL" acknowledge "$event_name" >/dev/null \
+  || fail "guarded event acknowledgment failed"
+marker="${event%.json}.handled"
+[ -f "$marker" ] && [ ! -L "$marker" ] || fail "acknowledgment did not publish a safe marker"
+rm -f -- "$marker"
+ln -s "$event" "$marker"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$POLL" acknowledge "$event_name" >/dev/null 2>&1 \
+  && fail "acknowledgment accepted a symlink marker"
+pass "handled acknowledgments reject unsafe marker paths"
 
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)

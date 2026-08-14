@@ -34,7 +34,7 @@ The authenticated viewer ID is the only self identity, and `LINEAR_CAPTAIN_ID` i
 Process an event idempotently.
 Before dispatching or creating local work, reconcile whether the demanded action is already done or durably queued.
 Mark the event handled only after its action is complete or durably queued.
-For an event at `<uuid>.json`, create the adjacent marker privately with `umask 077; : > "<uuid>.handled"`.
+For an event at `<uuid>.json`, run `bin/fm-linear-poll.sh acknowledge <uuid>.json` to publish its guarded adjacent marker.
 An interruption before that marker deliberately causes the event to be offered again.
 
 ## Use the one outbound door

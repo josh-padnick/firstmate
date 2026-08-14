@@ -2,10 +2,11 @@
 # Poll Linear into a durable, identity-attributed event ledger.
 # Usage:
 #   fm-linear-poll.sh
+#   fm-linear-poll.sh acknowledge <inbox-filename.json>
 #   fm-linear-poll.sh acknowledge-unknown-status <BIG-n> <status>
 #
 # Captain-authored events are atomically written under state/linear-inbox before
-# their dedupe keys are recorded and before either server-timestamp cursor moves.
+# their content heads are recorded and before either server-timestamp cursor moves.
 # Repeated and rewound reads are therefore idempotent, while comment transitions
 # compare against the latest body hash and retain a distinct server-timestamp key.
 #
@@ -28,9 +29,11 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 CURSOR_FILE="$STATE/.linear-cursor"
 BOOTSTRAP_HORIZON_FILE="$STATE/.linear-bootstrap-horizon"
-SEEN_FILE="$STATE/.linear-seen.tsv"
 COMMENT_HEADS_FILE="$STATE/.linear-comment-heads.tsv"
 COMMENT_HEAD_BOOTSTRAP_FILE="$STATE/.linear-comment-head-bootstrap.json"
+COMMENT_ROOTS_FILE="$STATE/.linear-comment-roots.tsv"
+THREAD_ROOT_SCAN_DIR="$STATE/.linear-thread-root-scans"
+THREAD_DESCENDANT_SCAN_DIR="$STATE/.linear-thread-descendant-scans"
 HISTORY_HEADS_FILE="$STATE/.linear-history-heads.tsv"
 THREAD_PARTICIPATION_FILE="$STATE/.linear-thread-participation.tsv"
 ISSUE_HEADS_FILE="$STATE/.linear-issue-heads.json"
@@ -50,9 +53,9 @@ TMP_ROOT=
 LOCK_HELD=0
 NEW_EVENTS=0
 NEW_OBSERVATIONS=0
+COMMENT_SCAN_PENDING=0
 NEW_ISSUES=
 NEW_OBSERVATION_ISSUES=
-SEEN_KEYS=
 SELF_NAME=${FM_LINEAR_SELF_NAME:-josh.padnickfirstmate}
 SELF_MENTION=${FM_LINEAR_SELF_MENTION:-@josh.padnickfirstmate}
 SELF_ID=${FM_LINEAR_SELF_ID:-}
@@ -107,40 +110,6 @@ record_success() {  # <server-timestamp>
 
 cursor_get() {  # <field>
   sed -n "s/^$1=//p" "$CURSOR_FILE" 2>/dev/null | tail -n 1
-}
-
-seen_has() {  # <dedupe-key>
-  local key=$1 needle
-  printf -v needle '\n%s\n' "$key"
-  case "$SEEN_KEYS" in
-    *"$needle"*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-seen_append() {  # <dedupe-key> <observed-at>
-  local key=$1 observed=$2
-  if [ ! -e "$SEEN_FILE" ]; then
-    (umask 077; : > "$SEEN_FILE") || return 1
-    chmod 0600 "$SEEN_FILE" || return 1
-  fi
-  [ -f "$SEEN_FILE" ] && [ ! -L "$SEEN_FILE" ] || return 1
-  printf '%s\t%s\n' "$key" "$observed" >> "$SEEN_FILE"
-  SEEN_KEYS="${SEEN_KEYS}${key}
-"
-}
-
-load_seen_keys() {
-  local key _
-  SEEN_KEYS='
-'
-  [ -f "$SEEN_FILE" ] || return 0
-  [ ! -L "$SEEN_FILE" ] || return 1
-  while IFS="$(printf '\t')" read -r key _; do
-    [ -n "$key" ] || continue
-    SEEN_KEYS="${SEEN_KEYS}${key}
-"
-  done < "$SEEN_FILE"
 }
 
 comment_head_current() {  # <comment-id> <body-hash> <edited-at>
@@ -256,8 +225,47 @@ api() {  # <operation> <payload-file> <response-file>
   fm_linear_api_call "$1" "$2" "$3"
 }
 
+thread_root_cached() {  # <comment-id> <issue> <root-output-var-name>
+  local cached_root
+  cached_root=$(awk -F '\t' -v id="$1" -v issue="$2" '$1 == id && $3 == issue { print $2; exit }' \
+    "$COMMENT_ROOTS_FILE" 2>/dev/null)
+  [ -n "$cached_root" ] || return 1
+  printf -v "$3" '%s' "$cached_root"
+}
+
+thread_root_cache_set() {  # <comment-id> <root-id> <issue>
+  local id=$1 root=$2 issue=$3 next="$TMP_ROOT/comment-roots-next.tsv"
+  if [ -e "$COMMENT_ROOTS_FILE" ]; then
+    [ -f "$COMMENT_ROOTS_FILE" ] && [ ! -L "$COMMENT_ROOTS_FILE" ] || return 1
+    awk -F '\t' -v id="$id" '$1 != id' "$COMMENT_ROOTS_FILE" > "$next" || return 1
+  else
+    : > "$next"
+  fi
+  printf '%s\t%s\t%s\n' "$id" "$root" "$issue" >> "$next" || return 1
+  fm_linear_atomic_file "$COMMENT_ROOTS_FILE" 600 < "$next"
+}
+
 resolve_thread_root() {  # <comment-id> <issue> <root-output-var-name>
-  local current=$1 issue=$2 output_var=$3 observed=${4:-} depth=0 payload response query parent author_id
+  local start=$1 issue=$2 output_var=$3 observed=${4:-} depth=0 payload response query parent author_id
+  local current scan scan_id next visited_id root
+  if thread_root_cached "$start" "$issue" root; then
+    printf -v "$output_var" '%s' "$root"
+    return 0
+  fi
+  fm_linear_private_dir "$THREAD_ROOT_SCAN_DIR" || return 1
+  scan_id=$(printf '%s' "$start" | fm_linear_sha256) || return 1
+  scan="$THREAD_ROOT_SCAN_DIR/$scan_id.json"
+  if [ -e "$scan" ]; then
+    [ -f "$scan" ] && [ ! -L "$scan" ] || return 1
+    jq -e --arg start "$start" --arg issue "$issue" \
+      '.start == $start and .issue == $issue and (.visited | type == "array")' \
+      "$scan" >/dev/null 2>&1 || return 1
+  else
+    jq -n --arg start "$start" --arg issue "$issue" \
+      '{start:$start,current:$start,issue:$issue,visited:[]}' \
+      | fm_linear_atomic_file "$scan" 600 || return 1
+  fi
+  current=$(jq -r '.current' "$scan") || return 1
   while :; do
     depth=$((depth + 1))
     [ "$depth" -le 50 ] || {
@@ -277,11 +285,21 @@ resolve_thread_root() {  # <comment-id> <issue> <root-output-var-name>
       return 1
     }
     parent=$(jq -r '.data.comment.parent.id // empty' "$response")
+    next="$TMP_ROOT/thread-root-progress-$scan_id.json"
+    jq --arg current "$current" --arg parent "$parent" \
+      '.visited=((.visited + [$current]) | unique) | .current=(if $parent == "" then $current else $parent end)' \
+      "$scan" > "$next" || return 1
+    fm_linear_atomic_file "$scan" 600 < "$next" || return 1
     if [ -z "$parent" ]; then
       author_id=$(jq -r '.data.comment.user.id // empty' "$response")
       if [ -n "$observed" ] && [ "$author_id" = "$SELF_ID" ]; then
         thread_participation_set "$current" "$observed" || return 1
       fi
+      while IFS= read -r visited_id; do
+        [ -n "$visited_id" ] || continue
+        thread_root_cache_set "$visited_id" "$current" "$issue" || return 1
+      done < <(jq -r '.visited[]' "$scan")
+      rm -f -- "$scan" || return 1
       break
     fi
     current=$parent
@@ -290,42 +308,74 @@ resolve_thread_root() {  # <comment-id> <issue> <root-output-var-name>
 }
 
 resolve_thread_participation() {  # <parent-comment-id> <issue> <observed-at> <root-output-var-name>
-  local current issue=$2 observed=$3 output_var=$4 payload response query after has_next end_cursor page
-  resolve_thread_root "$1" "$issue" current "$observed" || return 1
+  local current resolved_root issue=$2 observed=$3 output_var=$4 payload response query after has_next end_cursor page
+  local scan scan_id next node limit
+  resolve_thread_root "$1" "$issue" resolved_root "$observed" || return 1
+  current=$resolved_root
   printf -v "$output_var" '%s' "$current"
   thread_participated "$current" && return 0
-  after=
+  fm_linear_private_dir "$THREAD_DESCENDANT_SCAN_DIR" || return 1
+  scan_id=$(printf '%s' "$current" | fm_linear_sha256) || return 1
+  scan="$THREAD_DESCENDANT_SCAN_DIR/$scan_id.json"
+  if [ -e "$scan" ]; then
+    [ -f "$scan" ] && [ ! -L "$scan" ] || return 1
+    jq -e --arg root "$current" --arg issue "$issue" \
+      '.root == $root and .issue == $issue and (.queue | type == "array")' \
+      "$scan" >/dev/null 2>&1 || return 1
+  else
+    jq -n --arg root "$current" --arg issue "$issue" \
+      '{root:$root,issue:$issue,queue:[$root],current:null,after:null}' \
+      | fm_linear_atomic_file "$scan" 600 || return 1
+  fi
   page=0
-  while :; do
+  limit=${FM_LINEAR_THREAD_PAGES_PER_POLL:-10}
+  case "$limit" in ''|*[!0-9]*|0) limit=10 ;; esac
+  while [ "$page" -lt "$limit" ]; do
+    node=$(jq -r '.current // .queue[0] // empty' "$scan") || return 1
+    if [ -z "$node" ]; then
+      rm -f -- "$scan" || return 1
+      return 0
+    fi
+    after=$(jq -r '.after // empty' "$scan") || return 1
     page=$((page + 1))
     payload="$TMP_ROOT/thread-participants-$page-payload.json"
     response="$TMP_ROOT/thread-participants-$page-response.json"
     # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-    query='query($comment:String!,$after:String){comment(id:$comment){id issue{identifier} children(first:50,after:$after,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{user{id}}}}}'
-    jq -n --arg query "$query" --arg comment "$current" --arg after "$after" \
+    query='query($comment:String!,$after:String){comment(id:$comment){id issue{identifier} children(first:50,after:$after,orderBy:updatedAt){pageInfo{hasNextPage endCursor} nodes{id user{id}}}}}'
+    jq -n --arg query "$query" --arg comment "$node" --arg after "$after" \
       '{query:$query,variables:{comment:$comment,after:(if $after == "" then null else $after end)}}' \
       > "$payload" || return 1
     api threadParticipants "$payload" "$response" || return 1
-    [ "$(jq -r '.data.comment.id // empty' "$response")" = "$current" ] \
+    [ "$(jq -r '.data.comment.id // empty' "$response")" = "$node" ] \
       && [ "$(jq -r '.data.comment.issue.identifier // empty' "$response")" = "$issue" ] \
       && jq -e '.data.comment.children.nodes | type == "array"' "$response" >/dev/null 2>&1 || {
-      FM_LINEAR_API_ERROR="malformed thread participation response for $current"
+      FM_LINEAR_API_ERROR="malformed thread participation response for $node"
       return 1
     }
     if jq -e --arg self "$SELF_ID" 'any(.data.comment.children.nodes[]; .user.id == $self)' \
       "$response" >/dev/null; then
       thread_participation_set "$current" "$observed" || return 1
+      rm -f -- "$scan" || return 1
       return 0
     fi
     has_next=$(jq -r '.data.comment.children.pageInfo.hasNextPage // false' "$response")
-    [ "$has_next" = true ] || return 0
     end_cursor=$(jq -r '.data.comment.children.pageInfo.endCursor // empty' "$response")
-    [ -n "$end_cursor" ] || {
+    [ "$has_next" != true ] || [ -n "$end_cursor" ] || {
       FM_LINEAR_API_ERROR="thread participation pagination omitted endCursor for $current"
       return 1
     }
-    after=$end_cursor
+    next="$TMP_ROOT/thread-descendants-$scan_id.json"
+    jq --arg node "$node" --arg after "$end_cursor" --argjson has_next "$has_next" \
+      --slurpfile response "$response" '
+      if $has_next then .current=$node | .after=$after
+      else
+        ($response[0].data.comment.children.nodes | map(.id // empty) | map(select(length > 0))) as $children
+        | .queue=((.queue[1:] + $children) | unique)
+        | .current=null | .after=null
+      end' "$scan" > "$next" || return 1
+    fm_linear_atomic_file "$scan" 600 < "$next" || return 1
   done
+  return 3
 }
 
 bootstrap_comment_heads() {  # <event-bootstrap-cutoff>
@@ -450,13 +500,7 @@ fetch_comments() {  # <cursor> <bootstrap-cutoff>
     SELF_ID=$viewer_id
     [ -z "$viewer_name" ] || SELF_NAME=$viewer_name
     nodes="$TMP_ROOT/comments-nodes-$page.json"
-    jq 'def nts:
-      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<frac>[0-9]+))?Z$") as $m
-      | $m.base + "." + ((($m.frac // "") + "000000000")[0:9]) + "Z";
-      [.data.comments.nodes[]
-       | .createdAt=(.createdAt|nts)
-       | .updatedAt=(.updatedAt|nts)
-       | if .editedAt == null then . else .editedAt=(.editedAt|nts) end]' "$response" > "$nodes" || return 1
+    fm_linear_normalize_json_timestamps comments < "$response" > "$nodes" || return 1
     json_array_append "$TMP_ROOT/comments.json" "$nodes" || return 1
     has_next=$(jq -r '.data.comments.pageInfo.hasNextPage // false' "$response")
     [ "$has_next" = true ] || break
@@ -500,12 +544,7 @@ fetch_more_history() {  # <scan-file>
       return 1
     }
     nodes="$TMP_ROOT/history-$issue-nodes-$page.json"
-    jq --arg issue "$issue" 'def nts:
-      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<frac>[0-9]+))?Z$") as $m
-      | $m.base + "." + ((($m.frac // "") + "000000000")[0:9]) + "Z";
-      [.data.issue.history.nodes[]
-       | .createdAt=(.createdAt|nts) | .updatedAt=(.updatedAt|nts) | . + {issue:$issue}]' \
-      "$response" > "$nodes" || return 1
+    fm_linear_normalize_json_timestamps history "$issue" < "$response" > "$nodes" || return 1
     has_next=$(jq -r '.data.issue.history.pageInfo.hasNextPage // false' "$response")
     oldest=$(jq -r '[.[].updatedAt] | min // empty' "$nodes")
     end_cursor=$(jq -r '.data.issue.history.pageInfo.endCursor // empty' "$response")
@@ -524,9 +563,11 @@ fetch_more_history() {  # <scan-file>
     after=$end_cursor
     if [ "$has_next" != true ] \
       || { [ -n "$threshold" ] && [ -n "$oldest" ] && [[ "$oldest" < "$threshold" ]]; }; then
-      jq -n --slurpfile scan "$scan" '[$scan[0].issue_node]' > "$nodes" || return 1
+      jq -n --slurpfile scan "$scan" \
+        '[$scan[0].issue_node + {_scan_threshold:$scan[0].threshold}]' > "$nodes" || return 1
       json_array_append "$TMP_ROOT/issues.json" "$nodes" || return 1
-      jq -n --slurpfile scan "$scan" '$scan[0].nodes' > "$nodes" || return 1
+      jq -n --slurpfile scan "$scan" \
+        '$scan[0].nodes | map(. + {_scan_threshold:$scan[0].threshold})' > "$nodes" || return 1
       json_array_append "$TMP_ROOT/history.json" "$nodes" || return 1
       rm -f -- "$scan" || return 1
       return 0
@@ -577,13 +618,7 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
     }
     normalized="$TMP_ROOT/issues-normalized-$page.json"
     page_history_list="$TMP_ROOT/history-pagination-$page.tsv"
-    jq 'def nts:
-      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<frac>[0-9]+))?Z$") as $m
-      | $m.base + "." + ((($m.frac // "") + "000000000")[0:9]) + "Z";
-      .data.issues.nodes |= map(
-        .createdAt=(.createdAt|nts) | .updatedAt=(.updatedAt|nts)
-        | .history.nodes |= map(.createdAt=(.createdAt|nts) | .updatedAt=(.updatedAt|nts)))' \
-      "$response" > "$normalized" || return 1
+    fm_linear_normalize_json_timestamps issues < "$response" > "$normalized" || return 1
     mv -f -- "$normalized" "$response" || return 1
     threshold=$since
     jq -r --arg threshold "$threshold" '
@@ -612,7 +647,7 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
           --argjson additions "$history_json" --arg after "$history_after" --arg threshold "$threshold" '
           $old[0]
           | if .issue_node.updatedAt == $issue_node.updatedAt then .
-            else .issue_node=$issue_node | .after=$after | .threshold=$threshold
+            else .issue_node=$issue_node | .after=$after
               | .nodes=((.nodes + $additions) | unique_by([.id,.updatedAt,(.changes|tostring)]))
             end' \
           > "$scan_next" || return 1
@@ -712,7 +747,7 @@ mark_outbox_board_observed() {  # <issue> <to-state> <to-assignee-id>
 
 derive_comments() {  # <observed-at> <bootstrap-cutoff>
   local observed=$1 bootstrap_cutoff=$2 id body_b64 body_file author_id author issue parent created updated edited hash key record authority
-  local labels_b64 labels labeled body_lower mention_lower should_wake route thread bootstrap_complete head_cutoff
+  local labels_b64 labels labeled body_lower mention_lower should_wake route thread bootstrap_complete head_cutoff participation_status
   bootstrap_complete=$(jq -r '.complete // false' "$COMMENT_HEAD_BOOTSTRAP_FILE" 2>/dev/null || printf false)
   head_cutoff=$(jq -r '.before // empty' "$COMMENT_HEAD_BOOTSTRAP_FILE" 2>/dev/null || true)
   [ -n "$head_cutoff" ] || head_cutoff=$bootstrap_cutoff
@@ -802,7 +837,13 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
       should_wake=1
       route=mention
     elif [ -n "$parent" ] && [ "$bootstrap_complete" != true ]; then
-      resolve_thread_participation "$parent" "$issue" "$observed" thread || return 1
+      resolve_thread_participation "$parent" "$issue" "$observed" thread
+      participation_status=$?
+      case "$participation_status" in
+        0) ;;
+        3) COMMENT_SCAN_PENDING=1; continue ;;
+        *) return 1 ;;
+      esac
       if thread_participated "$thread"; then
         should_wake=1
         route=thread
@@ -842,7 +883,7 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
 }
 
 derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
-  local observed=$1 event_cutoff=$2 bootstrap_cutoff=$3 row content id actor_id issue created updated hash key kind record
+  local observed=$1 event_cutoff=$2 bootstrap_cutoff=$3 row content id actor_id issue created updated hash key kind record row_cutoff
   local has_board has_description has_labels has_other to_state to_assignee_id authority
   jq -c 'sort_by((.updatedAt // .createdAt), .id)[]' "$TMP_ROOT/history.json" \
     > "$TMP_ROOT/history-rows.jsonl" || return 1
@@ -852,6 +893,8 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     issue=$(printf '%s' "$row" | jq -r '.issue // "unknown"')
     created=$(printf '%s' "$row" | jq -r '.createdAt // empty')
     updated=$(printf '%s' "$row" | jq -r '.updatedAt // .createdAt // empty')
+    row_cutoff=$(printf '%s' "$row" | jq -r '._scan_threshold // empty')
+    [ -n "$row_cutoff" ] || row_cutoff=$event_cutoff
     [ -n "$id" ] && [ -n "$created" ] && [ -n "$updated" ] || return 1
     content=$(printf '%s' "$row" | jq -cS '
       def description_target:
@@ -887,7 +930,7 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
       fi
       continue
     fi
-    if [ -n "$event_cutoff" ] && [[ "$updated" < "$event_cutoff" ]]; then
+    if [ -n "$row_cutoff" ] && [[ "$updated" < "$row_cutoff" ]]; then
       history_hash_set "$id" "$hash" "$updated" || return 1
       continue
     fi
@@ -1074,14 +1117,16 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
 }
 
 derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
-  local observed=$1 creation_cutoff=$2 bootstrap_cutoff=$3 row issue creator_id created key labels record should_wake authority
+  local observed=$1 creation_cutoff=$2 bootstrap_cutoff=$3 row issue creator_id created key labels record should_wake authority row_cutoff
   jq -c 'sort_by(.createdAt, .identifier)[]' "$TMP_ROOT/issues.json" > "$TMP_ROOT/issue-rows.jsonl" || return 1
   while IFS= read -r row; do
     issue=$(printf '%s' "$row" | jq -r '.identifier // empty')
     creator_id=$(printf '%s' "$row" | jq -r '.creator.id // empty')
     created=$(printf '%s' "$row" | jq -r '.createdAt // empty')
+    row_cutoff=$(printf '%s' "$row" | jq -r '._scan_threshold // empty')
+    [ -n "$row_cutoff" ] || row_cutoff=$creation_cutoff
     [ -n "$issue" ] && [ -n "$created" ] || continue
-    [ -z "$creation_cutoff" ] || [[ "$created" > "$creation_cutoff" || "$created" = "$creation_cutoff" ]] || continue
+    [ -z "$row_cutoff" ] || [[ "$created" > "$row_cutoff" || "$created" = "$row_cutoff" ]] || continue
     key="issue-created:$issue"
     if issue_creation_known "$issue"; then
       issue_creation_mark "$issue" || return 1
@@ -1318,21 +1363,11 @@ announce_outbox() {
 }
 
 prune_retained_state() {
-  local file cutoff seen_tmp
-  cutoff=
+  local file
   [ -d "$INBOX" ] || return 0
   find "$INBOX" -type f -name '*.handled' -mtime +14 -print 2>/dev/null | while IFS= read -r file; do
     rm -f -- "$file" "${file%.handled}.json" 2>/dev/null || true
   done
-  if [ -f "$SEEN_FILE" ] && [ ! -L "$SEEN_FILE" ]; then
-    cutoff=$(fm_linear_iso_from_epoch "$((${FM_LINEAR_NOW_EPOCH:-$(date +%s)} - 1209600))") || cutoff=
-    [ -z "$cutoff" ] || cutoff=$(fm_linear_normalize_timestamp "$cutoff") || return 1
-    if [ -n "$cutoff" ]; then
-      seen_tmp="$TMP_ROOT/seen-pruned.tsv"
-      awk -F '\t' -v cutoff="$cutoff" '$2 >= cutoff' "$SEEN_FILE" > "$seen_tmp" || return 1
-      fm_linear_atomic_file "$SEEN_FILE" 600 < "$seen_tmp" || return 1
-    fi
-  fi
   [ -d "$OUTBOX" ] || return 0
   find "$OUTBOX" -type f -name '*.done' -mtime +7 -print 2>/dev/null | while IFS= read -r file; do
     rm -f -- "$file" "$file.unobserved-sweeps" \
@@ -1377,6 +1412,38 @@ acknowledge_unknown_status() {  # <issue> <status>
   printf 'linear: acknowledged unknown status %s (%s)\n' "$status" "$issue"
 }
 
+acknowledge_event() {  # <inbox-filename.json>
+  local name=$1 event marker lock_status
+  case "$name" in
+    */*|''|.*|*.handled|*[!A-Za-z0-9._-]*|*.json.json) 
+      printf 'linear: invalid inbox event filename: %s\n' "$name" >&2
+      return 2
+      ;;
+    *.json) ;;
+    *) printf 'linear: invalid inbox event filename: %s\n' "$name" >&2; return 2 ;;
+  esac
+  fm_linear_private_dir "$STATE" || return 1
+  fm_linear_private_dir "$INBOX" || return 1
+  fm_linear_lock_acquire "$LOCK"
+  lock_status=$?
+  case "$lock_status" in 0) LOCK_HELD=1 ;; 1) printf 'linear: POLL BUSY: another ledger writer holds the lock\n' >&2; return 1 ;; *) return 1 ;; esac
+  event="$INBOX/$name"
+  marker="${event%.json}.handled"
+  [ -f "$event" ] && [ ! -L "$event" ] || {
+    printf 'linear: inbox event is missing or unsafe: %s\n' "$name" >&2
+    return 1
+  }
+  if [ -e "$marker" ] || [ -L "$marker" ]; then
+    [ -f "$marker" ] && [ ! -L "$marker" ] || {
+      printf 'linear: handled marker is unsafe: %s\n' "${marker##*/}" >&2
+      return 1
+    }
+  else
+    fm_linear_atomic_file "$marker" 600 < /dev/null || return 1
+  fi
+  printf 'linear: acknowledged inbox event %s\n' "$name"
+}
+
 main() {
   local comments_cursor issues_cursor comments_cursor_stored issues_cursor_stored
   local bootstrap_cutoff creation_cutoff comments_max issues_max observed cursor_tmp lock_status
@@ -1399,10 +1466,6 @@ main() {
   LOCK_HELD=1
   TMP_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/fm-linear-poll.XXXXXX") || {
     record_failure "cannot create poll workspace"
-    return 1
-  }
-  load_seen_keys || {
-    record_failure "cannot read the Linear seen ledger"
     return 1
   }
   if ! command -v jq >/dev/null 2>&1; then
@@ -1497,7 +1560,11 @@ main() {
     return 1
   fi
 
-  next_comments_cursor=$(timestamp_max "${comments_cursor_stored:-$bootstrap_cutoff}" "$comments_max")
+  if [ "$COMMENT_SCAN_PENDING" -eq 1 ]; then
+    next_comments_cursor=${comments_cursor_stored:-$bootstrap_cutoff}
+  else
+    next_comments_cursor=$(timestamp_max "${comments_cursor_stored:-$bootstrap_cutoff}" "$comments_max")
+  fi
   next_issues_cursor=$(timestamp_max "${issues_cursor_stored:-$bootstrap_cutoff}" "$issues_max")
   if [ -n "$next_comments_cursor" ] && [ -n "$next_issues_cursor" ]; then
     cursor_tmp="$TMP_ROOT/cursor"
@@ -1567,5 +1634,9 @@ case "${1:-}" in
     [ "$#" -eq 3 ] || { printf 'usage: fm-linear-poll.sh acknowledge-unknown-status <BIG-n> <status>\n' >&2; exit 2; }
     acknowledge_unknown_status "$2" "$3"
     ;;
-  *) printf 'usage: fm-linear-poll.sh [acknowledge-unknown-status <BIG-n> <status>]\n' >&2; exit 2 ;;
+  acknowledge)
+    [ "$#" -eq 2 ] || { printf 'usage: fm-linear-poll.sh acknowledge <inbox-filename.json>\n' >&2; exit 2; }
+    acknowledge_event "$2"
+    ;;
+  *) printf 'usage: fm-linear-poll.sh [acknowledge <inbox-filename.json> | acknowledge-unknown-status <BIG-n> <status>]\n' >&2; exit 2 ;;
 esac

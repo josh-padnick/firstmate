@@ -57,7 +57,8 @@ reply_target_fixture() {  # <file> <comment-id> <issue-id> [parent-id]
 }
 
 mutation_fixture() {  # <file>
-  jq -n '{data:{issueUpdate:{success:true,issue:{id:"issue-1",state:{name:"Approve Deliverable"},assignee:{displayName:"josh.padnick"}}}}}' > "$1"
+  jq -n '{data:{issueUpdate:{success:true,issue:{id:"issue-1",updatedAt:"2026-08-14T11:51:00Z",
+    state:{id:"approve",name:"Approve Deliverable"},assignee:{id:"captain-id",displayName:"josh.padnick"}}}}}' > "$1"
 }
 
 comment_fixture() {  # <file>
@@ -96,8 +97,9 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
-verify_fixture "$fixtures/05-verify.json" Building josh.padnickfirstmate
+mutation_read_fixture "$fixtures/04-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
+verify_fixture "$fixtures/06-verify.json" Building josh.padnickfirstmate
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
   --status 'Approve Deliverable' --comment-file "$home/review.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "stale board read-back did not fail loudly"
@@ -111,8 +113,9 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
-verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
+mutation_read_fixture "$fixtures/04-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
+verify_fixture "$fixtures/06-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
   --status 'Approve Deliverable' --comment-file "$home/review.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "same-name wrong-ID assignee passed read-back"
@@ -148,8 +151,9 @@ printf '%s' "$mutate_payload" | jq -e '.variables.issue == "issue-1"' >/dev/null
 
 fixtures="$TMP_ROOT/resume-fixtures"
 mkdir -p "$fixtures"
-comment_fixture "$fixtures/01-comment.json"
-verify_fixture "$fixtures/02-verify.json" 'Approve Deliverable' josh.padnick
+mutation_read_fixture "$fixtures/01-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/02-comment.json"
+verify_fixture "$fixtures/03-verify.json" 'Approve Deliverable' josh.padnick
 resume_log="$home/resume.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume >/dev/null \
@@ -164,6 +168,31 @@ posted_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -r '.
 awk -F '\t' '$1=="commentCreate"{print $2}' "$resume_log" | jq -e '.variables.issue == "issue-1"' >/dev/null \
   || fail "comment mutation did not use the resolved Linear issue UUID"
 pass "a killed state-carrying write resumes without half state or duplicate comments"
+
+home=$(make_home stale-comment-resume)
+fixtures="$TMP_ROOT/stale-comment-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/review.md"
+) >/dev/null 2>&1 || true
+fixtures="$TMP_ROOT/stale-comment-resume-fixtures"
+mkdir -p "$fixtures"
+mutation_read_fixture "$fixtures/01-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick \
+  2026-08-14T11:52:00Z
+resume_log="$home/stale-comment-resume.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1 || true)
+assert_contains "$out" "pre-comment conflict" \
+  "mutated recovery posted after a later captain board change"
+[ "$(awk -F '\t' '$1=="commentCreate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "stale mutated recovery posted an irreversible comment"
+pass "every resumed mutation revalidates the board before commenting"
 
 home=$(make_home accepted-mutation)
 fixtures="$TMP_ROOT/accepted-mutation-kill-fixtures"
@@ -182,9 +211,10 @@ journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
   || fail "accepted mutation kill did not preserve the pre-publication journal phase"
 fixtures="$TMP_ROOT/accepted-mutation-resume-fixtures"
 mkdir -p "$fixtures"
-mutation_read_fixture "$fixtures/01-read.json" approve 'Approve Deliverable' captain-id josh.padnick
-comment_fixture "$fixtures/02-comment.json"
-verify_fixture "$fixtures/03-verify.json" 'Approve Deliverable' josh.padnick
+mutation_read_fixture "$fixtures/01-read.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+mutation_read_fixture "$fixtures/02-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick
 resume_log="$home/accepted-mutation-resume.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume >/dev/null \
@@ -246,8 +276,9 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json" 'Approve Deliverable' josh.padnick captain-id
 mutation_read_fixture "$fixtures/02-read.json" approve 'Approve Deliverable' captain-id josh.padnick
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
-verify_fixture "$fixtures/05-verify.json" Building renamed-firstmate firstmate-id
+mutation_read_fixture "$fixtures/04-pre-comment.json" building Building firstmate-id renamed-firstmate 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
+verify_fixture "$fixtures/06-verify.json" Building renamed-firstmate firstmate-id
 identity_log="$home/identity.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$identity_log" FM_LINEAR_NOW_EPOCH="$NOW" \
@@ -273,8 +304,9 @@ fixtures="$TMP_ROOT/reply-without-assignee-ids-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 reply_target_fixture "$fixtures/02-reply-target.json" parent-1 issue-1
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" Building josh.padnickfirstmate
+mutation_read_fixture "$fixtures/03-pre-comment.json" building Building firstmate-id josh.padnickfirstmate
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" Building josh.padnickfirstmate
 run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/comment.md" --parent parent-1 >/dev/null \
   || fail "comment-only reply required unrelated assignee identities"
 [ "$(find "$home/state/linear-outbox" -name '*.done' | wc -l | tr -d ' ')" = 1 ] \
@@ -302,8 +334,9 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
-verify_fixture "$fixtures/05-verify.json" 'Approve Plan' josh.padnick captain-id
+mutation_read_fixture "$fixtures/04-pre-comment.json" approve-plan 'Approve Plan' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
+verify_fixture "$fixtures/06-verify.json" 'Approve Plan' josh.padnick captain-id
 plan_log="$home/approve-plan.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$plan_log" FM_LINEAR_NOW_EPOCH="$NOW" \
@@ -358,8 +391,9 @@ reply_target_fixture "$fixtures/02-reply-child.json" child-comment issue-1 root-
 reply_target_fixture "$fixtures/03-reply-root.json" root-comment issue-1
 mutation_read_fixture "$fixtures/04-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/05-mutate.json"
-comment_fixture "$fixtures/06-comment.json"
-verify_fixture "$fixtures/07-verify.json" 'Approve Deliverable' josh.padnick captain-id
+mutation_read_fixture "$fixtures/06-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/07-comment.json"
+verify_fixture "$fixtures/08-verify.json" 'Approve Deliverable' josh.padnick captain-id
 review_log="$home/reviewable-reply.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$review_log" FM_LINEAR_NOW_EPOCH="$NOW" \
@@ -401,7 +435,8 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
+mutation_read_fixture "$fixtures/04-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
 accepted_store="$home/accepted-comment-ids"
 accepted_log="$home/accepted-kill.log"
 (
@@ -418,9 +453,10 @@ journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 [ "$(wc -l < "$accepted_store" | tr -d ' ')" = 1 ] || fail "fixture server did not retain one accepted comment"
 fixtures="$TMP_ROOT/accepted-comment-resume-fixtures"
 mkdir -p "$fixtures"
-comment_fixture "$fixtures/01-comment.json"
-comment_read_fixture "$fixtures/02-comment-read.json"
-verify_fixture "$fixtures/03-verify.json" 'Approve Deliverable' josh.padnick
+mutation_read_fixture "$fixtures/01-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/02-comment.json"
+comment_read_fixture "$fixtures/03-comment-read.json"
+verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick
 retry_log="$home/accepted-retry.log"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_FIXTURE_LOG="$retry_log" FM_LINEAR_FIXTURE_COMMENT_STORE="$accepted_store" \
@@ -440,8 +476,9 @@ mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
 mutation_fixture "$fixtures/03-mutate.json"
-comment_fixture "$fixtures/04-comment.json"
-verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick
+mutation_read_fixture "$fixtures/04-pre-comment.json" approve 'Approve Deliverable' captain-id josh.padnick 2026-08-14T11:51:00Z
+comment_fixture "$fixtures/05-comment.json"
+verify_fixture "$fixtures/06-verify.json" 'Approve Deliverable' josh.padnick
 control="$home/mutation-pause"
 mkdir -p "$control"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
@@ -510,8 +547,9 @@ fixtures="$TMP_ROOT/image-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
 reply_target_fixture "$fixtures/02-reply-target.json" parent-1 issue-1
-comment_fixture "$fixtures/03-comment.json"
-verify_fixture "$fixtures/04-verify.json" Building josh.padnickfirstmate
+mutation_read_fixture "$fixtures/03-pre-comment.json" building Building firstmate-id josh.padnickfirstmate
+comment_fixture "$fixtures/04-comment.json"
+verify_fixture "$fixtures/05-verify.json" Building josh.padnickfirstmate
 run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/image.md" --parent parent-1 >/dev/null \
   || fail "Markdown image embed was incorrectly rejected"
 pass "the write door refuses raw upload links and permits image embeds"

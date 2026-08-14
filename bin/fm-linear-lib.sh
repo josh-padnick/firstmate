@@ -112,6 +112,34 @@ fm_linear_normalize_timestamp() {
   printf '%s.%sZ\n' "$base" "$(printf '%s' "$padded" | cut -c1-9)"
 }
 
+fm_linear_normalize_json_timestamps() {  # <comments|history|issues> [issue]
+  local kind=$1 issue=${2:-}
+  jq --arg kind "$kind" --arg issue "$issue" '
+    def nts:
+      capture("^(?<base>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\\.(?<frac>[0-9]+))?Z$") as $m
+      | $m.base + "." + ((($m.frac // "") + "000000000")[0:9]) + "Z";
+    if $kind == "comments" then
+      [.data.comments.nodes[]
+       | .createdAt=(.createdAt|nts)
+       | .updatedAt=(.updatedAt|nts)
+       | if .editedAt == null then . else .editedAt=(.editedAt|nts) end]
+    elif $kind == "history" then
+      [.data.issue.history.nodes[]
+       | .createdAt=(.createdAt|nts)
+       | .updatedAt=(.updatedAt|nts)
+       | . + {issue:$issue}]
+    elif $kind == "issues" then
+      .data.issues.nodes |= map(
+        .createdAt=(.createdAt|nts)
+        | .updatedAt=(.updatedAt|nts)
+        | .history.nodes |= map(
+          .createdAt=(.createdAt|nts)
+          | .updatedAt=(.updatedAt|nts)))
+    else
+      error("unknown Linear timestamp document kind")
+    end'
+}
+
 fm_linear_overlap_timestamp() {
   local epoch
   epoch=$(fm_linear_epoch "$1") || return 1
