@@ -40,11 +40,12 @@
 #     reason.
 #   - Fail-safe-to-escalate: any wake the classifier cannot confidently mark
 #     routine is escalated.
-#   - Bounded wedge latency: a stale pane without a declared external wait is
-#     escalated only after it has been idle for STALE_ESCALATE_SECS
-#     (configurable), rechecked once. A wedged crewmate is therefore detected
-#     within STALE_ESCALATE_SECS + a tick, never lost. A declared pause instead
-#     gets its own longer PAUSE_RESURFACE_SECS recheck, never a wedge escalation.
+#   - Bounded wedge latency: a stale pane without a declared external wait or a
+#     durable captain-held transfer is escalated only after it has been idle for
+#     STALE_ESCALATE_SECS (configurable), rechecked once. A wedged crewmate is
+#     therefore detected within STALE_ESCALATE_SECS + a tick, never lost. A
+#     declared pause instead gets its own longer PAUSE_RESURFACE_SECS recheck,
+#     while a captain-held transfer remains permanently silent.
 #     Crewmates are autonomous, so a delayed stale response does not stall a
 #     healthy crewmate's own progress.
 #     Buffered escalation delivery also has a max-defer alarm: if a digest stays
@@ -331,9 +332,10 @@ _collapse_newlines() {  # <text>
 # and dedup state below layer the daemon's escalation-digest concerns on top.
 #
 # Decision protocol: every classifier prints exactly one line on stdout of the
-# form "<action>|<distilled>" where action is "self" or "escalate". The distilled
-# field for "self" is informational (logged); for "escalate" it is the pre-read
-# summary firstmate would otherwise have to re-read.
+# form "<action>|<distilled>" where action is "self", "escalate", "pause", or
+# "hold". The distilled field for non-escalating actions is informational
+# (logged); for "escalate" it is the pre-read summary firstmate would otherwise
+# have to re-read.
 
 classify_signal() {  # <reason-after-colon> <state>
   local reason=$1 state=$2 f last distilled="" rel="" all_seen=1 task seen
@@ -365,13 +367,18 @@ classify_signal() {  # <reason-after-colon> <state>
   fi
 }
 
-# classify_stale decides the WAKE itself (one-shot per distinct hash). On a
-# first sight of a non-terminal stale it returns "self" and the caller records a
-# timestamp marker; persistence is escalated by housekeeping's recheck, not here.
+# classify_stale decides the WAKE itself (one-shot per distinct hash). A durable
+# captain-held transfer returns "hold", a declared external wait returns "pause",
+# and an ordinary non-terminal stale returns "self" so the caller records a
+# timestamp marker for housekeeping's persistence recheck.
 classify_stale() {  # <window> <state>
   local win=$1 state=$2 task last seen
   task=$(window_to_task "$win" "$state")
   last=$(last_status_line "$state/$task.status")
+  if [ -n "$last" ] && status_is_captain_held "$last"; then
+    printf 'hold|captain-held (durable review transfer, no periodic recheck): %s' "$last"
+    return
+  fi
   if [ -n "$last" ] && status_is_paused "$last"; then
     # A DECLARED external-wait pause (fm-classify-lib.sh): an idle pane is EXPECTED,
     # so this is not a wedge. The caller records a pause marker (long re-surface
@@ -483,6 +490,8 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   if status_is_paused "$last"; then
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
+  elif status_is_captain_held "$last"; then
+    clear_pause_tracking "$win" "$state"
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
   fi
@@ -498,7 +507,8 @@ migrate_watcher_pause_markers() {  # <state>
     key=$(_stale_key "$task")
     watcher_key=$(_stale_key "$win")
     last=$(last_status_line "$state/$task.status")
-    if status_is_paused "$last" || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
+    if status_is_paused "$last" || status_is_captain_held "$last" \
+      || [ -e "$state/.subsuper-paused-$key" ] || [ -e "$state/.paused-$watcher_key" ]; then
       reconcile_pause_tracking "$win" "$state" "$last"
     fi
   done
@@ -1004,7 +1014,7 @@ housekeeping() {  # <state>
     fi
     task=$(window_to_task "$win" "$state")
     last=$(last_status_line "$state/$task.status")
-    if [ -n "$last" ] && status_is_paused "$last"; then
+    if [ -n "$last" ] && { status_is_paused "$last" || status_is_captain_held "$last"; }; then
       reconcile_pause_tracking "$win" "$state" "$last"
       continue
     fi
@@ -1214,7 +1224,7 @@ handle_wake() {  # <reason> <state>
               decision=$(classify_stale "$arg" "$state")
               case "$stale_detail" in
                 idle\ *s,\ possible\ wedge,\ escalation\ *)
-                  decision="escalate|${reason#stale: }" ;;
+                  [ "${decision%%|*}" = hold ] || decision="escalate|${reason#stale: }" ;;
               esac ;;
     check:*)  decision=$(classify_check "$reason") ;;
     heartbeat|heartbeat:*) decision=$(classify_heartbeat) ;;
@@ -1243,6 +1253,10 @@ handle_wake() {  # <reason> <state>
         pause_marker_record "$arg" "$state"
       fi
       log "self-handle (paused): $reason -> $distilled"
+      ;;
+    hold)
+      [ "$kind" = "stale" ] && clear_pause_tracking "$arg" "$state"
+      log "self-handle (captain-held): $reason -> $distilled"
       ;;
     *)
       # Transient (non-terminal) stale: record/refresh the wedge marker so

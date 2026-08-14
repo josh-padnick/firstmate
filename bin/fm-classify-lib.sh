@@ -61,12 +61,14 @@ FM_CLASSIFY_CAPTAIN_RE_DEFAULT='done:|needs-decision:|blocked:|failed:|PR ready|
 # drift between the two consumers. FM_CLASSIFY_PAUSED_VERB overrides it.
 FM_CLASSIFY_PAUSED_VERB_DEFAULT='paused'
 
-# Bounded re-surface cadence for a declared pause or a dead-agent captain hold.
+# Bounded re-surface cadence for a declared external wait.
 # Far longer than the wedge threshold (FM_STALE_ESCALATE_SECS, default 240s), it
-# avoids nagging a deliberate wait while ensuring a forgotten hold cannot rot
-# invisibly - it re-surfaces once for a recheck every window. One hour by default;
-# both consumers read FM_PAUSE_RESURFACE_SECS with this default so the cadence has
-# one owner.
+# avoids nagging a deliberate wait while ensuring a forgotten wait cannot rot
+# invisibly - it re-surfaces once for a recheck every window.
+# Captain-held transfers remain permanently silent because their decisions are
+# already durable in the captain-held backlog record.
+# One hour by default; both consumers read FM_PAUSE_RESURFACE_SECS with this
+# default so the cadence has one owner.
 # shellcheck disable=SC2034 # Read by the watcher and daemon (fm-watch.sh, fm-supervise-daemon.sh), not this lib.
 FM_PAUSE_RESURFACE_SECS_DEFAULT=3600
 
@@ -135,8 +137,8 @@ status_is_paused() {  # <status-line>
 # (captain-held [key=...]: ...). A pure read mirroring status_is_paused above, so
 # a caller that must tell a dead-agent decision-hold apart from a genuine
 # declared external wait (they share the same bounded-absorb cadence in
-# pause_state_class, but not the same periodic recheck-wake behavior - see
-# handle_paused_stale in bin/fm-watch.sh) never hand-rolls the verb comparison.
+# pause_state_class, but not the same periodic recheck-wake behavior) never
+# hand-rolls the verb comparison.
 status_is_captain_held() {  # <status-line>
   local line=$1 verb
   [ -n "$line" ] || return 1

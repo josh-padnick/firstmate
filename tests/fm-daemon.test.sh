@@ -349,6 +349,44 @@ test_housekeeping_paused_resurfaces_and_resets() {
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
+test_housekeeping_captain_held_remains_silent() {
+  local dir state fakebin win pane key watcher_key held_line round
+  dir=$(make_supercase captain-held-silent)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-w11-captain"; pane="$dir/pane.txt"
+  held_line='captain-held [key=preview]: tracked by held-decision-preview'
+  fm_write_meta "$state/held-w11-captain.meta" "window=$win" "backend=tmux"
+  printf '%s\n' "$held_line" > "$state/held-w11-captain.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w11-captain" | tr ':/.' '___')
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  printf '%s' "$held_line" > "$state/.subsuper-seen-status-$key"
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  : > "$state/.paused-$watcher_key"
+
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 \
+    housekeeping "$state"
+
+  round=1
+  while [ "$round" -le 6 ]; do
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 \
+      handle_wake "stale: $win (idle 5000s, possible wedge, escalation $round)" "$state"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 \
+      housekeeping "$state"
+    round=$((round + 1))
+  done
+
+  [ ! -s "$state/.subsuper-escalations" ] || fail "captain-held pane re-surfaced or wedge-escalated after a durable transfer"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "captain-held pane retained daemon wedge tracking"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "captain-held pane retained daemon pause-recheck tracking"
+  [ ! -e "$state/.paused-$watcher_key" ] || fail "captain-held pane retained watcher pause-recheck tracking"
+  pass "away-mode captain-held panes remain silent past wedge and pause-recheck thresholds"
+}
+
 # A pause whose pane became busy again (the crew resumed) drops its marker without
 # escalating, exactly like a resumed wedge.
 test_housekeeping_paused_resumed_cleared() {
@@ -1847,6 +1885,7 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_housekeeping_captain_held_remains_silent
 test_housekeeping_paused_resumed_cleared
 test_housekeeping_paused_unpaused_cleared
 test_housekeeping_stale_marker_transitions_to_pause
