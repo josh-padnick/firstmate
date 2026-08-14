@@ -89,6 +89,29 @@ fm_linear_iso_from_epoch() {
   fi
 }
 
+fm_linear_normalize_timestamp() {
+  local value=$1 stem base fraction padded
+  case "$value" in
+    ????-??-??T??:??:??Z|????-??-??T??:??:??.*Z) ;;
+    *) return 1 ;;
+  esac
+  fm_linear_epoch "$value" >/dev/null 2>&1 || return 1
+  stem=${value%Z}
+  case "$stem" in
+    *.*)
+      base=${stem%%.*}
+      fraction=${stem#*.}
+      ;;
+    *)
+      base=$stem
+      fraction=
+      ;;
+  esac
+  case "$fraction" in *[!0-9]*) return 1 ;; esac
+  padded="${fraction}000000000"
+  printf '%s.%sZ\n' "$base" "$(printf '%s' "$padded" | cut -c1-9)"
+}
+
 fm_linear_overlap_timestamp() {
   local epoch
   epoch=$(fm_linear_epoch "$1") || return 1
@@ -97,13 +120,18 @@ fm_linear_overlap_timestamp() {
 }
 
 fm_linear_time_self_check() {
-  local epoch iso overlap
+  local epoch iso overlap normalized whole
   epoch=$(fm_linear_epoch 2026-08-14T12:00:00Z) || return 1
   [ "$epoch" = 1786708800 ] || return 1
   iso=$(fm_linear_iso_from_epoch 1786708800) || return 1
   [ "$iso" = 2026-08-14T12:00:00Z ] || return 1
   overlap=$(fm_linear_overlap_timestamp 2026-08-14T12:00:00Z) || return 1
-  [ "$overlap" = 2026-08-14T11:55:00Z ]
+  [ "$overlap" = 2026-08-14T11:55:00Z ] || return 1
+  normalized=$(fm_linear_normalize_timestamp 2026-08-14T12:00:00.5Z) || return 1
+  [ "$normalized" = 2026-08-14T12:00:00.500000000Z ] || return 1
+  whole=$(fm_linear_normalize_timestamp 2026-08-14T12:00:00Z) || return 1
+  [ "$whole" = 2026-08-14T12:00:00.000000000Z ] || return 1
+  [[ "$normalized" > "$whole" ]]
 }
 
 fm_linear_private_dir() {  # <path>

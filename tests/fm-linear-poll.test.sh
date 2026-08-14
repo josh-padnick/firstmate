@@ -155,9 +155,9 @@ pass "seen self-events still reconcile a journal that completed after their firs
 printf 'comments_updated_at=2026-08-14T10:00:00Z\nissues_updated_at=2026-08-14T10:00:00Z\n' > "$home/state/.linear-cursor"
 out=$(run_poll "$home" "$fixtures") || fail "rewound poll failed"
 [ -z "$out" ] || fail "rewound duplicate poll was not silent: $out"
-grep -qx 'comments_updated_at=2026-08-14T11:58:01Z' "$home/state/.linear-cursor" \
+grep -qx 'comments_updated_at=2026-08-14T11:58:01.000000000Z' "$home/state/.linear-cursor" \
   || fail "rewind did not restore the maximum comment timestamp"
-grep -qx 'issues_updated_at=2026-08-14T11:58:04Z' "$home/state/.linear-cursor" \
+grep -qx 'issues_updated_at=2026-08-14T11:58:04.000000000Z' "$home/state/.linear-cursor" \
   || fail "rewind did not restore the maximum issue timestamp"
 pass "rewound cursors safely re-read and restore observed maxima"
 
@@ -278,14 +278,14 @@ FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures" >/dev/null \
 [ "$(jq -r '.complete' "$home/state/.linear-comment-head-bootstrap.json")" = false ] \
   || fail "comment-head bootstrap completed before its final page"
 awk -F '\t' '$1 == "comments" { print $2 }' "$request_log" \
-  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}")' >/dev/null \
+  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00.000000000Z\"}")' >/dev/null \
   || fail "initial captain-event query was not bounded to the bootstrap horizon"
 awk -F '\t' '$1 == "issues" { print $2 }' "$request_log" \
-  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}")' >/dev/null \
+  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00.000000000Z\"}")' >/dev/null \
   || fail "initial issue query was not bounded to the bootstrap horizon"
-grep -qx 'comments_updated_at=2026-08-14T10:00:00Z' "$home/state/.linear-cursor" \
+grep -qx 'comments_updated_at=2026-08-14T10:00:00.000000000Z' "$home/state/.linear-cursor" \
   || fail "empty initial comment ingestion did not establish its bounded cursor"
-grep -qx 'issues_updated_at=2026-08-14T10:00:00Z' "$home/state/.linear-cursor" \
+grep -qx 'issues_updated_at=2026-08-14T10:00:00.000000000Z' "$home/state/.linear-cursor" \
   || fail "empty initial issue ingestion did not establish its bounded cursor"
 fixtures="$TMP_ROOT/bounded-bootstrap-page-two"
 mkdir -p "$fixtures"
@@ -319,8 +319,9 @@ home=$(make_home complete-description)
 fixtures="$TMP_ROOT/complete-description-fixtures"
 description=$(printf 'captain-description-%0500d' 8)
 description_history=$(history description-edit 2026-08-14T11:58:00Z captain-id shared-name Backlog Backlog)
-description_history=$(printf '%s' "$description_history" | jq '
+description_history=$(printf '%s' "$description_history" | jq --arg description "$description" '
   .fromState = null | .toState = null | .updatedDescription = true
+  | .changes={description:["old",$description]}
 ')
 histories=$(jq -nc --argjson h "$description_history" '[$h]')
 edited_issue=$(issue BIG-6 2026-08-14T11:58:01Z captain-id shared-name "$histories" Backlog '' '' "$description")
@@ -351,7 +352,7 @@ created_b=$(issue BIG-12 2026-08-14T11:59:00Z captain-id shared-name '[]' Backlo
 created_b=$(printf '%s' "$created_b" | jq '.createdAt = "2026-08-14T11:58:00Z"')
 issues=$(jq -nc --argjson i "$created_b" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
-out=$(run_poll "$home" "$fixtures") || fail "creation-window description B poll failed"
+out=$(run_poll "$home" "$fixtures" 2>&1) || fail "creation-window description B poll failed: $out"
 assert_contains "$out" "1 non-authoritative observation(s)" "history-free creation-window description edit was silent"
 jq -s -e 'any(.[]; .kind == "issue-created" and .description == "A")
   and any(.[]; .kind == "description" and .source == "issue-snapshot" and .description == "B")' \
@@ -380,6 +381,69 @@ jq -s -e 'any(.[]; .history_id == "mixed-title" and .authority == "captain")
   || fail "history fields were not subtracted from the residual snapshot delta"
 pass "snapshot fallback preserves every field not represented by history"
 
+home=$(make_home same-field-residual)
+fixtures="$TMP_ROOT/same-field-residual-a"
+baseline=$(issue BIG-34 2026-08-14T11:56:00Z firstmate-id shared-name '[]')
+baseline=$(printf '%s' "$baseline" | jq '.title="A"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "same-field residual baseline failed"
+fixtures="$TMP_ROOT/same-field-residual-c"
+title_history=$(history residual-title 2026-08-14T11:57:00Z captain-id shared-name Backlog Backlog)
+title_history=$(printf '%s' "$title_history" | jq '.fromState=null | .toState=null
+  | .fromTitle="A" | .toTitle="B" | .changes={title:["A","B"]}')
+changed=$(issue BIG-34 2026-08-14T11:57:01Z firstmate-id shared-name \
+  "$(jq -nc --argjson h "$title_history" '[$h]')")
+changed=$(printf '%s' "$changed" | jq '.title="C"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "same-field residual poll failed"
+assert_contains "$out" "1 captain input(s)" "logged intermediate title did not surface"
+assert_contains "$out" "1 non-authoritative observation(s)" "history-suppressed final title was subtracted"
+jq -s -e 'any(.[]; .history_id == "residual-title" and .to_title == "B")
+  and any(.[]; .source == "issue-snapshot" and .changes.title == "C")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "snapshot reconciliation did not compare the represented target with the current title"
+pass "snapshot residuals retain later same-field targets"
+
+home=$(make_home creation-window-board)
+fixtures="$TMP_ROOT/creation-window-board-a"
+baseline=$(issue BIG-35 2026-08-14T11:56:00Z captain-id shared-name '[]' Backlog firstmate-id shared-name)
+baseline=$(printf '%s' "$baseline" | jq '.createdAt="2026-08-14T11:55:30Z" | .state.id="backlog-id"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "creation-window board baseline failed"
+fixtures="$TMP_ROOT/creation-window-board-b"
+changed=$(printf '%s' "$baseline" | jq '.updatedAt="2026-08-14T11:57:00Z"
+  | .state={id:"approve-plan-id",name:"Approve Plan"}
+  | .assignee={id:"captain-id",displayName:"shared-name"}')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "creation-window board transition failed"
+assert_contains "$out" "1 non-authoritative observation(s)" "history-free board transition was silent"
+jq -s -e 'any(.[]; .source == "issue-snapshot"
+  and .changes.state.id == "approve-plan-id" and .changes.assignee.id == "captain-id")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "canonical state and assignee IDs were absent from the snapshot delta"
+pass "issue snapshots preserve history-free board transitions"
+
+home=$(make_home description-authority)
+fixtures="$TMP_ROOT/description-authority-a"
+baseline=$(issue BIG-36 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Backlog firstmate-id shared-name A)
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "description authority baseline failed"
+fixtures="$TMP_ROOT/description-authority-c"
+description_history=$(history captain-description 2026-08-14T11:56:30Z captain-id shared-name Backlog Backlog)
+description_history=$(printf '%s' "$description_history" | jq '.fromState=null | .toState=null
+  | .updatedDescription=true | .changes=null')
+changed=$(issue BIG-36 2026-08-14T11:57:00Z other-id shared-name \
+  "$(jq -nc --argjson h "$description_history" '[$h]')" Backlog firstmate-id shared-name C)
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "description authority poll failed"
+assert_not_contains "$out" "captain input(s)" "current non-captain description was attributed to older captain history"
+assert_contains "$out" "1 non-authoritative observation(s)" "unattributed current description was not durable"
+jq -s -e 'all(.[]; .description != "C" or .authority != "captain")
+  and any(.[]; .source == "issue-snapshot" and .description == "C" and .authority == "unattributed")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "description snapshot authority was synthesized from an unrelated history actor"
+pass "description content keeps occurrence-owned authority"
+
 home=$(make_home bootstrap-horizon-retry)
 rm -f "$home/state/.linear-comment-head-bootstrap.json"
 fixtures="$TMP_ROOT/bootstrap-horizon-fail"
@@ -388,7 +452,7 @@ jq -n '{data:{viewer:{id:"firstmate-id"},comments:{pageInfo:{hasNextPage:false,e
   > "$fixtures/01-comment-heads.json"
 printf '{}\n' > "$fixtures/02-fail-500.json"
 run_poll "$home" "$fixtures" >/dev/null 2>&1 && fail "bootstrap failure unexpectedly succeeded"
-[ "$(cat "$home/state/.linear-bootstrap-horizon")" = 2026-08-14T10:00:00Z ] \
+[ "$(cat "$home/state/.linear-bootstrap-horizon")" = 2026-08-14T10:00:00.000000000Z ] \
   || fail "initial bootstrap horizon was not durably fixed before fetching"
 fixtures="$TMP_ROOT/bootstrap-horizon-retry-fixtures"
 make_fixtures "$fixtures" '[]' '[]'
@@ -398,7 +462,7 @@ FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures
   FM_LINEAR_PENDING_ALARM_SECONDS=9999 "$POLL" >/dev/null \
   || fail "bootstrap horizon retry failed"
 awk -F '\t' '$1 == "comments" || $1 == "issues" { print $2 }' "$request_log" \
-  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}"))' \
+  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T10:00:00.000000000Z\"}"))' \
   >/dev/null || fail "cursorless retry drifted its initial ingestion horizon"
 [ ! -e "$home/state/.linear-bootstrap-horizon" ] || fail "completed cursor establishment retained a stale horizon"
 pass "cursorless retries reuse one durable bootstrap horizon"
@@ -477,17 +541,44 @@ fixtures="$TMP_ROOT/thread-routing-self"
 self_reply=$(comment self-thread-reply 2026-08-14T11:57:00Z acknowledged firstmate-id shared-name BIG-14)
 self_reply=$(printf '%s' "$self_reply" | jq '.issue.labels.nodes=[] | .parent={id:"thread-root"}')
 make_fixtures "$fixtures" "$(jq -nc --argjson c "$self_reply" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"thread-root",issue:{identifier:"BIG-14"},parent:null,
+  user:{id:"captain-id"}}}}' > "$fixtures/03-thread-root.json"
 run_poll "$home" "$fixtures" >/dev/null || fail "Firstmate thread participation poll failed"
 fixtures="$TMP_ROOT/thread-routing-followup"
 followup=$(comment bare-followup 2026-08-14T11:58:00Z followup captain-id shared-name BIG-14)
 followup=$(printf '%s' "$followup" | jq '.issue.labels.nodes=[] | .parent={id:"thread-root"}')
 make_fixtures "$fixtures" "$(jq -nc --argjson c "$followup" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"thread-root",issue:{identifier:"BIG-14"},parent:null,
+  user:{id:"captain-id"}}}}' > "$fixtures/03-thread-root.json"
 out=$(run_poll "$home" "$fixtures") || fail "participated-thread follow-up poll failed"
 assert_contains "$out" "1 captain input(s)" "bare follow-up after Firstmate participation was silent"
 jq -s -e 'any(.[]; .comment_id == "thread-root" and .route == "mention")
   and any(.[]; .comment_id == "bare-followup" and .route == "thread")' \
   "$home/state/linear-inbox"/*.json >/dev/null || fail "durable comment routes did not encode mention and thread continuation"
 pass "comment routing persists Firstmate thread participation"
+
+home=$(make_home nested-thread-routing)
+fixtures="$TMP_ROOT/nested-thread-self"
+nested_self=$(comment nested-self 2026-08-14T11:57:00Z acknowledged firstmate-id shared-name BIG-33)
+nested_self=$(printf '%s' "$nested_self" | jq '.issue.labels.nodes=[] | .parent={id:"thread-child"}')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$nested_self" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"thread-child",issue:{identifier:"BIG-33"},parent:{id:"thread-root"},
+  user:{id:"captain-id"}}}}' > "$fixtures/03-thread-child.json"
+jq -n '{data:{comment:{id:"thread-root",issue:{identifier:"BIG-33"},parent:null,
+  user:{id:"captain-id"}}}}' > "$fixtures/04-thread-root.json"
+run_poll "$home" "$fixtures" >/dev/null || fail "nested Firstmate participation poll failed"
+awk -F '\t' '$1 == "thread-root" { found=1 } END { exit !found }' \
+  "$home/state/.linear-thread-participation.tsv" \
+  || fail "nested Firstmate reply retained its immediate parent instead of the canonical root"
+fixtures="$TMP_ROOT/nested-thread-followup"
+nested_followup=$(comment nested-followup 2026-08-14T11:58:00Z followup captain-id shared-name BIG-33)
+nested_followup=$(printf '%s' "$nested_followup" | jq '.issue.labels.nodes=[] | .parent={id:"thread-root"}')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$nested_followup" '[$c]')" '[]'
+jq -n '{data:{comment:{id:"thread-root",issue:{identifier:"BIG-33"},parent:null,
+  user:{id:"captain-id"}}}}' > "$fixtures/03-thread-root.json"
+out=$(run_poll "$home" "$fixtures") || fail "nested-thread captain follow-up poll failed"
+assert_contains "$out" "1 captain input(s)" "canonical nested-thread participation did not wake the later root reply"
+pass "nested participation is retained at the canonical thread root"
 
 home=$(make_home label-only-ownership)
 fixtures="$TMP_ROOT/label-only-ownership-fixtures"
@@ -528,6 +619,7 @@ title_history=$(printf '%s' "$title_history" | jq '.fromState=null | .toState=nu
   | .fromParent={id:"i1",identifier:"BIG-1"} | .toParent={id:"i2",identifier:"BIG-2"}
   | .fromDueDate="2026-08-20" | .toDueDate="2026-08-21"
   | .changes={title:["A","B"],priority:[1,2]}')
+title_history_a=$title_history
 make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$(issue BIG-17 2026-08-14T11:58:01Z captain-id shared-name "$(jq -nc --argjson h "$title_history" '[ $h ]')")" '[$i]')"
 run_poll "$home" "$fixtures" >/dev/null || fail "first amended history poll failed"
 fixtures="$TMP_ROOT/amended-history-b"
@@ -542,7 +634,15 @@ jq -s -e 'map(select(.history_id == "amended-title")) | length == 2
   "$home/state/linear-inbox"/*.json >/dev/null || fail "amended title history was not preserved by derived content"
 [ "$(wc -l < "$home/state/.linear-history-heads.tsv" | tr -d ' ')" = 1 ] \
   || fail "amended history retained more than one latest content head"
-pass "history content heads surface amended issue properties"
+fixtures="$TMP_ROOT/amended-history-revert"
+title_history=$(printf '%s' "$title_history_a" | jq '.updatedAt="2026-08-14T12:00:00Z"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$(issue BIG-17 2026-08-14T12:00:01Z captain-id shared-name "$(jq -nc --argjson h "$title_history" '[ $h ]')")" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "reverted history amendment poll failed"
+assert_contains "$out" "1 captain input(s)" "A-to-B-to-A history amendment collided with the first A occurrence"
+jq -s -e 'map(select(.history_id == "amended-title")) | length == 3
+  and (map(select(.history_id == "amended-title" and .to_title == "B")) | length == 2)' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "history occurrences did not retain both repeated A targets"
+pass "history occurrence keys preserve A-to-B-to-A amendments"
 
 home=$(make_home deep-history-overlap)
 printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' > "$home/state/.linear-cursor"
@@ -579,6 +679,51 @@ jq -s -e 'all(.[]; .history_id != "old-boundary")' "$home/state/linear-inbox"/*.
   || fail "history older than the overlap horizon became a captain event"
 pass "deep history pagination stops at the overlap horizon"
 
+home=$(make_home resumable-deep-history)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \
+  > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/resumable-deep-history-one"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' \
+  > "$fixtures/01-comments.json"
+histories=$(jq -nc '[range(0;10) as $n | {id:("scan-initial-"+($n|tostring)),
+  createdAt:"2026-08-14T11:58:00Z",updatedAt:"2026-08-14T11:58:00Z",changes:{title:["A","B"]},
+  actor:{id:"captain-id",displayName:"shared-name"},fromState:null,toState:null,
+  fromAssignee:null,toAssignee:null,fromTitle:"A",toTitle:"B",updatedDescription:false,
+  addedLabels:[],removedLabels:[]}]')
+scan_issue=$(issue BIG-37 2026-08-14T12:01:00Z captain-id shared-name "$histories")
+scan_issue=$(printf '%s' "$scan_issue" | jq '.history.pageInfo={hasNextPage:true,endCursor:"scan-page-one"}')
+later_issue=$(issue BIG-38 2026-08-14T12:02:00Z captain-id shared-name '[]')
+later_issue=$(printf '%s' "$later_issue" | jq '.createdAt="2026-08-14T12:01:30Z"')
+jq -n --argjson a "$scan_issue" --argjson b "$later_issue" \
+  '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$a,$b]}}}' \
+  > "$fixtures/02-issues.json"
+scan_page=$(history scan-middle 2026-08-14T11:57:30Z captain-id shared-name Backlog Building)
+jq -n --argjson node "$scan_page" \
+  '{data:{issue:{history:{pageInfo:{hasNextPage:true,endCursor:"scan-page-two"},nodes:[$node]}}}}' \
+  > "$fixtures/03-history.json"
+out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
+  || fail "first resumable deep-history poll failed"
+assert_contains "$out" "BIG-38" "deep scan blocked a later captain issue"
+[ -f "$home/state/.linear-history-scans/BIG-37.json" ] \
+  || fail "incomplete deep-history pagination was not checkpointed durably"
+grep -qx 'issues_updated_at=2026-08-14T12:02:00.000000000Z' "$home/state/.linear-cursor" \
+  || fail "an incomplete issue scan blocked the global issue cursor"
+fixtures="$TMP_ROOT/resumable-deep-history-two"
+make_fixtures "$fixtures" '[]' '[]'
+scan_page=$(history scan-final 2026-08-14T11:57:00Z captain-id shared-name Building Backlog)
+jq -n --argjson node "$scan_page" \
+  '{data:{issue:{history:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}}' \
+  > "$fixtures/03-history.json"
+out=$(FM_LINEAR_HISTORY_PAGES_PER_POLL=1 run_poll "$home" "$fixtures") \
+  || fail "resumed deep-history poll failed"
+[ ! -e "$home/state/.linear-history-scans/BIG-37.json" ] \
+  || fail "completed deep-history scan retained its checkpoint"
+jq -s -e 'any(.[]; .history_id == "scan-middle") and any(.[]; .history_id == "scan-final")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "resumed deep-history pages were not durably emitted"
+pass "deep history checkpoints resume without blocking later issues"
+
 home=$(make_home cursor-clamp)
 printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' > "$home/state/.linear-cursor"
 fixtures="$TMP_ROOT/cursor-clamp-fixtures"
@@ -594,11 +739,47 @@ grep -qx 'comments_updated_at=2026-08-14T12:00:00Z' "$home/state/.linear-cursor"
 grep -qx 'issues_updated_at=2026-08-14T12:00:00Z' "$home/state/.linear-cursor" \
   || fail "empty issue page moved the cursor backwards"
 awk -F '\t' '$1 == "comments" || $1 == "issues" { print $2 }' "$request_log" \
-  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T11:55:00Z\"}"))' \
+  | jq -s -e 'length == 2 and all(.[]; .query | contains("updatedAt:{gte:\"2026-08-14T11:55:00.000000000Z\"}"))' \
   >/dev/null || fail "incremental polling did not use the five-minute overlap"
 jq -s -e 'any(.[]; .kind == "issue-created" and .issue == "BIG-19")' \
   "$home/state/linear-inbox"/*.json >/dev/null || fail "lagged issue creation inside overlap was skipped"
 pass "cursor maxima clamp monotonically while creation and queries retain overlap"
+
+home=$(make_home fractional-boundary)
+printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \
+  > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/fractional-boundary-fixtures"
+boundary=$(comment fractional-boundary 2026-08-14T11:55:00.500Z inside captain-id shared-name BIG-39)
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$boundary" '[$c]')" '[]'
+out=$(run_poll "$home" "$fixtures") || fail "fractional boundary poll failed"
+assert_contains "$out" "1 captain input(s)" \
+  "fractional event inside the cutoff second compared before the whole-second boundary"
+jq -s -e 'any(.[]; .comment_id == "fractional-boundary"
+  and .updated_at == "2026-08-14T11:55:00.500000000Z")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "fractional event timestamp was not normalized to fixed precision"
+pass "fractional timestamps compare correctly at overlap boundaries"
+
+home=$(make_home retained-issue-creation)
+printf 'comments_updated_at=2026-08-14T11:55:00Z\nissues_updated_at=2026-08-14T11:55:00Z\n' \
+  > "$home/state/.linear-cursor"
+fixtures="$TMP_ROOT/retained-issue-creation-fixtures"
+created=$(issue BIG-40 2026-08-14T11:58:00Z captain-id shared-name '[]')
+created=$(printf '%s' "$created" | jq '.createdAt="2026-08-14T11:57:59Z"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$created" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "retained issue-creation baseline failed"
+[ "$(pending_count "$home")" = 1 ] || fail "issue creation baseline was not durable"
+for file in "$home/state/linear-inbox"/*.json; do
+  : > "${file%.json}.handled"
+  rm -f -- "$file" "${file%.json}.handled"
+done
+: > "$home/state/.linear-seen.tsv"
+printf 'comments_updated_at=2026-08-14T11:55:00Z\nissues_updated_at=2026-08-14T11:55:00Z\n' \
+  > "$home/state/.linear-cursor"
+out=$(run_poll "$home" "$fixtures") || fail "rewound retained issue-creation poll failed"
+[ -z "$out" ] || fail "retained issue creation replayed after event retention: $out"
+[ "$(pending_count "$home")" = 0 ] || fail "persistent issue head did not suppress recreated issue input"
+pass "issue heads retain immutable creation identity"
 
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)
