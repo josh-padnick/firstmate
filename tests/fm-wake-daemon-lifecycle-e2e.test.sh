@@ -48,6 +48,26 @@ run_watcher_once() {
   wait_for_exit "$!" 50
 }
 
+run_watcher_rearm_window() {
+  local state=$1 fakebin=$2 out=$3 pid i
+  mkdir -p "$state"
+  date '+%s' > "$state/.afk"
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" FM_POLL=1 FM_SIGNAL_GRACE=1 \
+    FM_CHECK_INTERVAL=999999 FM_HEARTBEAT=999999 "$WATCH" >> "$out" &
+  pid=$!
+  i=0
+  while [ "$i" -lt 30 ]; do
+    if ! is_live_non_zombie "$pid"; then
+      wait "$pid" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
 # --- Phase 1: routine self-handled, queued; terminal caught after restart ---
 test_routine_then_terminal_after_restart() {
   local dir state fakebin out drain_out status_file
@@ -153,5 +173,58 @@ test_stale_pane_transient_persistent_resume() {
   pass "lifecycle: stale pane transient self-handles, persistent escalates once and clears, resumed clears quietly"
 }
 
+test_captain_held_rearms_without_duplicate_stale_wakes() {
+  local dir state fakebin out drain_out status_file pane win key watcher_key round wakes
+  dir=$(make_supercase wd-captain-held-rearm)
+  state="$dir/state"
+  fakebin="$dir/fakebin"
+  out="$dir/watch.out"
+  drain_out="$dir/drain.out"
+  status_file="$state/held-w3.status"
+  pane="$dir/pane.txt"
+  win="sess:fm-held-w3"
+  key=$(printf '%s' "held-w3" | tr ':/.' '___')
+  watcher_key=$(printf '%s' "$win" | tr ':/.' '___')
+  fm_write_meta "$state/held-w3.meta" "window=$win" "kind=ship" "harness=pi" "backend=tmux"
+  printf 'captain-held [key=preview]: tracked by held-decision-preview\n' > "$status_file"
+  printf 'idle prompt $\n' > "$pane"
+
+  FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    run_watcher_once "$state" "$fakebin" "$out" || fail "captain-held signal did not exit the away-mode watcher"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "captain-held signal did not cross the watcher boundary"
+  FM_STATE_OVERRIDE="$state" "$DRAIN" > "$drain_out" || fail "captain-held signal drain failed"
+  FM_STATE_OVERRIDE="$state" handle_wake "signal: $status_file" "$state"
+  rm -f "$state/.subsuper-escalations"
+
+  FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    run_watcher_once "$state" "$fakebin" "$out" || fail "captain-held stale did not exit the away-mode watcher"
+  grep -F "stale: $win" "$out" >/dev/null || fail "captain-held stale did not cross the watcher boundary"
+  FM_STATE_OVERRIDE="$state" handle_wake "stale: $win" "$state"
+  [ -e "$state/.stale-$watcher_key" ] || fail "captain-held handling deleted the watcher stale suppressor"
+  [ -e "$state/.paused-$watcher_key" ] || fail "captain-held handling lost the status-change guard"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "captain-held handling retained daemon wedge aging"
+  [ ! -e "$state/.subsuper-paused-$key" ] || fail "captain-held handling retained daemon pause rechecks"
+
+  round=1
+  while [ "$round" -le 3 ]; do
+    FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      run_watcher_rearm_window "$state" "$fakebin" "$out" \
+      || fail "unchanged captain-held pane exited on rearm $round"
+    round=$((round + 1))
+  done
+  wakes=$(awk -F '\t' -v w="$win" '$3 == "stale" && $4 == w { n++ } END { print n + 0 }' "$state/.wake-queue")
+  [ "$wakes" -eq 1 ] || fail "unchanged captain-held pane queued $wakes stale wakes across rearms"
+
+  printf 'working: captain answered, resuming\n' >> "$status_file"
+  FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    run_watcher_once "$state" "$fakebin" "$out" || fail "status change did not exit the away-mode watcher"
+  grep -F "signal: $status_file" "$out" >/dev/null || fail "status change did not cross the watcher boundary"
+  FM_STATE_OVERRIDE="$state" handle_wake "signal: $status_file" "$state"
+  [ ! -e "$state/.stale-$watcher_key" ] || fail "status change retained the captain-held stale suppressor"
+  [ ! -e "$state/.paused-$watcher_key" ] || fail "status change retained the captain-held guard"
+  pass "captain-held away-mode rearms preserve one stale wake until status changes"
+}
+
 test_routine_then_terminal_after_restart
 test_stale_pane_transient_persistent_resume
+test_captain_held_rearms_without_duplicate_stale_wakes

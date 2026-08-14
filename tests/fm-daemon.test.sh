@@ -364,6 +364,10 @@ test_housekeeping_captain_held_remains_silent() {
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   : > "$state/.paused-$watcher_key"
+  printf 'held-pane-hash' > "$state/.stale-$watcher_key"
+  : > "$state/.stale-since-$watcher_key"
+  : > "$state/.wedge-escalations-$watcher_key"
+  : > "$state/.stale-noevidence-$watcher_key"
 
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=240 \
@@ -383,7 +387,13 @@ test_housekeeping_captain_held_remains_silent() {
   [ ! -s "$state/.subsuper-escalations" ] || fail "captain-held pane re-surfaced or wedge-escalated after a durable transfer"
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "captain-held pane retained daemon wedge tracking"
   [ ! -e "$state/.subsuper-paused-$key" ] || fail "captain-held pane retained daemon pause-recheck tracking"
-  [ ! -e "$state/.paused-$watcher_key" ] || fail "captain-held pane retained watcher pause-recheck tracking"
+  [ -e "$state/.paused-$watcher_key" ] || fail "captain-held pane lost its watcher status-change guard"
+  [ "$(cat "$state/.stale-$watcher_key" 2>/dev/null || true)" = 'held-pane-hash' ] || fail "captain-held pane lost its watcher stale suppressor"
+  [ ! -e "$state/.paused-rechecked-$watcher_key" ] || fail "captain-held pane retained watcher pause recheck timing"
+  [ ! -e "$state/.paused-resurfaced-$watcher_key" ] || fail "captain-held pane retained watcher pause resurface timing"
+  [ ! -e "$state/.stale-since-$watcher_key" ] || fail "captain-held pane retained watcher wedge timing"
+  [ ! -e "$state/.wedge-escalations-$watcher_key" ] || fail "captain-held pane retained watcher wedge escalation timing"
+  [ ! -e "$state/.stale-noevidence-$watcher_key" ] || fail "captain-held pane retained watcher no-evidence wedge timing"
   pass "away-mode captain-held panes remain silent past wedge and pause-recheck thresholds"
 }
 

@@ -481,6 +481,17 @@ clear_pause_tracking() {  # <window> <state>
     "$state/.stale-$watcher_key" "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key"
 }
 
+silence_captain_hold_tracking() {  # <window> <state>
+  local win=$1 state=$2 task key watcher_key
+  task=$(window_to_task "$win" "$state")
+  key=$(_stale_key "$task")
+  watcher_key=$(_stale_key "$win")
+  rm -f "$state/.subsuper-paused-$key" "$state/.subsuper-stale-$key" \
+    "$state/.paused-rechecked-$watcher_key" "$state/.paused-resurfaced-$watcher_key" \
+    "$state/.stale-since-$watcher_key" "$state/.wedge-escalations-$watcher_key" "$state/.stale-noevidence-$watcher_key"
+  : > "$state/.paused-$watcher_key"
+}
+
 reconcile_pause_tracking() {  # <window> <state> <last-status-line>
   local win=$1 state=$2 last=$3 task key marker watcher_key
   task=$(window_to_task "$win" "$state")
@@ -491,7 +502,7 @@ reconcile_pause_tracking() {  # <window> <state> <last-status-line>
     stale_marker_remove "$win" "$state"
     pause_marker_record "$win" "$state"
   elif status_is_captain_held "$last"; then
-    clear_pause_tracking "$win" "$state"
+    silence_captain_hold_tracking "$win" "$state"
   elif [ -e "$marker" ] || [ -e "$state/.paused-$watcher_key" ]; then
     clear_pause_tracking "$win" "$state"
   fi
@@ -1255,7 +1266,7 @@ handle_wake() {  # <reason> <state>
       log "self-handle (paused): $reason -> $distilled"
       ;;
     hold)
-      [ "$kind" = "stale" ] && clear_pause_tracking "$arg" "$state"
+      [ "$kind" = "stale" ] && silence_captain_hold_tracking "$arg" "$state"
       log "self-handle (captain-held): $reason -> $distilled"
       ;;
     *)
