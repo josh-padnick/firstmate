@@ -12,7 +12,7 @@ set -u
 ACT="$ROOT/bin/fm-linear-act.sh"
 POLL="$ROOT/bin/fm-linear-poll.sh"
 TMP_ROOT=$(fm_test_tmproot fm-linear-act)
-NOW=$(jq -nr '"2026-08-14T12:00:00Z" | fromdateiso8601')
+NOW=1786708800
 
 make_home() {  # <name>
   local home="$TMP_ROOT/$1"
@@ -161,6 +161,19 @@ assert_contains "$out" "missing LINEAR_CAPTAIN_ID" "missing canonical captain ID
   || fail "missing canonical captain ID created a write journal"
 pass "writes refuse to journal without canonical identity IDs"
 
+home=$(make_home reply-without-assignee-ids)
+printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
+fixtures="$TMP_ROOT/reply-without-assignee-ids-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+comment_fixture "$fixtures/02-comment.json"
+verify_fixture "$fixtures/03-verify.json" Building josh.padnickfirstmate
+run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/comment.md" --parent parent-1 >/dev/null \
+  || fail "comment-only reply required unrelated assignee identities"
+[ "$(find "$home/state/linear-outbox" -name '*.done' | wc -l | tr -d ' ')" = 1 ] \
+  || fail "comment-only reply did not complete its journal"
+pass "comment-only replies do not require assignee identities"
+
 home=$(make_home accepted-comment)
 fixtures="$TMP_ROOT/accepted-comment-kill-fixtures"
 mkdir -p "$fixtures"
@@ -197,6 +210,8 @@ retry_id=$(awk -F '\t' '$1=="commentCreate"{print $2}' "$retry_log" | jq -r '.va
 pass "an accepted comment survives pre-phase SIGKILL without duplication"
 
 home=$(make_home overlap)
+printf '{"after":null,"complete":true}\n' > "$home/state/.linear-comment-head-bootstrap.json"
+chmod 0600 "$home/state/.linear-comment-head-bootstrap.json"
 fixtures="$TMP_ROOT/overlap-act-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"

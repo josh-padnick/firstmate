@@ -45,6 +45,7 @@ fm_linear_load_identity_ids() {
     return 1
   fi
   if [ "$FM_LINEAR_FIRSTMATE_ID" = "$FM_LINEAR_CAPTAIN_ID" ]; then
+    # shellcheck disable=SC2034 # Returned to the sourcing caller as the identity diagnostic.
     FM_LINEAR_IDENTITY_ERROR="LINEAR_FIRSTMATE_ID and LINEAR_CAPTAIN_ID must differ"
     return 1
   fi
@@ -84,15 +85,21 @@ fm_linear_uuid() {
 }
 
 fm_linear_epoch() {
-  local timestamp=$1
-  printf '%s' "$timestamp" | jq -Rr '
-    sub("\\.[0-9]+Z$"; "Z")
-    | try fromdateiso8601 catch empty
-  '
+  local timestamp
+  timestamp=$(printf '%s' "$1" | sed 's/\.[0-9][0-9]*Z$/Z/')
+  if [ "$(uname)" = Darwin ]; then
+    date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$timestamp" '+%s' 2>/dev/null
+  else
+    date -u -d "$timestamp" '+%s' 2>/dev/null
+  fi
 }
 
 fm_linear_iso_from_epoch() {
-  jq -nr --argjson epoch "$1" '$epoch | todateiso8601'
+  if [ "$(uname)" = Darwin ]; then
+    date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null
+  else
+    date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null
+  fi
 }
 
 fm_linear_overlap_timestamp() {

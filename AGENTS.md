@@ -107,7 +107,7 @@ state/               runtime records and signals; gitignored
   x-watch.check.sh   generated Relay poll shim; present only when opted in (section 14)
   fm-linear-inbox.check.sh  generated Linear event-ledger poll shim; hash-registered only after the captain-reviewed activation record exists
   linear-inbox/ linear-outbox/  durable captain-event inbox and journaled Firstmate write intents; linear-operations owns handling
-  .linear-cursor .linear-seen.tsv .linear-comment-heads.tsv .linear-poll-health  server-timestamp cursors, immutable event dedupe, latest comment hashes, and poll health
+  .linear-cursor .linear-seen.tsv .linear-comment-heads.tsv .linear-comment-head-bootstrap.json .linear-issue-heads.json .linear-turn-marker-mismatches.json .linear-poll-health  server-timestamp cursors, immutable event dedupe, latest comment hashes and resumable history scan, issue snapshots, retained invariant failures, and poll health
   pending-replies/   parent-owned secondmate pending-reply records (correlation id, delivery vs reply, recovery, escalation); fm-pending-reply-lib.sh
   procevent/         registered process-to-event sources, one private record per canonical source id; written only by bin/fm-procevent.sh, and their presence alone keeps supervision required (section 13)
   procevent-inbox/   private captured results and their durable handled-acknowledgement markers; source output lives here and never in an event line

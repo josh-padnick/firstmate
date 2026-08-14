@@ -12,13 +12,16 @@ set -u
 
 POLL="$ROOT/bin/fm-linear-poll.sh"
 TMP_ROOT=$(fm_test_tmproot fm-linear-poll)
-NOW=$(jq -nr '"2026-08-14T12:00:00Z" | fromdateiso8601')
+NOW=1786708800
 
 make_home() {  # <name>
   local home="$TMP_ROOT/$1"
   mkdir -p "$home/state"
-  printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
+  printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\nLINEAR_CAPTAIN_ID=captain-id\n' \
+    > "$home/.env"
+  printf '{"after":null,"complete":true}\n' > "$home/state/.linear-comment-head-bootstrap.json"
   chmod 0600 "$home/.env"
+  chmod 0600 "$home/state/.linear-comment-head-bootstrap.json"
   printf '%s\n' "$home"
 }
 
@@ -211,6 +214,54 @@ out=$(run_poll "$home" "$fixtures") || fail "old unchanged parent bump poll fail
 [ "$(pending_count "$home")" = 0 ] || fail "old unchanged parent bump created a durable duplicate"
 pass "latest comment heads outlive event retention and silence old bumps"
 
+home=$(make_home bounded-bootstrap)
+rm -f "$home/state/.linear-comment-head-bootstrap.json"
+fixtures="$TMP_ROOT/bounded-bootstrap-page-one"
+mkdir -p "$fixtures"
+old_one=$(comment old-one 2025-01-01T00:00:00Z old captain-id shared-name BIG-4)
+jq -n --argjson node "$old_one" '
+  {data:{viewer:{id:"firstmate-id"},comments:{
+    pageInfo:{hasNextPage:true,endCursor:"older-page"},nodes:[$node]}}}
+' > "$fixtures/01-comment-heads.json"
+make_fixtures "$fixtures/normal" '[]' '[]'
+mv "$fixtures/normal/01-comments.json" "$fixtures/02-comments.json"
+mv "$fixtures/normal/02-issues.json" "$fixtures/03-issues.json"
+rmdir "$fixtures/normal"
+request_log="$home/bootstrap.log"
+FM_LINEAR_FIXTURE_LOG="$request_log" run_poll "$home" "$fixtures" >/dev/null \
+  || fail "bounded comment-head bootstrap page one failed"
+[ "$(jq -r '.after' "$home/state/.linear-comment-head-bootstrap.json")" = older-page ] \
+  || fail "comment-head bootstrap did not retain its resume cursor"
+[ "$(jq -r '.complete' "$home/state/.linear-comment-head-bootstrap.json")" = false ] \
+  || fail "comment-head bootstrap completed before its final page"
+awk -F '\t' '$1 == "comments" { print $2 }' "$request_log" \
+  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}")' >/dev/null \
+  || fail "initial captain-event query was not bounded to the bootstrap horizon"
+awk -F '\t' '$1 == "issues" { print $2 }' "$request_log" \
+  | jq -e '.query | contains("updatedAt:{gte:\"2026-08-14T10:00:00Z\"}")' >/dev/null \
+  || fail "initial issue query was not bounded to the bootstrap horizon"
+grep -qx 'comments_updated_at=2026-08-14T10:00:00Z' "$home/state/.linear-cursor" \
+  || fail "empty initial comment ingestion did not establish its bounded cursor"
+grep -qx 'issues_updated_at=2026-08-14T10:00:00Z' "$home/state/.linear-cursor" \
+  || fail "empty initial issue ingestion did not establish its bounded cursor"
+fixtures="$TMP_ROOT/bounded-bootstrap-page-two"
+mkdir -p "$fixtures"
+old_two=$(comment old-two 2024-01-01T00:00:00Z older captain-id shared-name BIG-4)
+jq -n --argjson node "$old_two" '
+  {data:{viewer:{id:"firstmate-id"},comments:{
+    pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}
+' > "$fixtures/01-comment-heads.json"
+make_fixtures "$fixtures/normal" '[]' '[]'
+mv "$fixtures/normal/01-comments.json" "$fixtures/02-comments.json"
+mv "$fixtures/normal/02-issues.json" "$fixtures/03-issues.json"
+rmdir "$fixtures/normal"
+run_poll "$home" "$fixtures" >/dev/null || fail "bounded comment-head bootstrap resume failed"
+[ "$(jq -r '.complete' "$home/state/.linear-comment-head-bootstrap.json")" = true ] \
+  || fail "comment-head bootstrap did not complete after its final page"
+[ "$(wc -l < "$home/state/.linear-comment-heads.tsv" | tr -d ' ')" = 2 ] \
+  || fail "resumable bootstrap did not retain every historical comment head"
+pass "initial bootstrap is bounded and resumes historical comment heads"
+
 home=$(make_home complete-body)
 long_body=$(printf 'captain-%0500d' 7)
 fixtures="$TMP_ROOT/complete-body-fixtures"
@@ -245,6 +296,26 @@ jq -s -e --arg description "firstmate $description" '
   || fail "issue creation omitted the complete observed description"
 pass "the durable inbox preserves complete observed issue descriptions"
 
+home=$(make_home creation-window-description)
+fixtures="$TMP_ROOT/creation-window-description-a"
+created_a=$(issue BIG-12 2026-08-14T11:58:30Z captain-id shared-name '[]' Backlog firstmate-id shared-name A)
+created_a=$(printf '%s' "$created_a" | jq '.createdAt = "2026-08-14T11:58:00Z"')
+issues=$(jq -nc --argjson i "$created_a" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+run_poll "$home" "$fixtures" >/dev/null || fail "creation-window description A poll failed"
+fixtures="$TMP_ROOT/creation-window-description-b"
+created_b=$(issue BIG-12 2026-08-14T11:59:00Z captain-id shared-name '[]' Backlog firstmate-id shared-name B)
+created_b=$(printf '%s' "$created_b" | jq '.createdAt = "2026-08-14T11:58:00Z"')
+issues=$(jq -nc --argjson i "$created_b" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "creation-window description B poll failed"
+assert_contains "$out" "1 captain input(s)" "history-free creation-window description edit was silent"
+jq -s -e 'any(.[]; .kind == "issue-created" and .description == "A")
+  and any(.[]; .kind == "description" and .source == "issue-snapshot" and .description == "B")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "creation-window description snapshots did not preserve both observed bodies"
+pass "issue snapshots preserve history-free creation-window description edits"
+
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)
 printf 'comments_updated_at=2026-08-14T11:00:00Z\nissues_updated_at=2026-08-14T11:00:00Z\n' > "$home/state/.linear-cursor"
@@ -272,7 +343,7 @@ pass "every inability to poll becomes a loud, durable failure episode"
 # T9 and T11: old pending inputs and turn-marker drift announce every sweep.
 home=$(make_home alarms)
 fixtures="$TMP_ROOT/alarm-fixtures"
-bad_issue=$(issue BIG-9 2026-08-14T11:59:00Z firstmate-id shared-name '[]' 'Approve Deliverable' firstmate-id shared-name)
+bad_issue=$(issue BIG-9 2026-08-14T11:59:00Z firstmate-id shared-name '[]' 'Approve Deliverable' impostor-id josh.padnick)
 issues=$(jq -nc --argjson i "$bad_issue" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
 mkdir -p "$home/state/linear-inbox"
@@ -283,7 +354,17 @@ chmod 0600 "$home/state/linear-inbox/stale.json"
 out=$(FM_LINEAR_PENDING_ALARM_SECONDS=300 run_poll "$home" "$fixtures") || fail "alarm poll failed"
 assert_contains "$out" "UNHANDLED captain inputs" "stale pending event was silent"
 assert_contains "$out" "TURN-MARKER MISMATCH BIG-9" "board invariant mismatch was silent"
-pass "stale pending events and turn-marker drift wake loudly"
+fixtures="$TMP_ROOT/alarm-empty-fixtures"
+make_fixtures "$fixtures" '[]' '[]'
+out=$(run_poll "$home" "$fixtures") || fail "retained mismatch poll failed"
+assert_contains "$out" "TURN-MARKER MISMATCH BIG-9" "unresolved turn-marker mismatch expired from the incremental page"
+fixtures="$TMP_ROOT/alarm-resolved-fixtures"
+good_issue=$(issue BIG-9 2026-08-14T12:00:00Z firstmate-id shared-name '[]' 'Approve Deliverable' captain-id renamed-captain)
+issues=$(jq -nc --argjson i "$good_issue" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "canonical mismatch resolution poll failed"
+assert_not_contains "$out" "TURN-MARKER MISMATCH BIG-9" "canonical assignment did not resolve the retained mismatch"
+pass "stale pending events and canonical turn-marker drift wake loudly"
 
 home=$(make_home unknown-status)
 fixtures="$TMP_ROOT/unknown-status-fixtures"
@@ -302,13 +383,20 @@ assert_contains "$out" "acknowledged unknown status QA (BIG-10)" "acknowledgment
 out=$(run_poll "$home" "$fixtures") || fail "acknowledged unknown-status poll failed"
 assert_not_contains "$out" "UNKNOWN STATUS" "exact issue-status acknowledgment did not silence the occurrence"
 fixtures="$TMP_ROOT/issue-scoped-unknown-fixtures"
-unknown_issue=$(issue BIG-10 2026-08-14T12:00:00Z captain-id shared-name '[]' QA)
+unknown_issue=$(issue BIG-10 2026-08-14T11:59:00Z captain-id shared-name '[]' QA)
 other_unknown_issue=$(issue BIG-11 2026-08-14T12:00:01Z captain-id shared-name '[]' QA)
 issues=$(jq -nc --argjson a "$unknown_issue" --argjson b "$other_unknown_issue" '[$a,$b]')
 make_fixtures "$fixtures" '[]' "$issues"
 out=$(run_poll "$home" "$fixtures") || fail "issue-scoped unknown-status poll failed"
 assert_not_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "BIG-11 invalidated BIG-10's exact acknowledgment"
 assert_contains "$out" "UNKNOWN STATUS QA (BIG-11)" "BIG-10's acknowledgment silenced BIG-11"
+fixtures="$TMP_ROOT/unknown-status-unlogged-reentry-fixtures"
+unknown_issue=$(issue BIG-10 2026-08-14T12:00:05Z captain-id shared-name '[]' QA)
+issues=$(jq -nc --argjson i "$unknown_issue" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "unlogged unknown-status reentry poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" \
+  "acknowledgment survived an updated snapshot whose status continuity was unprovable"
 fixtures="$TMP_ROOT/unknown-status-direct-reentry-fixtures"
 left_qa=$(history left-qa 2026-08-14T12:00:10Z captain-id shared-name QA Backlog)
 reentered_qa=$(history reentered-qa 2026-08-14T12:00:11Z captain-id shared-name Backlog QA)
@@ -371,7 +459,8 @@ out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
   fm_custom_check_snapshot_cleanup
 ' _ "$ROOT" "$home/state" 2>&1 || true)
 assert_contains "$out" "missing LINEAR_API_KEY" "established shim did not announce a missing key"
-printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
+printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\nLINEAR_CAPTAIN_ID=captain-id\n' \
+  > "$home/.env"
 rm -f "$home/config/linear-event-ledger-activation"
 for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
   printf 'legacy\n' > "$home/state/$legacy"

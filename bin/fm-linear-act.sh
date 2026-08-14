@@ -73,22 +73,27 @@ api() {  # <operation> <payload-file> <response-file>
 resolve_issue() {  # <BIG-n> <target-status-or-empty> <target-role-or-empty> <output>
   local issue=$1 status=$2 role=$3 output=$4 payload="$TMP_ROOT/resolve-payload.json" response="$TMP_ROOT/resolve-response.json"
   local query assignee_id viewer_id
-  fm_linear_load_identity_ids || die "$FM_LINEAR_IDENTITY_ERROR"
-  # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($issue:String!){viewer{id} issue(id:$issue){id state{id name} assignee{id displayName} team{states{nodes{id name}}}}}'
+  if [ -n "$status" ]; then
+    fm_linear_load_identity_ids || die "$FM_LINEAR_IDENTITY_ERROR"
+    # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+    query='query($issue:String!){viewer{id} issue(id:$issue){id state{id name} assignee{id displayName} team{states{nodes{id name}}}}}'
+  else
+    # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
+    query='query($issue:String!){issue(id:$issue){id state{id name} assignee{id displayName}}}'
+  fi
   jq -n --arg query "$query" --arg issue "$issue" \
     '{query:$query,variables:{issue:$issue}}' > "$payload" || die "cannot build issue lookup"
   api resolve "$payload" "$response"
   jq -e '.data.issue.id != null' "$response" >/dev/null 2>&1 || die "issue not found: $issue"
-  viewer_id=$(jq -r '.data.viewer.id // empty' "$response")
-  [ "$viewer_id" = "$FM_LINEAR_FIRSTMATE_ID" ] \
-    || die "LINEAR_FIRSTMATE_ID does not match the authenticated Linear viewer"
   if [ -z "$status" ]; then
     jq '.data.issue | {issue_id:.id, current_state:.state.name,
         current_assignee:(.assignee.displayName // "")}' \
       "$response" > "$output" || die "cannot parse issue lookup"
     return 0
   fi
+  viewer_id=$(jq -r '.data.viewer.id // empty' "$response")
+  [ "$viewer_id" = "$FM_LINEAR_FIRSTMATE_ID" ] \
+    || die "LINEAR_FIRSTMATE_ID does not match the authenticated Linear viewer"
   if [ "$role" = captain ]; then assignee_id=$FM_LINEAR_CAPTAIN_ID; else assignee_id=$FM_LINEAR_FIRSTMATE_ID; fi
   jq --arg status "$status" --arg assignee_id "$assignee_id" '
     .data.issue as $issue
