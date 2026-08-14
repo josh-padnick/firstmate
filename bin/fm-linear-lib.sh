@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Shared primitives for the Linear event ledger and outbound write journal.
+# Usage: source bin/fm-linear-lib.sh from fm-linear-poll.sh, fm-linear-act.sh, or fm-bootstrap.sh.
 #
 # This file is sourced by fm-linear-poll.sh, fm-linear-act.sh, and bootstrap.
 # It owns Linear credential resolution, private state publication, fixture-backed

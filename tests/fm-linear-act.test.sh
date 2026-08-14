@@ -42,9 +42,12 @@ comment_fixture() {  # <file>
   jq -n '{data:{commentCreate:{success:true,comment:{id:"__COMMENT_ID__"}}}}' > "$1"
 }
 
-verify_fixture() {  # <file> <status> <assignee>
-  jq -n --arg status "$2" --arg assignee "$3" '
-    {data:{issue:{state:{name:$status},assignee:{displayName:$assignee}},comment:{id:"__COMMENT_ID__"}}}
+verify_fixture() {  # <file> <status> <assignee> [assignee-id]
+  jq -n --arg status "$2" --arg assignee "$3" --arg assignee_id "${4:-}" '
+    {data:{issue:{state:{name:$status},assignee:{
+      id:(if $assignee_id != "" then $assignee_id
+          elif $assignee == "josh.padnick" then "captain-id" else "firstmate-id" end),
+      displayName:$assignee}},comment:{id:"__COMMENT_ID__"}}}
   ' > "$1"
 }
 
@@ -70,6 +73,20 @@ assert_contains "$out" "read-back mismatch" "stale board read-back did not fail 
 [ "$(find "$home/state/linear-outbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
   || fail "read-back mismatch did not retain the unfinished journal"
 pass "write success requires matching state, assignee, and comment read-back"
+
+home=$(make_home assignee-id-mismatch)
+fixtures="$TMP_ROOT/assignee-id-mismatch-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_fixture "$fixtures/02-mutate.json"
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
+out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
+  --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
+assert_contains "$out" "read-back mismatch" "same-name wrong-ID assignee passed read-back"
+[ "$(find "$home/state/linear-outbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
+  || fail "assignee ID mismatch did not retain the unfinished journal"
+pass "write read-back verifies stable assignee identity"
 
 # T10 crash contract: mutation and assignee are sent in one request, a SIGKILL
 # leaves one journal, and resume posts exactly one stable client comment ID.

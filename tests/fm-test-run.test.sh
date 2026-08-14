@@ -116,7 +116,10 @@ init_changed_fixture_repo() {
   : >"$repo/tests/lib.sh"
   : >"$repo/tests/fm-backend-herdr-eventwait.test.py"
   : >"$repo/bin/fm-supervisor-target-lib.sh"
+  : >"$repo/bin/fm-bootstrap.sh"
   : >"$repo/bin/unmapped-source.sh"
+  printf '#!/usr/bin/env bash\n# tests/lib.sh\n' >"$repo/tests/fm-linear-poll.test.sh"
+  chmod +x "$repo/tests/fm-linear-poll.test.sh"
   printf '# .claude/settings.json\n# .pi/extensions/fm-primary-turnend-guard.ts\n' \
     >>"$repo/tests/fm-cd-pretool-check.test.sh"
   printf '# .pi/extensions/fm-primary-pi-watch.ts\n' >>"$repo/tests/fm-pi-watch-extension.test.sh"
@@ -158,6 +161,13 @@ test_changed_dependency_selection_and_unmapped_failure() {
   assert_contains "$listed" "tests/fm-afk-return.test.sh" "supervisor target selects afk coverage"
   git -C "$repo" add bin/fm-supervisor-target-lib.sh
   git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm supervisor-change
+
+  printf '\n' >>"$repo/bin/fm-bootstrap.sh"
+  listed=$(cd "$repo" && bin/fm-test-run.sh --list --changed --base HEAD)
+  assert_contains "$listed" "tests/fm-session-start.test.sh" "bootstrap selects session coverage"
+  assert_contains "$listed" "tests/fm-linear-poll.test.sh" "bootstrap selects Linear activation coverage"
+  git -C "$repo" add bin/fm-bootstrap.sh
+  git -C "$repo" -c user.name=test -c user.email=test@example.invalid commit -qm bootstrap-change
 
   printf '\n' >>"$repo/.agents/skills/example/SKILL.md"
   printf '\n' >>"$repo/.claude/settings.json"

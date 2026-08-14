@@ -51,10 +51,11 @@ history() {  # <id> <created> <actor-id> <actor-name> <from> <to> [to-assignee-i
   '
 }
 
-issue() {  # <id> <updated> <creator-id> <creator-name> <history-json> [status] [assignee-id] [assignee-name]
+issue() {  # <id> <updated> <creator-id> <creator-name> <history-json> [status] [assignee-id] [assignee-name] [description]
   jq -nc --arg id "$1" --arg updated "$2" --arg creator_id "$3" --arg creator "$4" --argjson history "$5" \
-    --arg status "${6:-Backlog}" --arg assignee_id "${7:-}" --arg assignee "${8:-}" '
-    {identifier:$id,title:"fixture",description:"",updatedAt:$updated,
+    --arg status "${6:-Backlog}" --arg assignee_id "${7:-}" --arg assignee "${8:-}" \
+    --arg description "${9:-}" '
+    {identifier:$id,title:"fixture",description:$description,updatedAt:$updated,
      createdAt:"2026-08-01T00:00:00Z",state:{name:$status},
      assignee:(if $assignee_id == "" then null else {id:$assignee_id,displayName:$assignee} end),
      creator:{id:$creator_id,displayName:$creator},labels:{nodes:[]},
@@ -198,6 +199,30 @@ body_file=$(find "$home/state/linear-inbox" -type f -name '*.json' | head -n 1)
 [ "$(jq -r '.body' "$body_file")" = "$long_body" ] || fail "durable inbox truncated the observed captain comment"
 pass "the durable inbox preserves the complete observed comment body"
 
+home=$(make_home complete-description)
+fixtures="$TMP_ROOT/complete-description-fixtures"
+description=$(printf 'captain-description-%0500d' 8)
+description_history=$(history description-edit 2026-08-14T11:58:00Z captain-id shared-name Backlog Backlog)
+description_history=$(printf '%s' "$description_history" | jq '
+  .fromState = null | .toState = null | .updatedDescription = true
+')
+histories=$(jq -nc --argjson h "$description_history" '[$h]')
+edited_issue=$(issue BIG-6 2026-08-14T11:58:01Z captain-id shared-name "$histories" Backlog '' '' "$description")
+created_issue=$(issue BIG-7 2026-08-14T11:59:01Z captain-id shared-name '[]' Backlog '' '' "firstmate $description")
+created_issue=$(printf '%s' "$created_issue" | jq '.createdAt = "2026-08-14T11:59:00Z"')
+issues=$(jq -nc --argjson a "$edited_issue" --argjson b "$created_issue" '[$a,$b]')
+make_fixtures "$fixtures" '[]' "$issues"
+run_poll "$home" "$fixtures" >/dev/null || fail "complete description poll failed"
+jq -s -e --arg description "$description" '
+  any(.[]; .kind == "description" and .description == $description)
+' "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "description edit omitted the complete observed description"
+jq -s -e --arg description "firstmate $description" '
+  any(.[]; .kind == "issue-created" and .description == $description)
+' "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "issue creation omitted the complete observed description"
+pass "the durable inbox preserves complete observed issue descriptions"
+
 # T8: transport, JSON, and missing-key failures are loud and preserve cursors.
 home=$(make_home failures)
 printf 'comments_updated_at=2026-08-14T11:00:00Z\nissues_updated_at=2026-08-14T11:00:00Z\n' > "$home/state/.linear-cursor"
@@ -262,14 +287,24 @@ make_fixtures "$fixtures" '[]' "$issues"
 out=$(run_poll "$home" "$fixtures") || fail "issue-scoped unknown-status poll failed"
 assert_not_contains "$out" "UNKNOWN STATUS QA (BIG-10)" "BIG-11 invalidated BIG-10's exact acknowledgment"
 assert_contains "$out" "UNKNOWN STATUS QA (BIG-11)" "BIG-10's acknowledgment silenced BIG-11"
+fixtures="$TMP_ROOT/unknown-status-direct-reentry-fixtures"
+left_qa=$(history left-qa 2026-08-14T12:00:10Z captain-id shared-name QA Backlog)
+reentered_qa=$(history reentered-qa 2026-08-14T12:00:11Z captain-id shared-name Backlog QA)
+histories=$(jq -nc --argjson a "$left_qa" --argjson b "$reentered_qa" '[$a,$b]')
+unknown_issue=$(issue BIG-10 2026-08-14T12:00:12Z captain-id shared-name "$histories" QA)
+issues=$(jq -nc --argjson i "$unknown_issue" '[$i]')
+make_fixtures "$fixtures" '[]' "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "direct unknown-status reentry poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" \
+  "acknowledgment survived a leave-and-reenter sequence between polls"
 fixtures="$TMP_ROOT/known-status-fixtures"
-known_issue=$(issue BIG-10 2026-08-14T12:00:00Z captain-id shared-name '[]' Backlog)
-other_known_issue=$(issue BIG-11 2026-08-14T12:00:01Z captain-id shared-name '[]' Backlog)
+known_issue=$(issue BIG-10 2026-08-14T12:00:20Z captain-id shared-name '[]' Backlog)
+other_known_issue=$(issue BIG-11 2026-08-14T12:00:21Z captain-id shared-name '[]' Backlog)
 issues=$(jq -nc --argjson a "$known_issue" --argjson b "$other_known_issue" '[$a,$b]')
 make_fixtures "$fixtures" '[]' "$issues"
 run_poll "$home" "$fixtures" >/dev/null || fail "known-status transition poll failed"
 fixtures="$TMP_ROOT/unknown-status-return-fixtures"
-unknown_issue=$(issue BIG-10 2026-08-14T12:01:00Z captain-id shared-name '[]' QA)
+unknown_issue=$(issue BIG-10 2026-08-14T12:00:30Z captain-id shared-name '[]' QA)
 issues=$(jq -nc --argjson i "$unknown_issue" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
 out=$(run_poll "$home" "$fixtures") || fail "returned unknown-status poll failed"
@@ -314,7 +349,42 @@ out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" bash -c '
   fm_custom_check_snapshot_cleanup
 ' _ "$ROOT" "$home/state" 2>&1 || true)
 assert_contains "$out" "missing LINEAR_API_KEY" "established shim did not announce a missing key"
-pass "captain approval gates cutover and the registered watcher path runs the replacement"
+printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
+rm -f "$home/config/linear-event-ledger-activation"
+for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
+  printf 'legacy\n' > "$home/state/$legacy"
+done
+out=$(FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" 2>/dev/null)
+assert_contains "$out" "unapproved event-ledger poll disarmed" \
+  "bootstrap did not report disarming a pre-existing unapproved replacement"
+[ ! -e "$home/state/fm-linear-inbox.check.sh" ] || fail "pre-existing shim bypassed captain approval"
+[ ! -e "$home/state/fm-linear-inbox.check-trust" ] || fail "pre-existing shim retained watcher trust without approval"
+[ ! -e "$home/config/x-mode.env" ] || fail "unapproved replacement retained the 30-second cadence"
+for legacy in .linear-absorb .linear-state-snapshot .linear-inbox-seen .linear-comment-cursor; do
+  [ -e "$home/state/$legacy" ] || fail "unapproved replacement removed legacy state/$legacy"
+done
+pass "captain approval is required for pre-existing replacement artifacts"
+
+printf 'approved\n' > "$home/config/linear-event-ledger-activation"
+FM_HOME="$home" FM_BOOTSTRAP_NETWORK=skip "$ROOT/bin/fm-bootstrap.sh" >/dev/null 2>&1
+fake_bin="$TMP_ROOT/slow-linear-bin"
+mkdir -p "$fake_bin"
+cat > "$fake_bin/curl" <<'SH'
+#!/usr/bin/env bash
+sleep 3
+exit 7
+SH
+chmod +x "$fake_bin/curl"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_CHECK_TIMEOUT=5 \
+  FM_LINEAR_POLL_DEADLINE_SECONDS=1 PATH="$fake_bin:$PATH" bash -c '
+  . "$1/bin/fm-watch.sh"
+  fm_custom_check_snapshot_prepare "$2" fm-linear-inbox || exit 1
+  run_check "$FM_CUSTOM_CHECK_SNAPSHOT"
+  fm_custom_check_snapshot_cleanup
+' _ "$ROOT" "$home/state" 2>&1 || true)
+assert_contains "$out" "complete poll exceeded 1s deadline" \
+  "registered poll timeout was discarded by the watcher"
+pass "registered Linear polls fail loudly before the watcher deadline"
 
 # A hard kill must not make the lock a permanent silent outage.
 home=$(make_home stale-lock)

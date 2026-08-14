@@ -12,6 +12,7 @@
 # Set FM_LINEAR_FIXTURE_DIR to replace HTTP with lexically ordered canned GraphQL
 # responses consumed in request order.
 # Set FM_LINEAR_FIXTURE_LOG to record each fixture-backed request for tests.
+# Set FM_LINEAR_POLL_DEADLINE_SECONDS below 25 to shorten the complete poll bound.
 # Set FM_LINEAR_TIMING=1 to print phase timestamps to stderr for diagnostics.
 set -u
 
@@ -22,6 +23,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 
 # shellcheck source=bin/fm-linear-lib.sh
 . "$SCRIPT_DIR/fm-linear-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 
 CURSOR_FILE="$STATE/.linear-cursor"
 SEEN_FILE="$STATE/.linear-seen.tsv"
@@ -218,14 +221,15 @@ append_initial_histories() {  # <issues-response> <page-number>
   nodes="$TMP_ROOT/history-initial-$page.json"
   jq '[.data.issues.nodes[] as $issue
         | $issue.history.nodes[]?
-        | . + {issue:$issue.identifier}]' "$response" > "$nodes" || return 1
+        | . + {issue:$issue.identifier, observedDescription:($issue.description // "")}]' \
+    "$response" > "$nodes" || return 1
   json_array_append "$TMP_ROOT/history.json" "$nodes"
 }
 
 fetch_more_history() {  # <issue-id> <after>
   local issue=$1 after=$2 page=0 payload response nodes has_next end_cursor query
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($id:String!,$after:String){issue(id:$id){history(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id createdAt actor{id displayName} fromState{name} toState{name} fromAssignee{id displayName} toAssignee{id displayName} updatedDescription addedLabels{name} removedLabels{name}}}}}'
+  query='query($id:String!,$after:String){issue(id:$id){description history(first:10,after:$after){pageInfo{hasNextPage endCursor} nodes{id createdAt actor{id displayName} fromState{name} toState{name} fromAssignee{id displayName} toAssignee{id displayName} updatedDescription addedLabels{name} removedLabels{name}}}}}'
   while :; do
     page=$((page + 1))
     [ "$page" -le "${FM_LINEAR_MAX_HISTORY_PAGES:-100}" ] || {
@@ -242,7 +246,8 @@ fetch_more_history() {  # <issue-id> <after>
       return 1
     }
     nodes="$TMP_ROOT/history-$issue-nodes-$page.json"
-    jq --arg issue "$issue" '[.data.issue.history.nodes[] | . + {issue:$issue}]' \
+    jq --arg issue "$issue" '[.data.issue as $issue_data | $issue_data.history.nodes[]
+      | . + {issue:$issue, observedDescription:($issue_data.description // "")}]' \
       "$response" > "$nodes" || return 1
     json_array_append "$TMP_ROOT/history.json" "$nodes" || return 1
     has_next=$(jq -r '.data.issue.history.pageInfo.hasNextPage // false' "$response")
@@ -422,7 +427,7 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
 
 derive_history() {  # <observed-at> <bootstrap-cutoff>
   local observed=$1 bootstrap_cutoff=$2 id actor_id actor issue created key kind record has_board has_description has_labels
-  local to_state to_assignee_id to_assignee from_state from_assignee added_b64 removed_b64
+  local to_state to_assignee_id to_assignee from_state from_assignee description_b64 added_b64 removed_b64
   jq -r 'sort_by(.createdAt, .id)[]
     | [(.id // "__FM_LINEAR_EMPTY__"), (.actor.id // "__FM_LINEAR_EMPTY__"),
        (.actor.displayName // "unknown"), (.issue // "unknown"),
@@ -435,12 +440,13 @@ derive_history() {  # <observed-at> <bootstrap-cutoff>
        (.toAssignee.displayName // "__FM_LINEAR_EMPTY__"),
        (.fromState.name // "__FM_LINEAR_EMPTY__"),
        (.fromAssignee.displayName // "__FM_LINEAR_EMPTY__"),
+       ("b:" + ((.observedDescription // "") | @base64)),
        ((.addedLabels // [] | map(.name) | tojson) | @base64),
        ((.removedLabels // [] | map(.name) | tojson) | @base64)]
     | @tsv
   ' "$TMP_ROOT/history.json" > "$TMP_ROOT/history-rows.tsv" || return 1
   while IFS="$(printf '\t')" read -r id actor_id actor issue created has_board has_description has_labels \
-    to_state to_assignee_id to_assignee from_state from_assignee added_b64 removed_b64; do
+    to_state to_assignee_id to_assignee from_state from_assignee description_b64 added_b64 removed_b64; do
     [ "$id" != __FM_LINEAR_EMPTY__ ] || id=
     [ "$actor_id" != __FM_LINEAR_EMPTY__ ] || actor_id=
     [ "$created" != __FM_LINEAR_EMPTY__ ] || created=
@@ -449,6 +455,7 @@ derive_history() {  # <observed-at> <bootstrap-cutoff>
     [ "$to_assignee" != __FM_LINEAR_EMPTY__ ] || to_assignee=
     [ "$from_state" != __FM_LINEAR_EMPTY__ ] || from_state=
     [ "$from_assignee" != __FM_LINEAR_EMPTY__ ] || from_assignee=
+    description_b64=${description_b64#b:}
     [ -n "$id" ] && [ -n "$created" ] || return 1
     key="history:$id"
     if seen_has "$key"; then
@@ -481,7 +488,8 @@ derive_history() {  # <observed-at> <bootstrap-cutoff>
       --arg cutoff "$bootstrap_cutoff" --arg issue "$issue" --arg id "$id" \
       --arg created "$created" --arg from_state "$from_state" --arg to_state "$to_state" \
       --arg from_assignee "$from_assignee" --arg to_assignee "$to_assignee" \
-      --arg description "$has_description" --arg added "$added_b64" --arg removed "$removed_b64" '
+      --arg description_updated "$has_description" --arg description "$description_b64" \
+      --arg added "$added_b64" --arg removed "$removed_b64" '
         {kind:$kind, issue:$issue, history_id:$id, author:$actor,
          author_id:(if $actor_id == "" then null else $actor_id end),
          created_at:$created, updated_at:$created, observed_at:$observed,
@@ -489,9 +497,10 @@ derive_history() {  # <observed-at> <bootstrap-cutoff>
          to_state:(if $to_state == "" then null else $to_state end),
          from_assignee:(if $from_assignee == "" then null else $from_assignee end),
          to_assignee:(if $to_assignee == "" then null else $to_assignee end),
-         description_updated:($description == "true"),
+         description_updated:($description_updated == "true"),
          added_labels:($added | @base64d | fromjson),
          removed_labels:($removed | @base64d | fromjson)}
+        + (if $description_updated == "true" then {description:($description | @base64d)} else {} end)
         + (if $cutoff != "" and $created >= $cutoff then {bootstrap:true} else {} end)
       ' > "$record" || return 1
     publish_inbox "$key" "$record" || return 1
@@ -528,7 +537,7 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
       {kind:"issue-created", issue:.identifier, author:(.creator.displayName // "unknown"),
        author_id:(.creator.id // null),
        created_at:.createdAt, updated_at:.updatedAt, observed_at:$observed,
-       title:(.title // ""), labels:[.labels.nodes[].name]}
+       title:(.title // ""), description:(.description // ""), labels:[.labels.nodes[].name]}
       + (if $cutoff != "" and .createdAt >= $cutoff then {bootstrap:true} else {} end)
     ' > "$record" || return 1
     publish_inbox "$key" "$record" || return 1
@@ -539,13 +548,14 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
 }
 
 audit_invariants() {
-  local row issue status assignee role expected current next kept
+  local row issue status updated assignee role expected current next kept previous previous_status occurrence entry_id
   current="$TMP_ROOT/unknown-status-current.tsv"
   next="$TMP_ROOT/unknown-status-next.tsv"
   kept="$TMP_ROOT/unknown-status-acks-kept.tsv"
   if [ -e "$UNKNOWN_FILE" ]; then
     [ -f "$UNKNOWN_FILE" ] && [ ! -L "$UNKNOWN_FILE" ] || return 1
-    cp "$UNKNOWN_FILE" "$current" || return 1
+    awk -F '\t' 'NF >= 3 { print $1 "\t" $2 "\t" $3; next }
+      NF == 2 { print $1 "\t" $2 "\tlegacy" }' "$UNKNOWN_FILE" > "$current" || return 1
   else
     : > "$current"
   fi
@@ -553,7 +563,11 @@ audit_invariants() {
   while IFS= read -r row; do
     issue=$(printf '%s' "$row" | jq -r '.identifier // "unknown"')
     status=$(printf '%s' "$row" | jq -r '.state.name // "unknown"')
+    updated=$(printf '%s' "$row" | jq -r '.updatedAt // "unknown"')
     assignee=$(printf '%s' "$row" | jq -r '.assignee.displayName // "unassigned"')
+    previous=$(awk -F '\t' -v issue="$issue" '$1 == issue { print $2 "\t" $3; exit }' "$current")
+    previous_status=${previous%%"$(printf '\t')"*}
+    [ "$previous_status" != "$previous" ] || previous_status=
     awk -F '\t' -v issue="$issue" '$1 != issue' "$current" > "$next" || return 1
     mv -f -- "$next" "$current" || return 1
     if role=$(fm_linear_status_role "$status"); then
@@ -562,13 +576,24 @@ audit_invariants() {
         || printf 'linear: TURN-MARKER MISMATCH %s (%s assigned to %s, expected %s)\n' \
           "$issue" "$status" "$assignee" "$expected"
     elif ! fm_linear_status_known_without_turn_marker "$status"; then
-      printf '%s\t%s\n' "$issue" "$status" >> "$current" || return 1
+      entry_id=$(jq -r --arg issue "$issue" --arg status "$status" '
+        [.[] | select(.issue == $issue and .toState.name == $status)]
+        | sort_by(.createdAt, .id) | last | .id // empty
+      ' "$TMP_ROOT/history.json") || return 1
+      if [ -n "$entry_id" ]; then
+        occurrence="history:$entry_id"
+      elif [ "$previous_status" = "$status" ]; then
+        occurrence=${previous#*"$(printf '\t')"}
+      else
+        occurrence="snapshot:$updated"
+      fi
+      printf '%s\t%s\t%s\n' "$issue" "$status" "$occurrence" >> "$current" || return 1
     fi
   done < "$TMP_ROOT/audit-rows.jsonl"
-  while IFS="$(printf '\t')" read -r issue status; do
+  while IFS="$(printf '\t')" read -r issue status occurrence; do
     [ -n "$issue" ] || continue
-    if ! awk -F '\t' -v issue="$issue" -v status="$status" \
-      '$1 == issue && $2 == status { found=1 } END { exit !found }' \
+    if ! awk -F '\t' -v issue="$issue" -v status="$status" -v occurrence="$occurrence" \
+      '$1 == issue && $2 == status && $3 == occurrence { found=1 } END { exit !found }' \
       "$UNKNOWN_ACK_FILE" 2>/dev/null; then
       printf 'linear: UNKNOWN STATUS %s (%s)\n' "$status" "$issue"
     fi
@@ -576,8 +601,8 @@ audit_invariants() {
   fm_linear_atomic_file "$UNKNOWN_FILE" 600 < "$current" || return 1
   if [ -e "$UNKNOWN_ACK_FILE" ]; then
     [ -f "$UNKNOWN_ACK_FILE" ] && [ ! -L "$UNKNOWN_ACK_FILE" ] || return 1
-    awk -F '\t' 'NR == FNR { current[$1 FS $2]=1; next }
-      current[$1 FS $2] { print }' "$current" "$UNKNOWN_ACK_FILE" > "$kept" || return 1
+    awk -F '\t' 'NR == FNR { current[$1 FS $2 FS $3]=1; next }
+      current[$1 FS $2 FS $3] { print }' "$current" "$UNKNOWN_ACK_FILE" > "$kept" || return 1
     fm_linear_atomic_file "$UNKNOWN_ACK_FILE" 600 < "$kept" || return 1
   fi
 }
@@ -682,7 +707,7 @@ timing_mark() {  # <label>
 }
 
 acknowledge_unknown_status() {  # <issue> <status>
-  local issue=$1 status=$2 lock_status next
+  local issue=$1 status=$2 lock_status next occurrence
   case "$issue" in BIG-[0-9]*) ;; *) printf 'linear: invalid issue identifier: %s\n' "$issue" >&2; return 2 ;; esac
   case "$status" in *"$(printf '\t')"*|*$'\n'*) printf 'linear: invalid status name\n' >&2; return 2 ;; esac
   fm_linear_private_dir "$STATE" || return 1
@@ -693,8 +718,9 @@ acknowledge_unknown_status() {  # <issue> <status>
     printf 'linear: unknown status occurrence is not current: %s (%s)\n' "$status" "$issue" >&2
     return 1
   }
-  awk -F '\t' -v issue="$issue" -v status="$status" \
-    '$1 == issue && $2 == status { found=1 } END { exit !found }' "$UNKNOWN_FILE" || {
+  occurrence=$(awk -F '\t' -v issue="$issue" -v status="$status" \
+    '$1 == issue && $2 == status { print $3; exit }' "$UNKNOWN_FILE")
+  [ -n "$occurrence" ] || {
     printf 'linear: unknown status occurrence is not current: %s (%s)\n' "$status" "$issue" >&2
     return 1
   }
@@ -707,7 +733,7 @@ acknowledge_unknown_status() {  # <issue> <status>
   else
     : > "$next"
   fi
-  printf '%s\t%s\n' "$issue" "$status" >> "$next" || return 1
+  printf '%s\t%s\t%s\n' "$issue" "$status" "$occurrence" >> "$next" || return 1
   fm_linear_atomic_file "$UNKNOWN_ACK_FILE" 600 < "$next" || return 1
   printf 'linear: acknowledged unknown status %s (%s)\n' "$status" "$issue"
 }
@@ -822,8 +848,41 @@ main() {
   fi
 }
 
+run_bounded_poll() {
+  local seconds watcher_seconds output status=0
+  seconds=${FM_LINEAR_POLL_DEADLINE_SECONDS:-25}
+  case "$seconds" in ''|*[!0-9]*|0) seconds=25 ;; esac
+  [ "$seconds" -le 25 ] || seconds=25
+  watcher_seconds=${FM_CHECK_TIMEOUT:-30}
+  case "$watcher_seconds" in ''|*[!0-9]*|0|1) watcher_seconds=30 ;; esac
+  [ "$seconds" -lt "$watcher_seconds" ] || seconds=$((watcher_seconds - 1))
+  output=$(mktemp "${TMPDIR:-/tmp}/fm-linear-poll-output.XXXXXX") || {
+    record_failure "cannot create bounded poll output"
+    return 1
+  }
+  if (export FM_LINEAR_POLL_CHILD=1; fm_run_timed "$seconds" "$0") > "$output" 2>&1; then
+    status=0
+  else
+    status=$?
+  fi
+  cat "$output"
+  if [ "$status" -eq 124 ]; then
+    record_failure "complete poll exceeded ${seconds}s deadline"
+  elif [ "$status" -ne 0 ] && ! grep -q '^linear:' "$output"; then
+    record_failure "poll exited with status $status"
+  fi
+  rm -f -- "$output"
+  return "$status"
+}
+
 case "${1:-}" in
-  '') main ;;
+  '')
+    if [ "${FM_LINEAR_POLL_CHILD:-0}" = 1 ]; then
+      main
+    else
+      run_bounded_poll
+    fi
+    ;;
   acknowledge-unknown-status)
     [ "$#" -eq 3 ] || { printf 'usage: fm-linear-poll.sh acknowledge-unknown-status <BIG-n> <status>\n' >&2; exit 2; }
     acknowledge_unknown_status "$2" "$3"

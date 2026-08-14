@@ -195,22 +195,23 @@ post_comment() {  # <journal>
 
 verify_journal() {  # <journal>
   local journal=$1 payload="$TMP_ROOT/verify-payload.json" response="$TMP_ROOT/verify-response.json" query
-  local target_state expected_assignee actual_state actual_assignee comment_id comment_seen completed
+  local target_state expected_assignee_id actual_state actual_assignee_id actual_assignee comment_id comment_seen completed
   target_state=$(jq -r '.target_state // empty' "$journal")
+  expected_assignee_id=$(jq -r '.assignee_id // empty' "$journal")
   comment_id=$(jq -r '.comment_id' "$journal")
   # shellcheck disable=SC2016 # GraphQL variables use literal dollar signs.
-  query='query($issue:String!,$comment:String!){issue(id:$issue){state{name} assignee{displayName}} comment(id:$comment){id}}'
+  query='query($issue:String!,$comment:String!){issue(id:$issue){state{name} assignee{id displayName}} comment(id:$comment){id}}'
   jq -n --arg query "$query" --arg issue "$(jq -r '.issue_id' "$journal")" --arg comment "$comment_id" \
     '{query:$query,variables:{issue:$issue,comment:$comment}}' > "$payload" || die "cannot build read-back query"
   api verify "$payload" "$response"
   actual_state=$(jq -r '.data.issue.state.name // empty' "$response")
+  actual_assignee_id=$(jq -r '.data.issue.assignee.id // empty' "$response")
   actual_assignee=$(jq -r '.data.issue.assignee.displayName // empty' "$response")
   comment_seen=$(jq -r '.data.comment.id // empty' "$response")
   [ "$comment_seen" = "$comment_id" ] || die "read-back did not find comment $comment_id"
   if [ -n "$target_state" ]; then
-    if [ "$(fm_linear_status_role "$target_state")" = captain ]; then expected_assignee=$CAPTAIN_NAME; else expected_assignee=$SELF_NAME; fi
-    [ "$actual_state" = "$target_state" ] && [ "$actual_assignee" = "$expected_assignee" ] \
-      || die "read-back mismatch for $(jq -r '.issue' "$journal"): state=$actual_state assignee=$actual_assignee"
+    [ "$actual_state" = "$target_state" ] && [ "$actual_assignee_id" = "$expected_assignee_id" ] \
+      || die "read-back mismatch for $(jq -r '.issue' "$journal"): state=$actual_state assignee=$actual_assignee ($actual_assignee_id)"
   fi
   update_journal_phase "$journal" verified
   completed=${journal%.json}.done
