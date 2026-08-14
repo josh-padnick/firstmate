@@ -92,6 +92,7 @@ request_log="$home/request.log"
 self_comment=$(comment self-comment 2026-08-14T11:58:00Z own firstmate-id shared-name BIG-1)
 captain_comment=$(comment captain-comment 2026-08-14T11:58:01Z captain captain-id shared-name BIG-1)
 self_history=$(history self-history 2026-08-14T11:58:02Z firstmate-id shared-name Backlog Building firstmate-id shared-name)
+self_history=$(printf '%s' "$self_history" | jq '.fromState.id="backlog-id" | .toState.id="building-id"')
 captain_history=$(history captain-history 2026-08-14T11:58:03Z captain-id shared-name Building Backlog)
 comments=$(jq -nc --argjson a "$self_comment" --argjson b "$captain_comment" '[$a,$b]')
 histories=$(jq -nc --argjson a "$self_history" --argjson b "$captain_history" '[$a,$b]')
@@ -139,7 +140,9 @@ fixtures=$idempotence_fixtures
 # A write can finish after its self-events were first observed.
 # Re-reading a seen self-event must still close the outbound observation loop.
 mkdir -p "$home/state/linear-outbox"
-jq -n '{issue:"BIG-1",target_state:"Building",assignee_id:"firstmate-id",comment_id:"self-comment"}' \
+jq -n '{issue:"BIG-1",target_state:"Building",state_id:"building-id",
+  assignee_id:"firstmate-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:58:02Z",comment_id:"self-comment"}' \
   > "$home/state/linear-outbox/late-journal.done"
 chmod 0700 "$home/state/linear-outbox"
 chmod 0600 "$home/state/linear-outbox/late-journal.done"
@@ -156,15 +159,18 @@ fixtures="$TMP_ROOT/observation-marker-symlink-fixtures"
 self_comment=$(comment marker-self-comment 2026-08-14T11:58:00Z own firstmate-id shared-name BIG-44)
 self_history=$(history marker-self-history 2026-08-14T11:58:01Z firstmate-id shared-name Backlog Building \
   firstmate-id shared-name)
+self_history=$(printf '%s' "$self_history" | jq '.fromState.id="backlog-id" | .toState.id="building-id"')
 comments=$(jq -nc --argjson c "$self_comment" '[$c]')
-issues=$(jq -nc --argjson i "$(issue BIG-44 2026-08-14T11:58:02Z firstmate-id shared-name \
-  "$(jq -nc --argjson h "$self_history" '[$h]')" Building firstmate-id shared-name)" '[$i]')
+marker_issue=$(issue BIG-44 2026-08-14T11:58:02Z firstmate-id shared-name \
+  "$(jq -nc --argjson h "$self_history" '[$h]')" Building firstmate-id shared-name)
+marker_issue=$(printf '%s' "$marker_issue" | jq '.state.id="building-id"')
+issues=$(jq -nc --argjson i "$marker_issue" '[$i]')
 make_fixtures "$fixtures" "$comments" "$issues"
 run_poll "$home" "$fixtures" >/dev/null || fail "observation marker baseline poll failed"
 mkdir -p "$home/state/linear-outbox"
 jq -n '{issue:"BIG-44",target_state:"Building",state_id:"building-id",
   assignee_id:"firstmate-id",mutation_sent:true,
-  mutated_updated_at:"2026-08-14T11:58:02Z",comment_id:"marker-self-comment"}' \
+  mutated_updated_at:"2026-08-14T11:58:01Z",comment_id:"marker-self-comment"}' \
   > "$home/state/linear-outbox/observed-journal.done"
 comment_target="$home/dangling-comment-target"
 ln -s "$comment_target" "$home/state/linear-outbox/observed-journal.comment-observed"
@@ -510,6 +516,31 @@ jq -s -e 'any(.[]; .source == "issue-snapshot" and .authority == "unattributed"
   || fail "unmatched snapshot board delta marked an outbox write observed"
 pass "snapshot reconciliation requires exact IDs and mutation provenance"
 
+home=$(make_home exact-history-observation)
+mkdir -p "$home/state/linear-outbox"
+jq -n '{issue:"BIG-49",target_state:"Approve Deliverable",state_id:"approve-id",
+  assignee_id:"captain-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:57:00Z",comment_id:null}' \
+  > "$home/state/linear-outbox/stale-pair.done"
+jq -n '{issue:"BIG-49",target_state:"Approve Deliverable",state_id:"approve-id",
+  assignee_id:"captain-id",mutation_sent:true,
+  mutated_updated_at:"2026-08-14T11:58:00Z",comment_id:null}' \
+  > "$home/state/linear-outbox/exact-pair.done"
+fixtures="$TMP_ROOT/exact-history-observation-fixtures"
+self_board=$(history exact-self-board 2026-08-14T11:58:00Z firstmate-id shared-name Building 'Approve Deliverable' \
+  captain-id shared-name)
+self_board=$(printf '%s' "$self_board" | jq '.fromState.id="building-id" | .toState.id="approve-id"')
+changed=$(issue BIG-49 2026-08-14T11:58:01Z firstmate-id shared-name \
+  "$(jq -nc --argjson h "$self_board" '[$h]')" 'Approve Deliverable' captain-id shared-name)
+changed=$(printf '%s' "$changed" | jq '.state.id="approve-id"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "exact history observation poll failed"
+[ -f "$home/state/linear-outbox/exact-pair.board-observed" ] \
+  || fail "exact mutation history did not satisfy board observation"
+[ ! -e "$home/state/linear-outbox/stale-pair.board-observed" ] \
+  || fail "a later same-pair history occurrence satisfied stale mutation provenance"
+pass "board observation requires exact mutation occurrence provenance"
+
 home=$(make_home description-authority)
 fixtures="$TMP_ROOT/description-authority-a"
 baseline=$(issue BIG-36 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Backlog firstmate-id shared-name A)
@@ -816,6 +847,58 @@ jq -s -e 'any(.[]; .history_id == "scan-middle") and any(.[]; .history_id == "sc
   || fail "resumed deep-history horizon did not preserve history and creation events"
 pass "deep history checkpoints retain their original ingestion horizon"
 
+home=$(make_home deep-history-snapshots)
+fixtures="$TMP_ROOT/deep-history-snapshot-baseline"
+baseline=$(issue BIG-48 2026-08-14T11:55:00Z captain-id shared-name '[]' Backlog firstmate-id shared-name A)
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "deep-history snapshot baseline failed"
+histories=$(jq -nc '[range(0;10) as $n | {id:("snapshot-initial-"+($n|tostring)),
+  createdAt:"2026-08-14T11:54:00Z",updatedAt:"2026-08-14T11:54:00Z",changes:null,
+  actor:{id:"captain-id",displayName:"shared-name"},fromState:null,toState:null,
+  fromAssignee:null,toAssignee:null,updatedDescription:false,addedLabels:[],removedLabels:[]}]')
+fixtures="$TMP_ROOT/deep-history-snapshot-b"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/01-comments.json"
+snapshot_b=$(issue BIG-48 2026-08-14T11:56:00Z captain-id shared-name "$histories" \
+  Backlog firstmate-id shared-name B)
+snapshot_b=$(printf '%s' "$snapshot_b" | jq '.history.pageInfo={hasNextPage:true,endCursor:"snapshot-page-one"}')
+jq -n --argjson issue "$snapshot_b" \
+  '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$issue]}}}' \
+  > "$fixtures/02-issues.json"
+middle=$(history snapshot-middle 2026-08-14T11:53:00Z captain-id shared-name Backlog Backlog)
+middle=$(printf '%s' "$middle" | jq '.fromState=null | .toState=null')
+jq -n --argjson node "$middle" \
+  '{data:{issue:{history:{pageInfo:{hasNextPage:true,endCursor:"snapshot-page-two"},nodes:[$node]}}}}' \
+  > "$fixtures/03-history.json"
+run_poll "$home" "$fixtures" >/dev/null || fail "first deep-history snapshot sweep failed"
+jq -e '.snapshots | length == 1 and .[0].description == "B"' \
+  "$home/state/.linear-history-scans/BIG-48.json" >/dev/null \
+  || fail "incomplete deep scan did not durably retain snapshot B"
+fixtures="$TMP_ROOT/deep-history-snapshot-c"
+mkdir -p "$fixtures"
+jq -n '{data:{viewer:{id:"firstmate-id",displayName:"shared-name"},comments:{
+  pageInfo:{hasNextPage:false,endCursor:null},nodes:[]}}}' > "$fixtures/01-comments.json"
+snapshot_c=$(printf '%s' "$snapshot_b" | jq '.updatedAt="2026-08-14T11:57:00Z" | .description="C"')
+jq -n --argjson issue "$snapshot_c" \
+  '{data:{issues:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$issue]}}}' \
+  > "$fixtures/02-issues.json"
+final=$(history snapshot-final 2026-08-14T11:49:00Z captain-id shared-name Backlog Backlog)
+final=$(printf '%s' "$final" | jq '.fromState=null | .toState=null')
+jq -n --argjson node "$final" \
+  '{data:{issue:{history:{pageInfo:{hasNextPage:false,endCursor:null},nodes:[$node]}}}}' \
+  > "$fixtures/03-history.json"
+out=$(run_poll "$home" "$fixtures") || fail "completed deep-history snapshot sweep failed"
+assert_contains "$out" "2 non-authoritative observation(s)" \
+  "deep scan completion collapsed fetched snapshots B and C"
+jq -s -e 'map(select(.issue == "BIG-48" and .source == "issue-snapshot")) as $events
+  | ($events | length) == 2
+  and any($events[]; .description == "B" and .changes.description == "B")
+  and any($events[]; .description == "C" and .changes.description == "C")' \
+  "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "deep scan did not reconcile every retained snapshot version in order"
+pass "deep history scans preserve every fetched snapshot version"
+
 home=$(make_home deep-scan-turn-mismatch)
 printf 'comments_updated_at=2026-08-14T12:00:00Z\nissues_updated_at=2026-08-14T12:00:00Z\n' \
   > "$home/state/.linear-cursor"
@@ -1113,6 +1196,27 @@ make_fixtures "$fixtures" '[]' "$issues"
 out=$(run_poll "$home" "$fixtures") || fail "direct unknown-status reentry poll failed"
 assert_contains "$out" "UNKNOWN STATUS QA (BIG-10)" \
   "acknowledgment survived a leave-and-reenter sequence between polls"
+unknown_status_home=$home
+home=$(make_home unknown-status-old-history)
+fixtures="$TMP_ROOT/unknown-status-old-history-a"
+old_entry=$(history old-qa-entry 2026-08-14T11:58:00Z captain-id shared-name Backlog QA)
+old_issue=$(issue BIG-50 2026-08-14T11:59:00Z captain-id shared-name \
+  "$(jq -nc --argjson h "$old_entry" '[$h]')" QA)
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$old_issue" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "old-history unknown baseline failed"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" "$POLL" acknowledge-unknown-status BIG-50 QA \
+  >/dev/null || fail "old-history unknown acknowledgment failed"
+fixtures="$TMP_ROOT/unknown-status-old-history-b"
+reentered=$(printf '%s' "$old_issue" | jq '.updatedAt="2026-08-14T12:00:05Z"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$reentered" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "old-history unknown reentry poll failed"
+assert_contains "$out" "UNKNOWN STATUS QA (BIG-50)" \
+  "an acknowledged historical entry suppressed a newer snapshot reentry"
+grep -Fq $'BIG-50\tQA\tsnapshot:2026-08-14T12:00:05.000000000Z' \
+  "$home/state/.linear-unknown-status.tsv" \
+  || fail "unproven unknown-status continuity reused the old history occurrence"
+pass "unknown-status reentry rejects history before the prior issue head"
+home=$unknown_status_home
 fixtures="$TMP_ROOT/known-status-fixtures"
 known_issue=$(issue BIG-10 2026-08-14T12:00:20Z captain-id shared-name '[]' Backlog)
 other_known_issue=$(issue BIG-11 2026-08-14T12:00:21Z captain-id shared-name '[]' Backlog)

@@ -410,13 +410,26 @@ resume_journal() {  # <journal>
 }
 
 resume_all() {
-  local journal found=0
+  local journal found=0 failures=0 journal_tmp
   for journal in "$OUTBOX"/*.json; do
     [ -f "$journal" ] || continue
     found=1
-    resume_journal "$journal"
+    journal_tmp=$(mktemp -d "${TMPDIR:-/tmp}/fm-linear-resume.XXXXXX") \
+      || die "cannot create journal recovery workspace"
+    if (
+      trap - EXIT HUP INT TERM
+      TMP_ROOT=$journal_tmp
+      resume_journal "$journal"
+    ); then
+      :
+    else
+      failures=$((failures + 1))
+      printf 'linear: WRITE RESUME FAILED: %s\n' "${journal##*/}" >&2
+    fi
+    rm -rf -- "$journal_tmp"
   done
   [ "$found" -eq 1 ] || printf 'linear: no unfinished writes\n'
+  [ "$failures" -eq 0 ]
 }
 
 make_repair_comment() {  # <issue> <status> <assignee> <output>

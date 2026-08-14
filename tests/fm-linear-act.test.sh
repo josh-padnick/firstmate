@@ -223,6 +223,36 @@ assert_contains "$out" "ambiguous state mutation recovery" \
   || fail "ambiguous accepted mutation posted an irreversible comment"
 pass "accepted pre-phase mutations require durable provenance before comment"
 
+home=$(make_home isolated-resume)
+mkdir -p "$home/state/linear-outbox"
+jq -n '{version:3,issue:"BIG-1",issue_id:"issue-1",target_state:null,
+  comment_id:"broken-comment-1",phase:"journaled"}' \
+  > "$home/state/linear-outbox/01-broken.json"
+jq -n '{version:3,issue:"BIG-2",issue_id:"issue-2",target_state:null,
+  comment_id:"broken-comment-2",phase:"journaled"}' \
+  > "$home/state/linear-outbox/02-broken.json"
+jq -n '{version:3,issue:"BIG-3",issue_id:"issue-3",target_state:null,
+  comment_id:"resume-good-comment",phase:"verified"}' \
+  > "$home/state/linear-outbox/03-good.json"
+chmod 0600 "$home/state/linear-outbox"/*.json
+fixtures="$TMP_ROOT/isolated-resume-fixtures"
+mkdir -p "$fixtures"
+verify_fixture "$fixtures/01-verify.json" Building josh.padnickfirstmate firstmate-id
+resume_rc=0
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1) || resume_rc=$?
+[ "$resume_rc" -ne 0 ] || fail "resume reported success despite failed journals"
+assert_contains "$out" "WRITE RESUME FAILED: 01-broken.json" \
+  "resume omitted deterministic context for its first failed journal"
+assert_contains "$out" "WRITE RESUME FAILED: 02-broken.json" \
+  "resume stopped before reporting its second failed journal"
+[ -f "$home/state/linear-outbox/01-broken.json" ] \
+  && [ -f "$home/state/linear-outbox/02-broken.json" ] \
+  || fail "failed journals were not retained for supported recovery"
+[ -f "$home/state/linear-outbox/03-good.done" ] \
+  || fail "a failed journal blocked an independent later issue from resuming"
+pass "resume isolates journal failures and continues independent issues"
+
 home=$(make_home mutation-same-pair-conflict)
 fixtures="$TMP_ROOT/mutation-same-pair-kill-fixtures"
 mkdir -p "$fixtures"

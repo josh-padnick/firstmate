@@ -565,8 +565,11 @@ fetch_more_history() {  # <scan-file>
     after=$end_cursor
     if [ "$has_next" != true ] \
       || { [ -n "$threshold" ] && [ -n "$oldest" ] && [[ "$oldest" < "$threshold" ]]; }; then
-      jq -n --slurpfile scan "$scan" \
-        '[$scan[0].issue_node + {_scan_threshold:$scan[0].threshold}]' > "$nodes" || return 1
+      jq -n --slurpfile scan "$scan" '
+        ($scan[0].snapshots // [$scan[0].issue_node])
+        | sort_by(.updatedAt)
+        | map(. + {_scan_threshold:$scan[0].threshold})
+      ' > "$nodes" || return 1
       json_array_append "$TMP_ROOT/issues.json" "$nodes" || return 1
       jq -n --slurpfile scan "$scan" \
         '$scan[0].nodes | map(. + {_scan_threshold:$scan[0].threshold})' > "$nodes" || return 1
@@ -652,6 +655,8 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
         jq -n --slurpfile old "$scan" --argjson issue_node "$issue_json" \
           --argjson additions "$history_json" --arg after "$history_after" --arg threshold "$threshold" '
           $old[0]
+          | .snapshots=(((.snapshots // [.issue_node]) + [$issue_node])
+              | unique_by(.updatedAt) | sort_by(.updatedAt))
           | if .issue_node.updatedAt == $issue_node.updatedAt then .
             else .issue_node=$issue_node | .after=$after
               | .nodes=((.nodes + $additions) | unique_by([.id,.updatedAt,(.changes|tostring)]))
@@ -661,7 +666,8 @@ fetch_issues() {  # <cursor> <bootstrap-cutoff>
       else
         jq -n --arg issue "$issue" --arg after "$history_after" --arg threshold "$threshold" \
           --argjson issue_node "$issue_json" --argjson nodes "$history_json" \
-          '{issue:$issue,after:$after,threshold:$threshold,issue_node:$issue_node,nodes:$nodes}' \
+          '{issue:$issue,after:$after,threshold:$threshold,issue_node:$issue_node,
+            snapshots:[$issue_node],nodes:$nodes}' \
           | fm_linear_atomic_file "$scan" 600 || return 1
       fi
     done < "$page_history_list"
@@ -755,25 +761,6 @@ mark_outbox_comment_observed() {  # <comment-id>
   done
 }
 
-mark_outbox_board_observed() {  # <issue> <to-state> <to-assignee-id>
-  local issue=$1 to_state=$2 to_assignee_id=$3 journal target_state expected_assignee_id marker
-  [ -d "$OUTBOX" ] || return 0
-  for journal in "$OUTBOX"/*.done; do
-    [ -f "$journal" ] || continue
-    [ ! -L "$journal" ] || {
-      FM_LINEAR_API_ERROR="unsafe completed write journal: ${journal##*/}"
-      return 1
-    }
-    [ "$(jq -r '.issue // empty' "$journal" 2>/dev/null)" = "$issue" ] || continue
-    target_state=$(jq -r '.target_state // empty' "$journal" 2>/dev/null)
-    [ -n "$target_state" ] || continue
-    expected_assignee_id=$(jq -r '.assignee_id // empty' "$journal" 2>/dev/null)
-    [ "$to_state" = "$target_state" ] && [ "$to_assignee_id" = "$expected_assignee_id" ] || continue
-    marker="${journal%.*}.board-observed"
-    publish_outbox_observation_marker "$marker" || return 1
-  done
-}
-
 reconcile_outbox_snapshot_board() {  # <issue> <updated-at> <state-id> <assignee-id>
   local issue=$1 updated=$2 state_id=$3 assignee_id=$4 journal journal_updated marker
   [ -d "$OUTBOX" ] || return 1
@@ -801,6 +788,16 @@ reconcile_outbox_snapshot_board() {  # <issue> <updated-at> <state-id> <assignee
     return 0
   done
   return 1
+}
+
+mark_outbox_board_observed() {  # <issue> <updated-at> <to-state-id> <to-assignee-id>
+  local status
+  if reconcile_outbox_snapshot_board "$1" "$2" "$3" "$4"; then
+    return 0
+  else
+    status=$?
+    [ "$status" -eq 1 ] || return 1
+  fi
 }
 
 reconcile_fetched_outbox_boards() {
@@ -960,7 +957,7 @@ derive_comments() {  # <observed-at> <bootstrap-cutoff>
 
 derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
   local observed=$1 event_cutoff=$2 bootstrap_cutoff=$3 row content id actor_id issue created updated hash key kind record row_cutoff
-  local has_board has_description has_labels has_other to_state to_assignee_id authority
+  local has_board has_description has_labels has_other to_state_id to_assignee_id authority
   jq -c 'sort_by((.updatedAt // .createdAt), .id)[]' "$TMP_ROOT/history.json" \
     > "$TMP_ROOT/history-rows.jsonl" || return 1
   while IFS= read -r row; do
@@ -998,11 +995,11 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     has_other=$(printf '%s' "$row" | jq -r '.fromTitle != null or .toTitle != null
       or .fromPriority != null or .toPriority != null or .fromProject != null or .toProject != null
       or .fromParent != null or .toParent != null or .fromDueDate != null or .toDueDate != null')
-    to_state=$(printf '%s' "$row" | jq -r '.toState.name // empty')
+    to_state_id=$(printf '%s' "$row" | jq -r '.toState.id // empty')
     to_assignee_id=$(printf '%s' "$row" | jq -r '.toAssignee.id // empty')
     if history_hash_current "$id" "$hash"; then
       if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ] && [ "$has_board" = true ]; then
-        mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id" || return 1
+        mark_outbox_board_observed "$issue" "$updated" "$to_state_id" "$to_assignee_id" || return 1
       fi
       continue
     fi
@@ -1013,7 +1010,7 @@ derive_history() {  # <observed-at> <event-cutoff> <bootstrap-cutoff>
     if [ -n "$actor_id" ] && [ "$actor_id" = "$SELF_ID" ]; then
       history_hash_set "$id" "$hash" "$updated" || return 1
       if [ "$has_board" = true ]; then
-        mark_outbox_board_observed "$issue" "$to_state" "$to_assignee_id" || return 1
+        mark_outbox_board_observed "$issue" "$updated" "$to_state_id" "$to_assignee_id" || return 1
       fi
       continue
     fi
@@ -1078,7 +1075,7 @@ prepare_issue_heads() {
 }
 
 issue_creation_known() {  # <issue>
-  jq -e --arg issue "$1" '.[$issue] != null' "$TMP_ROOT/issue-heads-before.json" >/dev/null 2>&1
+  jq -e --arg issue "$1" '.[$issue] != null' "$TMP_ROOT/issue-heads-next.json" >/dev/null 2>&1
 }
 
 issue_creation_mark() {  # <issue>
@@ -1107,14 +1104,15 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
     hash=$(printf '%s' "$snapshot" | fm_linear_sha256) || return 1
     description_hash=$(printf '%s' "$description" | fm_linear_sha256) || return 1
     prior_hash=$(jq -r --arg issue "$issue" '.[$issue].snapshot_sha256 // empty' \
-      "$TMP_ROOT/issue-heads-before.json") || return 1
+      "$TMP_ROOT/issue-heads-next.json") || return 1
     prior_updated=$(jq -r --arg issue "$issue" '.[$issue].updated_at // empty' \
-      "$TMP_ROOT/issue-heads-before.json") || return 1
+      "$TMP_ROOT/issue-heads-next.json") || return 1
     prior_snapshot=$(jq -c --arg issue "$issue" '.[$issue].snapshot // null' \
-      "$TMP_ROOT/issue-heads-before.json") || return 1
+      "$TMP_ROOT/issue-heads-next.json") || return 1
     if [ -n "$prior_hash" ] && [ "$hash" != "$prior_hash" ]; then
       changes=$(jq -n --argjson before "$prior_snapshot" --argjson after "$snapshot" \
-          --arg issue "$issue" --arg prior "$prior_updated" --slurpfile history "$TMP_ROOT/history.json" '
+          --arg issue "$issue" --arg prior "$prior_updated" --arg current "$updated" \
+          --slurpfile history "$TMP_ROOT/history.json" '
           def description_target:
             try (.changes.description // .changes.descriptionMarkdown // .changes.descriptionText) catch null
             | if type == "array" then .[-1]
@@ -1124,7 +1122,9 @@ derive_issue_snapshots() {  # <observed-at> <creation-cutoff>
           (reduce ($after | keys[]) as $key ({};
             if $before[$key] == $after[$key] then . else .[$key]=$after[$key] end)) as $delta
           | [($history[0][]
-              | select(.issue == $issue and ($prior == "" or (.updatedAt // .createdAt) > $prior)))]
+              | select(.issue == $issue
+                and ($prior == "" or (.updatedAt // .createdAt) > $prior)
+                and (.updatedAt // .createdAt) <= $current))]
             | sort_by((.updatedAt // .createdAt),.id) as $relevant
           | (reduce $relevant[] as $h ({};
               if $h.updatedDescription == true and ($h|description_target) != null
@@ -1254,7 +1254,7 @@ derive_issue_creation() {  # <observed-at> <creation-cutoff> <bootstrap-cutoff>
 }
 
 audit_invariants() {
-  local row issue status updated assignee assignee_id role expected expected_id current next kept previous previous_status occurrence entry_id entry_hash
+  local row issue status updated assignee assignee_id role expected expected_id current next kept previous previous_status occurrence entry entry_id entry_hash
   local previous_head_status previous_head_updated mismatch_current mismatch_next entry_updated
   current="$TMP_ROOT/unknown-status-current.tsv"
   next="$TMP_ROOT/unknown-status-next.tsv"
@@ -1313,13 +1313,19 @@ audit_invariants() {
         mv -f -- "$mismatch_next" "$mismatch_current" || return 1
       fi
     elif ! fm_linear_status_known_without_turn_marker "$status"; then
-      entry_id=$(jq -r --arg issue "$issue" --arg status "$status" '
-        [.[] | select(.issue == $issue and .toState.name == $status)]
-        | sort_by(.createdAt, .id) | last | .id // empty
+      entry=$(jq -c --arg issue "$issue" --arg status "$status" \
+        --arg previous "$previous_head_updated" --arg current "$updated" '
+        [.[]
+          | select(.issue == $issue and (.fromState != null or .toState != null))
+          | . + {_occurrence:(.updatedAt // .createdAt)}
+          | select(($previous == "" or ._occurrence > $previous) and ._occurrence <= $current)]
+        | sort_by(._occurrence, .id) | last
+        | select(.toState.name == $status) // empty
       ' "$TMP_ROOT/history.json") || return 1
+      entry_id=$(printf '%s' "$entry" | jq -r '.id // empty') || return 1
       if [ -n "$entry_id" ]; then
         entry_hash=$(awk -F '\t' -v id="$entry_id" '$1 == id { print $2; exit }' "$HISTORY_HEADS_FILE" 2>/dev/null)
-        entry_updated=$(awk -F '\t' -v id="$entry_id" '$1 == id { print $3; exit }' "$HISTORY_HEADS_FILE" 2>/dev/null)
+        entry_updated=$(printf '%s' "$entry" | jq -r '._occurrence // empty') || return 1
         occurrence="history:$entry_id:${entry_updated:-unknown}:${entry_hash:-unknown}"
       elif [ "$previous_status" = "$status" ] \
         && [ "$previous_head_status" = "$status" ] \
