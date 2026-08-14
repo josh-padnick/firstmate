@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Wake firstmate when the captain acts in Linear: a comment addressed to it, or
+# a state change on an issue firstmate manages. Prints only when there is
+# something to handle.
+#
+# One GraphQL call finds comments newer than the last seen timestamp, so the
+# check costs ~1s instead of reading every thread (was ~12s). Firstmate's own
+# comments are identified by author and skipped.
+set -u
+# --absorb-only refreshes the STATE snapshot after firstmate changes issues and
+# never touches the comment cursor. Running the full check to absorb state was
+# swallowing captain comments in the same window (2026-08-13) - the refresh
+# consumed them and discarded the output.
+ABSORB_ONLY=0
+[ "${1:-}" = "--absorb-only" ] && ABSORB_ONLY=1
+HOME_DIR="${FM_HOME:-/Users/personal/Code/kunchenguid/firstmate}"
+ENVF="$HOME_DIR/.env"
+SNAP="$HOME_DIR/state/.linear-state-snapshot"
+CURSOR="$HOME_DIR/state/.linear-comment-cursor"
+[ -r "$ENVF" ] || exit 0
+KEY="$(sed -n 's/^LINEAR_API_KEY=//p' "$ENVF" | head -1)"
+[ -n "$KEY" ] || exit 0
+export LINEAR_API_KEY="$KEY"
+
+if [ "$ABSORB_ONLY" = "1" ]; then
+  cur="$(linear-axi issue list --team BIG --state all --limit 60 2>/dev/null \
+    | sed -n 's/^  \(BIG-[0-9]*\),.*,\([A-Za-z ]*\),.*/\1\t\2/p')"
+  [ -n "$cur" ] && printf '%s\n' "$cur" > "$SNAP"
+  : > "$HOME_DIR/state/.linear-absorb" 2>/dev/null || true
+  exit 0
+fi
+
+since="$(cat "$CURSOR" 2>/dev/null)"
+[ -n "$since" ] || since="$(date -u -v-2M +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+
+resp="$(curl -s -m 20 -X POST https://api.linear.app/graphql \
+  -H "Authorization: $KEY" -H "Content-Type: application/json" \
+  -d "{\"query\":\"{ comments(first:20, filter:{createdAt:{gt:\\\"$since\\\"}}) { nodes { createdAt user { displayName } issue { identifier } } } }\"}" 2>/dev/null)" || exit 0
+
+# The API returns nodes in no guaranteed order, so take the MAXIMUM timestamp,
+# not the first one - taking the first re-reported old comments (2026-08-13).
+newest="$(printf '%s' "$resp" | grep -o '"createdAt":"[^"]*"' | sed 's/.*:"//;s/"//' | sort | tail -1)"
+authors="$(printf '%s' "$resp" | tr '}' '\n' | grep -o '"displayName":"[^"]*"' | sed 's/.*:"//;s/"//')"
+issues="$(printf '%s' "$resp" | tr '}' '\n' | grep -o '"identifier":"[^"]*"' | sed 's/.*:"//;s/"//')"
+
+out=""
+i=1
+for a in $authors; do
+  iss="$(printf '%s\n' "$issues" | sed -n "${i}p")"; i=$((i+1))
+  case "$a" in *firstmate) continue;; esac
+  [ -n "$iss" ] && out="$out $iss"
+done
+[ -n "$out" ] && out="comment on$(printf '%s' "$out" | tr ' ' '\n' | sort -u | tr '\n' ' ')"
+
+# advance the cursor only after reading, so an interrupted run re-reads
+# Advance ONLY to a timestamp actually observed. Writing "now" when the query
+# returned nothing skipped a captain comment on 2026-08-13: the cursor jumped
+# ahead of a comment that had not been returned yet, and it was never seen again.
+if [ -n "$newest" ]; then printf '%s\n' "$newest" > "$CURSOR"; fi
+
+# --- state changes on firstmate-managed issues --------------------------------
+current="$(linear-axi issue list --team BIG --state all --limit 60 2>/dev/null \
+  | sed -n 's/^  \(BIG-[0-9]*\),.*,\([A-Za-z ]*\),.*/\1\t\2/p')"
+if [ -n "$current" ]; then
+  if [ -s "$SNAP" ]; then
+    while IFS="$(printf '\t')" read -r id st; do
+      [ -n "${id:-}" ] || continue
+      prev="$(awk -F'\t' -v i="$id" '$1==i{print $2}' "$SNAP" | head -1)"
+      if [ -n "$prev" ] && [ "$prev" != "$st" ] && ! grep -qxF "$id" "$HOME_DIR/state/.linear-absorb" 2>/dev/null; then
+        out="$id:$prev->$st ${out}"
+      fi
+    done <<< "$current"
+  fi
+  printf '%s\n' "$current" > "$SNAP"
+  : > "$HOME_DIR/state/.linear-absorb" 2>/dev/null || true
+fi
+
+[ -n "$out" ] && printf 'linear: %s\n' "$out"
+exit 0

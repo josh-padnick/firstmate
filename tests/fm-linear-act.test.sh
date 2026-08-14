@@ -19,7 +19,8 @@ make_home() {  # <name>
   mkdir -p "$home/state"
   printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\nLINEAR_CAPTAIN_ID=captain-id\n' \
     > "$home/.env"
-  printf 'READY FOR YOUR REVIEW\n' > "$home/comment.md"
+  printf 'Routine update.\n' > "$home/comment.md"
+  printf 'READY FOR YOUR REVIEW\nhttps://example.com/review\n' > "$home/review.md"
   chmod 0600 "$home/.env"
   printf '%s\n' "$home"
 }
@@ -28,6 +29,7 @@ resolve_fixture() {  # <file> [current-status] [current-assignee] [current-assig
   jq -n --arg status "${2:-Building}" --arg assignee "${3:-josh.padnickfirstmate}" \
     --arg assignee_id "${4:-firstmate-id}" '
     {data:{viewer:{id:"firstmate-id"},issue:{id:"issue-1",
+      updatedAt:"2026-08-14T11:50:00Z",
       state:{id:(if $status == "Approve Deliverable" then "approve" else "building" end),name:$status},
       assignee:{id:$assignee_id,displayName:$assignee},team:{
         states:{nodes:[{id:"approve",name:"Approve Deliverable"},{id:"building",name:"Building"},
@@ -39,9 +41,16 @@ resolve_fixture() {  # <file> [current-status] [current-assignee] [current-assig
   ' > "$1"
 }
 
-mutation_read_fixture() {  # <file> <state-id> <state-name> <assignee-id> <assignee-name>
-  jq -n --arg state_id "$2" --arg state "$3" --arg assignee_id "$4" --arg assignee "$5" '
-    {data:{issue:{state:{id:$state_id,name:$state},assignee:{id:$assignee_id,displayName:$assignee}}}}
+mutation_read_fixture() {  # <file> <state-id> <state-name> <assignee-id> <assignee-name> [updated-at]
+  jq -n --arg state_id "$2" --arg state "$3" --arg assignee_id "$4" --arg assignee "$5" \
+    --arg updated "${6:-2026-08-14T11:50:00Z}" '
+    {data:{issue:{updatedAt:$updated,state:{id:$state_id,name:$state},assignee:{id:$assignee_id,displayName:$assignee}}}}
+  ' > "$1"
+}
+
+reply_target_fixture() {  # <file> <comment-id> <issue-id> [parent-id]
+  jq -n --arg id "$2" --arg issue "$3" --arg parent "${4:-}" '
+    {data:{comment:{id:$id,issue:{id:$issue},parent:(if $parent == "" then null else {id:$parent} end)}}}
   ' > "$1"
 }
 
@@ -88,7 +97,7 @@ mutation_fixture "$fixtures/03-mutate.json"
 comment_fixture "$fixtures/04-comment.json"
 verify_fixture "$fixtures/05-verify.json" Building josh.padnickfirstmate
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
-  --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
+  --status 'Approve Deliverable' --comment-file "$home/review.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "stale board read-back did not fail loudly"
 [ "$(find "$home/state/linear-outbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
   || fail "read-back mismatch did not retain the unfinished journal"
@@ -103,7 +112,7 @@ mutation_fixture "$fixtures/03-mutate.json"
 comment_fixture "$fixtures/04-comment.json"
 verify_fixture "$fixtures/05-verify.json" 'Approve Deliverable' josh.padnick wrong-captain-id
 out=$(run_act "$home" "$fixtures" handoff-to-captain BIG-1 \
-  --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
+  --status 'Approve Deliverable' --comment-file "$home/review.md" 2>&1 || true)
 assert_contains "$out" "read-back mismatch" "same-name wrong-ID assignee passed read-back"
 [ "$(find "$home/state/linear-outbox" -name '*.json' | wc -l | tr -d ' ')" = 1 ] \
   || fail "assignee ID mismatch did not retain the unfinished journal"
@@ -122,7 +131,7 @@ log="$home/kill.log"
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
     FM_LINEAR_FIXTURE_LOG="$log" FM_LINEAR_NOW_EPOCH="$NOW" \
     FM_LINEAR_TEST_KILL_AFTER_MUTATION=1 "$ACT" handoff-to-captain BIG-1 \
-      --status 'Approve Deliverable' --comment-file "$home/comment.md"
+      --status 'Approve Deliverable' --comment-file "$home/review.md"
 ) >/dev/null 2>&1 || true
 journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 [ -n "$journal" ] || fail "SIGKILL did not leave a resumable journal"
@@ -164,7 +173,7 @@ mutation_fixture "$fixtures/03-mutate.json"
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
     FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
     "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
-      --comment-file "$home/comment.md"
+      --comment-file "$home/review.md"
 ) >/dev/null 2>&1 || true
 journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 [ "$(jq -r '.phase' "$journal")" = journaled ] \
@@ -192,7 +201,7 @@ mutation_fixture "$fixtures/03-mutate.json"
   FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
     FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
     "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
-      --comment-file "$home/comment.md"
+      --comment-file "$home/review.md"
 ) >/dev/null 2>&1 || true
 fixtures="$TMP_ROOT/mutation-conflict-resume-fixtures"
 mkdir -p "$fixtures"
@@ -204,6 +213,30 @@ assert_contains "$out" "state mutation conflict" "captain's newer board state wa
 [ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
   || fail "recovery overwrote the captain's divergent board state"
 pass "state replay refuses to overwrite a divergent captain change"
+
+home=$(make_home mutation-restored-conflict)
+fixtures="$TMP_ROOT/mutation-restored-kill-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+mutation_read_fixture "$fixtures/02-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/03-mutate.json"
+(
+  FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+    FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_MUTATION_ACCEPTED=1 \
+    "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
+      --comment-file "$home/review.md"
+) >/dev/null 2>&1 || true
+fixtures="$TMP_ROOT/mutation-restored-resume-fixtures"
+mkdir -p "$fixtures"
+mutation_read_fixture "$fixtures/01-read.json" building Building firstmate-id josh.padnickfirstmate \
+  2026-08-14T11:55:00Z
+resume_log="$home/mutation-restored-resume.log"
+out=$(FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$resume_log" FM_LINEAR_NOW_EPOCH="$NOW" "$ACT" resume 2>&1 || true)
+assert_contains "$out" "state mutation conflict" "captain restoration after acceptance was mistaken for an unapplied write"
+[ "$(awk -F '\t' '$1=="issueUpdate"{n++} END{print n+0}' "$resume_log")" = 0 ] \
+  || fail "recovery overwrote a later captain restoration"
+pass "board versions protect captain restorations from stale replay"
 
 home=$(make_home stable-firstmate-id)
 fixtures="$TMP_ROOT/stable-firstmate-id-fixtures"
@@ -226,7 +259,7 @@ pass "state transitions resolve assignees from canonical stable IDs"
 home=$(make_home missing-captain-id)
 printf 'LINEAR_API_KEY=test-key\nLINEAR_FIRSTMATE_ID=firstmate-id\n' > "$home/.env"
 out=$(run_act "$home" "$TMP_ROOT/no-identity-fixtures" handoff-to-captain BIG-1 \
-  --status 'Approve Deliverable' --comment-file "$home/comment.md" 2>&1 || true)
+  --status 'Approve Deliverable' --comment-file "$home/review.md" 2>&1 || true)
 assert_contains "$out" "missing LINEAR_CAPTAIN_ID" "missing canonical captain ID did not fail loudly"
 [ "$(find "$home/state/linear-outbox" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
   || fail "missing canonical captain ID created a write journal"
@@ -237,8 +270,9 @@ printf 'LINEAR_API_KEY=test-key\n' > "$home/.env"
 fixtures="$TMP_ROOT/reply-without-assignee-ids-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-comment_fixture "$fixtures/02-comment.json"
-verify_fixture "$fixtures/03-verify.json" Building josh.padnickfirstmate
+reply_target_fixture "$fixtures/02-reply-target.json" parent-1 issue-1
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" Building josh.padnickfirstmate
 run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/comment.md" --parent parent-1 >/dev/null \
   || fail "comment-only reply required unrelated assignee identities"
 [ "$(find "$home/state/linear-outbox" -name '*.done' | wc -l | tr -d ' ')" = 1 ] \
@@ -254,6 +288,43 @@ assert_contains "$out" "must contain READY FOR YOUR REVIEW" \
 [ "$(find "$home/state/linear-outbox" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
   || fail "rejected readiness handoff created a journal"
 pass "captain handoffs enforce the review-readiness marker"
+
+printf 'READY FOR YOUR REVIEW\n' > "$home/no-link.md"
+out=$(run_act "$home" "$TMP_ROOT/no-review-link-fixtures" handoff-to-captain BIG-1 \
+  --status 'Approve Deliverable' --comment-file "$home/no-link.md" 2>&1 || true)
+assert_contains "$out" "must contain a reviewable link" "review handoff accepted no reviewable link"
+
+home=$(make_home reviewable-reply)
+fixtures="$TMP_ROOT/reviewable-reply-fixtures"
+mkdir -p "$fixtures"
+resolve_fixture "$fixtures/01-resolve.json"
+reply_target_fixture "$fixtures/02-reply-child.json" child-comment issue-1 root-comment
+reply_target_fixture "$fixtures/03-reply-root.json" root-comment issue-1
+mutation_read_fixture "$fixtures/04-read.json" building Building firstmate-id josh.padnickfirstmate
+mutation_fixture "$fixtures/05-mutate.json"
+comment_fixture "$fixtures/06-comment.json"
+verify_fixture "$fixtures/07-verify.json" 'Approve Deliverable' josh.padnick captain-id
+review_log="$home/reviewable-reply.log"
+FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
+  FM_LINEAR_FIXTURE_LOG="$review_log" FM_LINEAR_NOW_EPOCH="$NOW" \
+  "$ACT" reply BIG-1 --comment-file "$home/review.md" --parent child-comment >/dev/null \
+  || fail "reviewable reply did not atomically enter captain review"
+awk -F '\t' '$1=="issueUpdate"{print $2}' "$review_log" \
+  | jq -e '.variables.state == "approve" and .variables.assignee == "captain-id"' >/dev/null \
+  || fail "reviewable reply did not set the canonical captain review turn marker"
+awk -F '\t' '$1=="commentCreate"{print $2}' "$review_log" \
+  | jq -e '.variables.parent == "root-comment"' >/dev/null \
+  || fail "reply trusted the caller target instead of the canonical thread root"
+pass "reviewable replies resolve roots and hand off through one journal"
+
+home=$(make_home reviewable-firstmate-rejection)
+out=$(run_act "$home" "$TMP_ROOT/no-reviewable-take-fixtures" take-from-captain BIG-1 \
+  --status Building --comment-file "$home/review.md" 2>&1 || true)
+assert_contains "$out" "cannot remain in a Firstmate-owned state" \
+  "reviewable deliverable was accepted in a Firstmate-owned state"
+[ "$(find "$home/state/linear-outbox" -type f 2>/dev/null | wc -l | tr -d ' ')" = 0 ] \
+  || fail "rejected reviewable Firstmate state created a journal"
+pass "reviewables cannot remain on a Firstmate-owned turn marker"
 
 fake_time_bin="$TMP_ROOT/fake-time-bin"
 mkdir -p "$fake_time_bin"
@@ -282,7 +353,7 @@ accepted_log="$home/accepted-kill.log"
     FM_LINEAR_FIXTURE_LOG="$accepted_log" FM_LINEAR_FIXTURE_COMMENT_STORE="$accepted_store" \
     FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_KILL_AFTER_COMMENT_ACCEPTED=1 \
     "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
-      --comment-file "$home/comment.md"
+      --comment-file "$home/review.md"
 ) >/dev/null 2>&1 || true
 journal=$(find "$home/state/linear-outbox" -name '*.json' | head -n 1)
 [ -n "$journal" ] || fail "accepted-comment SIGKILL did not leave a resumable journal"
@@ -320,7 +391,7 @@ mkdir -p "$control"
 FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_LINEAR_FIXTURE_DIR="$fixtures" \
   FM_LINEAR_NOW_EPOCH="$NOW" FM_LINEAR_TEST_PAUSE_AFTER_MUTATION_DIR="$control" \
   "$ACT" handoff-to-captain BIG-1 --status 'Approve Deliverable' \
-    --comment-file "$home/comment.md" > "$home/overlap-act.out" 2>&1 &
+    --comment-file "$home/review.md" > "$home/overlap-act.out" 2>&1 &
 act_pid=$!
 attempts=0
 while [ ! -e "$control/ready" ] && kill -0 "$act_pid" 2>/dev/null; do
@@ -382,8 +453,9 @@ printf '![screenshot](https://uploads.linear.app/raw/file.png)\n' > "$home/image
 fixtures="$TMP_ROOT/image-fixtures"
 mkdir -p "$fixtures"
 resolve_fixture "$fixtures/01-resolve.json"
-comment_fixture "$fixtures/02-comment.json"
-verify_fixture "$fixtures/03-verify.json" Building josh.padnickfirstmate
+reply_target_fixture "$fixtures/02-reply-target.json" parent-1 issue-1
+comment_fixture "$fixtures/03-comment.json"
+verify_fixture "$fixtures/04-verify.json" Building josh.padnickfirstmate
 run_act "$home" "$fixtures" reply BIG-1 --comment-file "$home/image.md" --parent parent-1 >/dev/null \
   || fail "Markdown image embed was incorrectly rejected"
 pass "the write door refuses raw upload links and permits image embeds"

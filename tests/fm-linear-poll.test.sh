@@ -78,6 +78,13 @@ pending_count() {  # <home>
   find "$1/state/linear-inbox" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' '
 }
 
+legacy_fixture="$ROOT/tests/fixtures/legacy-linear-inbox.check.sh.txt"
+[ ! -x "$legacy_fixture" ] || fail "legacy Linear poller reference fixture is executable"
+[ "$(wc -l < "$legacy_fixture" | tr -d ' ')" = 79 ] || fail "legacy Linear poller reference line count drifted"
+[ "$(shasum -a 256 "$legacy_fixture" | awk '{print $1}')" = 74b764c237344bb22f0e7b0d95f076ca28c33e6064b10e1ad64cecb1975e5a32 ] \
+  || fail "legacy Linear poller reference bytes drifted"
+pass "legacy Linear poller remains an exact non-runtime reference"
+
 # T1, T5, and the author-identity half of the concurrent-write regression.
 home=$(make_home idempotence)
 fixtures="$TMP_ROOT/idempotence-fixtures"
@@ -108,6 +115,26 @@ pass "poller is idempotent and filters only by author identity"
 captured=$(find "$home/state/linear-inbox" -type f -name '*.json' -exec jq -r 'select(.comment_id == "captain-comment") | .author_id' {} +)
 [ "$captured" = captain-id ] || fail "captain comment with the viewer's display name was misclassified"
 pass "stable user IDs distinguish authors with the same display name"
+
+idempotence_home=$home
+idempotence_fixtures=$fixtures
+home=$(make_home noncaptain-authority)
+fixtures="$TMP_ROOT/noncaptain-authority-fixtures"
+other_comment=$(comment other-comment 2026-08-14T11:58:00Z 'not the captain' other-id shared-name BIG-30)
+other_history=$(history other-history 2026-08-14T11:58:01Z other-id shared-name Backlog Building)
+comments=$(jq -nc --argjson c "$other_comment" '[$c]')
+other_issue=$(issue BIG-30 2026-08-14T11:58:02Z other-id shared-name "$(jq -nc --argjson h "$other_history" '[$h]')")
+other_issue=$(printf '%s' "$other_issue" | jq '.createdAt="2026-08-14T11:58:02Z"')
+issues=$(jq -nc --argjson i "$other_issue" '[$i]')
+make_fixtures "$fixtures" "$comments" "$issues"
+out=$(run_poll "$home" "$fixtures") || fail "non-captain authority poll failed"
+assert_not_contains "$out" "captain input(s)" "non-captain provider IDs were promoted to captain authority"
+assert_contains "$out" "3 non-authoritative observation(s)" "non-captain observations were not surfaced distinctly"
+jq -s -e 'length == 3 and all(.[]; .authority == "non-captain")' \
+  "$home/state/linear-inbox"/*.json >/dev/null || fail "non-captain durable events lacked explicit authority"
+pass "only the canonical captain provider ID creates captain input"
+home=$idempotence_home
+fixtures=$idempotence_fixtures
 
 # A write can finish after its self-events were first observed.
 # Re-reading a seen self-event must still close the outbound observation loop.
@@ -200,6 +227,20 @@ out=$(run_poll "$home" "$fixtures") || fail "reverted comment poll failed"
 assert_contains "$out" "1 captain input(s)" "A-to-B-to-A edit did not surface the final A"
 [ "$(pending_count "$home")" = 3 ] || fail "A-to-B-to-A did not persist three comment transitions"
 pass "comment transitions surface A-to-B-to-A and silence same-body bumps"
+
+home=$(make_home same-hash-edit)
+fixtures="$TMP_ROOT/same-hash-edit-one"
+first=$(comment same-hash 2026-08-14T11:55:00Z A captain-id shared-name BIG-4)
+first=$(printf '%s' "$first" | jq '.editedAt="2026-08-14T11:55:00Z"')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$first" '[$c]')" '[]'
+run_poll "$home" "$fixtures" >/dev/null || fail "first same-hash edit poll failed"
+fixtures="$TMP_ROOT/same-hash-edit-two"
+reverted=$(printf '%s' "$first" | jq '.updatedAt="2026-08-14T11:57:00Z" | .editedAt="2026-08-14T11:57:00Z"')
+make_fixtures "$fixtures" "$(jq -nc --argjson c "$reverted" '[$c]')" '[]'
+out=$(run_poll "$home" "$fixtures") || fail "same-hash edit occurrence poll failed"
+assert_contains "$out" "1 captain input(s)" "new editedAt with the same body hash was suppressed"
+[ "$(pending_count "$home")" = 2 ] || fail "same-hash edit occurrence was not preserved separately"
+pass "editedAt surfaces same-hash edit occurrences"
 
 home=$(make_home retained-head)
 fixtures="$TMP_ROOT/retained-head-old-fixtures"
@@ -311,12 +352,33 @@ created_b=$(printf '%s' "$created_b" | jq '.createdAt = "2026-08-14T11:58:00Z"')
 issues=$(jq -nc --argjson i "$created_b" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
 out=$(run_poll "$home" "$fixtures") || fail "creation-window description B poll failed"
-assert_contains "$out" "1 captain input(s)" "history-free creation-window description edit was silent"
+assert_contains "$out" "1 non-authoritative observation(s)" "history-free creation-window description edit was silent"
 jq -s -e 'any(.[]; .kind == "issue-created" and .description == "A")
   and any(.[]; .kind == "description" and .source == "issue-snapshot" and .description == "B")' \
   "$home/state/linear-inbox"/*.json >/dev/null \
   || fail "creation-window description snapshots did not preserve both observed bodies"
 pass "issue snapshots preserve history-free creation-window description edits"
+
+home=$(make_home mixed-history-snapshot)
+fixtures="$TMP_ROOT/mixed-history-snapshot-a"
+baseline=$(issue BIG-31 2026-08-14T11:56:00Z firstmate-id shared-name '[]' Backlog firstmate-id shared-name A)
+baseline=$(printf '%s' "$baseline" | jq '.title="A"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$baseline" '[$i]')"
+run_poll "$home" "$fixtures" >/dev/null || fail "mixed snapshot baseline poll failed"
+fixtures="$TMP_ROOT/mixed-history-snapshot-b"
+title_history=$(history mixed-title 2026-08-14T11:57:00Z captain-id shared-name Backlog Backlog)
+title_history=$(printf '%s' "$title_history" | jq '.fromState=null | .toState=null | .fromTitle="A" | .toTitle="B"')
+changed=$(issue BIG-31 2026-08-14T11:57:01Z firstmate-id shared-name "$(jq -nc --argjson h "$title_history" '[$h]')" Backlog firstmate-id shared-name B)
+changed=$(printf '%s' "$changed" | jq '.title="B"')
+make_fixtures "$fixtures" '[]' "$(jq -nc --argjson i "$changed" '[$i]')"
+out=$(run_poll "$home" "$fixtures") || fail "mixed history and snapshot poll failed"
+assert_contains "$out" "1 captain input(s)" "logged title change did not remain authoritative"
+assert_contains "$out" "1 non-authoritative observation(s)" "residual description snapshot was lost"
+jq -s -e 'any(.[]; .history_id == "mixed-title" and .authority == "captain")
+  and any(.[]; .source == "issue-snapshot" and .authority == "unattributed"
+    and .changes == {description:"B"})' "$home/state/linear-inbox"/*.json >/dev/null \
+  || fail "history fields were not subtracted from the residual snapshot delta"
+pass "snapshot fallback preserves every field not represented by history"
 
 home=$(make_home bootstrap-horizon-retry)
 rm -f "$home/state/.linear-comment-head-bootstrap.json"
@@ -534,7 +596,7 @@ bad_issue=$(issue BIG-9 2026-08-14T11:59:00Z firstmate-id shared-name '[]' 'Appr
 issues=$(jq -nc --argjson i "$bad_issue" '[$i]')
 make_fixtures "$fixtures" '[]' "$issues"
 mkdir -p "$home/state/linear-inbox"
-jq -n '{kind:"comment",issue:"BIG-8",created_at:"2026-08-14T11:40:00Z"}' \
+jq -n '{kind:"comment",issue:"BIG-8",authority:"captain",created_at:"2026-08-14T11:40:00Z"}' \
   > "$home/state/linear-inbox/stale.json"
 chmod 0700 "$home/state/linear-inbox"
 chmod 0600 "$home/state/linear-inbox/stale.json"

@@ -336,15 +336,16 @@ Skipped items, such as a destination checkout that does not yet gitignore the it
 ## Linear event ledger
 
 A home activates Linear by placing a non-empty `LINEAR_API_KEY` in its private `.env`.
-Polling and state-carrying writes also require the canonical stable user IDs `LINEAR_FIRSTMATE_ID` and `LINEAR_CAPTAIN_ID` in that file, while comment-only replies require only the API key.
+Polling and state-carrying writes also require the canonical stable user IDs `LINEAR_FIRSTMATE_ID` and `LINEAR_CAPTAIN_ID` in that file, while an ordinary comment-only reply requires only the API key.
 The next locked bootstrap pass writes and hash-registers `state/fm-linear-inbox.check.sh`, which dispatches the tracked `bin/fm-linear-poll.sh`, and writes the shared connector cadence file `config/x-mode.env` with a 30-second interval.
 Bootstrap never copies the key into generated state.
 
-The poller reads stable user IDs on comments and issue history, atomically publishes complete captain events under `state/linear-inbox/`, records immutable event keys in `state/.linear-seen.tsv`, each comment's latest hash in `state/.linear-comment-heads.tsv`, each history record's latest derived-content hash in `state/.linear-history-heads.tsv`, durable Firstmate thread participation in `state/.linear-thread-participation.tsv`, and issue snapshots in `state/.linear-issue-heads.json`, and only then advances the server-timestamp cursors in `state/.linear-cursor`.
+The poller reads stable user IDs on comments and issue history, atomically publishes complete events under `state/linear-inbox/`, records immutable event keys in `state/.linear-seen.tsv`, each comment's latest hash and `editedAt` in `state/.linear-comment-heads.tsv`, each history record's latest derived-content hash in `state/.linear-history-heads.tsv`, durable Firstmate thread participation in `state/.linear-thread-participation.tsv`, and issue snapshots in `state/.linear-issue-heads.json`, and only then advances the server-timestamp cursors in `state/.linear-cursor`.
+Every durable event carries explicit `captain`, `non-captain`, or `unattributed` authority; only the configured `LINEAR_CAPTAIN_ID` produces captain instructions, while the authenticated viewer ID alone identifies Firstmate writes.
 Initial activation durably fixes its normal event-ingestion horizon at two hours before the first fetch and advances a resumable one-page-per-sweep historical comment-head scan, so retries cannot move that horizon and a mature board cannot block activation.
 An old comment not yet reached by that scan is classified from Linear's `editedAt` signal, so a reply-only parent bump seeds its current head silently while an actual edit still wakes.
 It retains self-authored events in the ledger without waking, so Firstmate's own writes never absorb a time window that could contain captain input.
-Comment transitions include the body hash and server update timestamp, so an A-to-B-to-A edit wakes three times while reply-only `updatedAt` bumps with unchanged bodies remain silent.
+Comment transitions include the body hash, `editedAt`, and server update timestamp, so a same-hash edit occurrence and an A-to-B-to-A edit wake while reply-only `updatedAt` bumps remain silent.
 New issue ownership is label-only: only the `Firstmate` label wakes Firstmate for an issue-created event, while assignment and body text do not establish ownership.
 On an unlabelled issue, a mention is required to start a comment thread; after Firstmate has commented in that thread, every later reply wakes without another mention.
 On a `Firstmate`-labelled issue, a bare top-level comment starts a thread and wakes.
@@ -356,6 +357,10 @@ The `linear-operations` skill owns how a wake drains and acknowledges the durabl
 
 All Firstmate state, assignee, and comment writes use `bin/fm-linear-act.sh`.
 It journals intent under `state/linear-outbox/`, maps the target status to a role and that role to its configured stable user ID, updates state and assignee in one mutation, posts with a client-generated comment ID, and verifies the result by read-back before completing the journal.
+The journal records the issue's provider `updatedAt`, so recovery refuses a stale mutation after any later captain restoration.
+Replies accept the target comment ID, resolve its issue and canonical root from Linear, and journal that root before posting.
+A comment containing both an exact `READY FOR YOUR REVIEW` line and a reviewable link is a reviewable handoff: the same journal moves the issue to `Approve Deliverable` with `LINEAR_CAPTAIN_ID`, and the write door rejects a Firstmate-owned state for that deliverable.
+Concurrent machinery and review work use separate issues.
 Unfinished journals are replayed with `fm-linear-act.sh resume`.
 
 On its first successful arm, bootstrap removes `.linear-absorb`, `.linear-state-snapshot`, `.linear-inbox-seen`, and `.linear-comment-cursor` from the private state directory.
