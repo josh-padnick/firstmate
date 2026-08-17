@@ -447,11 +447,17 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
 # otherwise resolve the wrong way against an acceptance line reading "tests
 # green" next to "stop for product look", so assert each clause on every variant
 # the flag accepts.
+# The pause verb is read from the ambient environment, so pin it here: these
+# tests assert the default-verb wording and must not depend on the runner's
+# FM_CLASSIFY_PAUSED_VERB. test_pause_verb_override_renders_all_brief_scaffolds
+# covers the override.
 scaffold_ux_brief() {  # <home> <id> <variant>
   if [ "$3" = scout ]; then
-    FM_HOME="$1" "$ROOT/bin/fm-brief.sh" "$2" someapp --scout --ux >/dev/null 2>&1
+    FM_HOME="$1" FM_CLASSIFY_PAUSED_VERB=paused \
+      "$ROOT/bin/fm-brief.sh" "$2" someapp --scout --ux >/dev/null 2>&1
   else
-    FM_HOME="$1" "$ROOT/bin/fm-brief.sh" "$2" someapp --mode "$3" --ux >/dev/null 2>&1
+    FM_HOME="$1" FM_CLASSIFY_PAUSED_VERB=paused \
+      "$ROOT/bin/fm-brief.sh" "$2" someapp --mode "$3" --ux >/dev/null 2>&1
   fi
 }
 
@@ -511,12 +517,17 @@ test_ux_handoff_names_only_steps_its_variant_allows() {
     assert_present "$brief" "$variant --ux brief was not scaffolded"
     case "$variant" in
       no-mistakes|direct-PR)
-        assert_grep "Open a draft PR first when this brief's delivery mode requires one." "$brief" \
-          "$variant --ux brief lost the mode-conditional draft PR"
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_grep 'Before that gate, push your `fm/'"$id"'` branch and open a DRAFT pull request with `gh-axi`' "$brief" \
+          "$variant --ux brief did not name the concrete stage 1 draft PR step"
+        assert_grep "Stage 2 updates that same branch and that same draft PR in place; never open a second PR for this task" "$brief" \
+          "$variant --ux brief did not keep stage 2 on the same branch and PR"
         ;;
       *)
-        assert_no_grep "Open a draft PR first" "$brief" \
+        assert_no_grep "DRAFT pull request" "$brief" \
           "$variant --ux brief tells a worker to open a draft PR its contract forbids"
+        assert_no_grep "never open a second PR for this task" "$brief" \
+          "$variant --ux brief carries PR-update wording its contract forbids"
         ;;
     esac
     # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
@@ -539,25 +550,32 @@ test_ux_handoff_names_only_steps_its_variant_allows() {
 # handoff followed by a deliberate wait. Feed the two status lines the generated
 # contract instructs the worker to append through the real classifier rather than
 # trusting the wording.
+classify_status_line() {  # <pause-verb> <classifier-fn> <status-line>
+  FM_CLASSIFY_PAUSED_VERB="$1" bash -c '. "$1" && "$2" "$3"' \
+    fm-classify "$ROOT/bin/fm-classify-lib.sh" "$2" "$3"
+}
+
 test_ux_handoff_lines_classify_as_captain_handoff_then_wait() {
-  local home id brief done_line wait_line
+  local home id brief verb done_line wait_line
   home="$TMP_ROOT/ux-classify-home"
   mkdir -p "$home/data"
+  # Scaffold and classify under one non-default verb, so this proves the emitted
+  # gate and the classifier agree on the configured vocabulary rather than on a
+  # hardcoded literal either side happens to share.
+  verb=waiting-on-captain
   id="brief-ux-classify"
-  scaffold_ux_brief "$home" "$id" no-mistakes
+  FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB="$verb" \
+    "$ROOT/bin/fm-brief.sh" "$id" someapp --mode no-mistakes --ux >/dev/null 2>&1
   brief="$home/data/$id/brief.md"
   assert_present "$brief" "--ux brief was not scaffolded"
-  # shellcheck disable=SC2016  # single quotes are deliberate: these are sed scripts, not shell expansions
+  # shellcheck disable=SC2016  # single quotes are deliberate: this is a sed script, not a shell expansion
   done_line=$(sed -n 's/^4\. Stop at `\(done: [^`]*\)`.*/\1/p' "$brief")
-  # shellcheck disable=SC2016  # single quotes are deliberate: these are sed scripts, not shell expansions
-  wait_line=$(sed -n 's/^4\. .*append `\(paused: [^`]*\)`.*/\1/p' "$brief")
+  wait_line=$(sed -n "s/^4\. .*append \`\($verb: [^\`]*\)\`.*/\1/p" "$brief")
   [ -n "$done_line" ] || fail "--ux brief did not state a done: gate the worker can append"
-  [ -n "$wait_line" ] || fail "--ux brief did not state a wait line the worker can append"
-  # shellcheck source=/dev/null
-  (. "$ROOT/bin/fm-classify-lib.sh" && status_is_captain_relevant "$done_line") \
+  [ -n "$wait_line" ] || fail "--ux brief did not state a $verb: wait line the worker can append"
+  classify_status_line "$verb" status_is_captain_relevant "$done_line" \
     || fail "--ux stage 1 gate '$done_line' does not reach the captain as a handoff"
-  # shellcheck source=/dev/null
-  (. "$ROOT/bin/fm-classify-lib.sh" && status_is_paused "$wait_line") \
+  classify_status_line "$verb" status_is_paused "$wait_line" \
     || fail "--ux stage 1 wait '$wait_line' is not a declared external wait"
   pass "fm-brief.sh: --ux stage 1 handoff lines classify as a captain gate plus a declared wait"
 }

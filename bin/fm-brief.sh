@@ -39,7 +39,10 @@
 #   the task text; stage 2 owns the full suite. The flag is explicit for the same reason
 #   as --herdr-lab, and briefs made without it carry the same loud declaration.
 #   The stage-1 handoff is shaped by brief kind and delivery mode, so each brief names
-#   only the draft-PR and pipeline steps its own contract actually allows.
+#   only the PR and pipeline steps its own contract actually allows: a PR-bearing ship
+#   also pushes its branch and opens a draft PR at that gate, so the captain reviews the
+#   code alongside the preview and stage 2 updates that same PR in place, while a scout
+#   or local-only brief names no PR step at all.
 #   Both flags apply to crewmate ship and scout briefs only; a charter is neither.
 # For ship tasks, --mode is REQUIRED and shapes the definition of done. Firstmate
 # resolves it per task at intake (AGENTS.md section 7); data/projects.md holds the
@@ -334,8 +337,9 @@ if [ "$UX" -eq 1 ]; then
 # shellcheck disable=SC2016  # single quotes are deliberate: this is literal brief text and the "$PAUSED_VERB" break-out is the only interpolation
 UX_STOP_LINES=('4. Stop at `done: preview ready <file:// or live URL>`, then append `'"$PAUSED_VERB"': awaiting captain product review` and wait.')
 if [ "$KIND" = ship ] && [ "$MODE" != local-only ]; then
-  # shellcheck disable=SC2016  # single quotes are deliberate: this is literal brief text and the apostrophe break-out is the only interpolation
-  UX_STOP_LINES+=('   Open a draft PR first when this brief'"'"'s delivery mode requires one.')
+  # shellcheck disable=SC2016  # single quotes are deliberate: this is literal brief text and the "$ID" break-out is the only interpolation
+  UX_STOP_LINES+=('   Before that gate, push your `fm/'"$ID"'` branch and open a DRAFT pull request with `gh-axi`, so the captain reviews the code alongside the preview.')
+  UX_STOP_LINES+=('   Stage 2 updates that same branch and that same draft PR in place; never open a second PR for this task, and leave the draft-to-ready transition and merge authority exactly as your Definition of done states.')
 fi
 UX_STOP_LINES+=('   That `'"$PAUSED_VERB"':` line is what tells firstmate this idle pane is a deliberate product-review handoff rather than a possible wedge, so never leave it off.')
 if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
