@@ -445,49 +445,121 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
 # A product-look task is staged: the captain sees the experience before any full
 # suite runs. The generated contract has to carry every clause the worker would
 # otherwise resolve the wrong way against an acceptance line reading "tests
-# green" next to "stop for product look", so assert each clause, on ship and
-# scout alike.
+# green" next to "stop for product look", so assert each clause on every variant
+# the flag accepts.
+scaffold_ux_brief() {  # <home> <id> <variant>
+  if [ "$3" = scout ]; then
+    FM_HOME="$1" "$ROOT/bin/fm-brief.sh" "$2" someapp --scout --ux >/dev/null 2>&1
+  else
+    FM_HOME="$1" "$ROOT/bin/fm-brief.sh" "$2" someapp --mode "$3" --ux >/dev/null 2>&1
+  fi
+}
+
 test_ux_contract_is_explicit_and_complete() {
-  local home kind id brief
+  local home variant id brief
   home="$TMP_ROOT/ux-contract-home"
   mkdir -p "$home/data"
-  for kind in ship scout; do
-    id="brief-ux-$kind"
-    if [ "$kind" = scout ]; then
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --scout --ux >/dev/null 2>&1
-    else
-      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --mode no-mistakes --ux >/dev/null 2>&1
-    fi
+  for variant in scout no-mistakes direct-PR local-only; do
+    id="brief-ux-$variant"
+    scaffold_ux_brief "$home" "$id" "$variant"
     brief="$home/data/$id/brief.md"
-    assert_present "$brief" "$kind --ux brief was not scaffolded"
+    assert_present "$brief" "$variant --ux brief was not scaffolded"
     assert_grep "# Product-look stage 1 - HARD CONTRACT" "$brief" \
-      "$kind --ux brief missing its hard product-look contract"
+      "$variant --ux brief missing its hard product-look contract"
     assert_grep "the captain reviews this experience before any full suite runs" "$brief" \
-      "$kind --ux brief did not put the captain's look ahead of the full suite"
+      "$variant --ux brief did not put the captain's look ahead of the full suite"
     assert_grep "Stage 1 self-verify is Chrome plus a targeted test of the changed behavior only." "$brief" \
-      "$kind --ux brief did not scope stage 1 self-verify to Chrome plus a targeted test"
+      "$variant --ux brief did not scope stage 1 self-verify to Chrome plus a targeted test"
     assert_grep "in BOTH light and dark, at every viewport this task declares, using real pointer gestures" "$brief" \
-      "$kind --ux brief lost the light/dark, viewport, and real-gesture self-verify terms"
+      "$variant --ux brief lost the light/dark, viewport, and real-gesture self-verify terms"
     assert_grep "Do NOT run the full unit, contract, or Playwright suite in stage 1" "$brief" \
-      "$kind --ux brief did not forbid the full suite in stage 1"
+      "$variant --ux brief did not forbid the full suite in stage 1"
     assert_grep "do not wait on any of those suites before reporting the preview" "$brief" \
-      "$kind --ux brief did not forbid waiting on the full suite before the preview"
+      "$variant --ux brief did not forbid waiting on the full suite before the preview"
+    # The stop gate is the canonical `done:` gate plus a declared wait, so it is a
+    # defined gate rather than a nonterminal `working:` line the ship Rules forbid
+    # ending a turn on.
     # shellcheck disable=SC2016  # single quotes are deliberate: the backticks and placeholder must stay literal
-    assert_grep 'Stop at `working: preview ready <file:// or live URL>`' "$brief" \
-      "$kind --ux brief lost its exact preview-ready stop gate"
-    assert_grep "open a draft PR first when this brief's delivery mode requires one" "$brief" \
-      "$kind --ux brief lost the mode-conditional draft PR"
+    assert_grep 'Stop at `done: preview ready <file:// or live URL>`' "$brief" \
+      "$variant --ux brief lost its exact preview-ready stop gate"
     # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
-    assert_grep 'Firstmate starts `/no-mistakes` only after the captain approves the product look.' "$brief" \
-      "$kind --ux brief did not defer the pipeline to product approval"
+    assert_grep 'append `paused: awaiting captain product review` and wait.' "$brief" \
+      "$variant --ux brief did not declare the wait that follows the preview gate"
+    assert_no_grep "working: preview ready" "$brief" \
+      "$variant --ux brief still stops on a nonterminal working: line"
     assert_grep 'A "tests green", "Playwright green", or equivalent acceptance line in this brief' "$brief" \
-      "$kind --ux brief did not neutralise a conflicting acceptance line in the task text"
+      "$variant --ux brief did not neutralise a conflicting acceptance line in the task text"
     assert_grep "Stage 2 owns the full unit, contract, and Playwright suites" "$brief" \
-      "$kind --ux brief did not hand the full suite to stage 2"
+      "$variant --ux brief did not hand the full suite to stage 2"
     assert_no_grep "Product-look stage 1 declaration - NOT ENABLED" "$brief" \
-      "$kind --ux brief retained the unguarded declaration"
+      "$variant --ux brief retained the unguarded declaration"
   done
   pass "fm-brief.sh: --ux emits the complete product-look stage 1 contract"
+}
+
+# The handoff step is the one part that must differ per variant: a scout and a
+# local-only ship may never open a PR, and only the no-mistakes mode has a
+# pipeline to start, so a brief must never name a step its own contract forbids.
+test_ux_handoff_names_only_steps_its_variant_allows() {
+  local home variant id brief
+  home="$TMP_ROOT/ux-handoff-home"
+  mkdir -p "$home/data"
+  for variant in scout no-mistakes direct-PR local-only; do
+    id="brief-ux-handoff-$variant"
+    scaffold_ux_brief "$home" "$id" "$variant"
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$variant --ux brief was not scaffolded"
+    case "$variant" in
+      no-mistakes|direct-PR)
+        assert_grep "Open a draft PR first when this brief's delivery mode requires one." "$brief" \
+          "$variant --ux brief lost the mode-conditional draft PR"
+        ;;
+      *)
+        assert_no_grep "Open a draft PR first" "$brief" \
+          "$variant --ux brief tells a worker to open a draft PR its contract forbids"
+        ;;
+    esac
+    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+    if [ "$variant" = no-mistakes ]; then
+      assert_grep 'Firstmate starts `/no-mistakes` only after the captain approves the product look.' "$brief" \
+        "no-mistakes --ux brief did not defer its pipeline to product approval"
+      assert_no_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
+        "no-mistakes --ux brief emitted the pipeline-free stage 2 wording as well"
+    else
+      assert_no_grep 'Firstmate starts `/no-mistakes` only after' "$brief" \
+        "$variant --ux brief references a pipeline its delivery contract does not run"
+      assert_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
+        "$variant --ux brief did not gate stage 2 on the captain's approval"
+    fi
+  done
+  pass "fm-brief.sh: --ux handoff names only the PR and pipeline steps each variant allows"
+}
+
+# The stop gate only works if firstmate's own classifier reads it as a captain
+# handoff followed by a deliberate wait. Feed the two status lines the generated
+# contract instructs the worker to append through the real classifier rather than
+# trusting the wording.
+test_ux_handoff_lines_classify_as_captain_handoff_then_wait() {
+  local home id brief done_line wait_line
+  home="$TMP_ROOT/ux-classify-home"
+  mkdir -p "$home/data"
+  id="brief-ux-classify"
+  scaffold_ux_brief "$home" "$id" no-mistakes
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "--ux brief was not scaffolded"
+  # shellcheck disable=SC2016  # single quotes are deliberate: these are sed scripts, not shell expansions
+  done_line=$(sed -n 's/^4\. Stop at `\(done: [^`]*\)`.*/\1/p' "$brief")
+  # shellcheck disable=SC2016  # single quotes are deliberate: these are sed scripts, not shell expansions
+  wait_line=$(sed -n 's/^4\. .*append `\(paused: [^`]*\)`.*/\1/p' "$brief")
+  [ -n "$done_line" ] || fail "--ux brief did not state a done: gate the worker can append"
+  [ -n "$wait_line" ] || fail "--ux brief did not state a wait line the worker can append"
+  # shellcheck source=/dev/null
+  (. "$ROOT/bin/fm-classify-lib.sh" && status_is_captain_relevant "$done_line") \
+    || fail "--ux stage 1 gate '$done_line' does not reach the captain as a handoff"
+  # shellcheck source=/dev/null
+  (. "$ROOT/bin/fm-classify-lib.sh" && status_is_paused "$wait_line") \
+    || fail "--ux stage 1 wait '$wait_line' is not a declared external wait"
+  pass "fm-brief.sh: --ux stage 1 handoff lines classify as a captain gate plus a declared wait"
 }
 
 # The scaffold cannot read the {TASK} text filled in later, so an omitted --ux
@@ -761,6 +833,18 @@ test_pause_verb_override_renders_all_brief_scaffolds() {
     assert_grep 'even when the answer is what started that work' "$brief" \
       "$kind brief did not warn that an answer-started done/working never closes a decision"
   done
+
+  # The product-look handoff ends on a declared wait, so it has to speak the same
+  # configured verb as the rest of the brief rather than a hardcoded "paused".
+  id="brief-pause-verb-ux"
+  FM_HOME="$home" FM_CLASSIFY_PAUSED_VERB=awaiting \
+    "$ROOT/bin/fm-brief.sh" "$id" firstmate --mode no-mistakes --ux >/dev/null 2>&1
+  brief="$home/data/$id/brief.md"
+  # shellcheck disable=SC2016 # Literal backticks must remain unexpanded.
+  assert_grep 'append `awaiting: awaiting captain product review` and wait.' "$brief" \
+    "--ux stage 1 handoff did not render the configured pause verb"
+  assert_no_grep "paused: awaiting captain product review" "$brief" \
+    "--ux stage 1 handoff still declares the default pause verb"
   pass "fm-brief.sh: custom pause verb renders in every scaffold"
 }
 
@@ -818,6 +902,8 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_ux_contract_is_explicit_and_complete
+test_ux_handoff_names_only_steps_its_variant_allows
+test_ux_handoff_lines_classify_as_captain_handoff_then_wait
 test_ux_omission_is_loud_for_ship_and_scout
 test_ux_is_refused_on_secondmate_charters
 test_secondmate_no_projects_charter
