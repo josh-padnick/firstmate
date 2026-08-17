@@ -482,25 +482,70 @@ test_ux_contract_is_explicit_and_complete() {
       "$variant --ux brief did not forbid the full suite in stage 1"
     assert_grep "do not wait on any of those suites before reporting the preview" "$brief" \
       "$variant --ux brief did not forbid waiting on the full suite before the preview"
-    # The stop gate is the canonical `done:` gate plus a declared wait, so it is a
-    # defined gate rather than a nonterminal `working:` line the ship Rules forbid
-    # ending a turn on.
-    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks and placeholder must stay literal
-    assert_grep 'Stop at `done: preview ready <file:// or live URL>`' "$brief" \
-      "$variant --ux brief lost its exact preview-ready stop gate"
-    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
-    assert_grep 'append `paused: awaiting captain product review` and wait.' "$brief" \
-      "$variant --ux brief did not declare the wait that follows the preview gate"
-    assert_no_grep "working: preview ready" "$brief" \
-      "$variant --ux brief still stops on a nonterminal working: line"
     assert_grep 'A "tests green", "Playwright green", or equivalent acceptance line in this brief' "$brief" \
       "$variant --ux brief did not neutralise a conflicting acceptance line in the task text"
-    assert_grep "Stage 2 owns the full unit, contract, and Playwright suites" "$brief" \
-      "$variant --ux brief did not hand the full suite to stage 2"
     assert_no_grep "Product-look stage 1 declaration - NOT ENABLED" "$brief" \
       "$variant --ux brief retained the unguarded declaration"
+    if [ "$variant" = scout ]; then
+      # A scout ships a report and nothing else, so its preview is evidence on the
+      # way to that report: a nonterminal `working:` milestone, never a gate.
+      # shellcheck disable=SC2016  # single quotes are deliberate: the backticks and placeholder must stay literal
+      assert_grep 'append `working: preview ready <file:// or live URL>` once the Chrome pass holds' "$brief" \
+        "scout --ux brief did not require the preview as a nonterminal evidence line"
+      assert_grep "That line is a mid-task milestone, so do not end your turn on it" "$brief" \
+        "scout --ux brief did not mark the preview line nonterminal"
+      assert_grep "Put the same openable \`file://\` or live URLs in the report" "$brief" \
+        "scout --ux brief did not require openable preview links in the report"
+      assert_grep "A scout ships knowledge, not code" "$brief" \
+        "scout --ux brief did not close the full-suite question on its own terms"
+    else
+      # The ship stop gate is the canonical `done:` gate plus a declared wait, so
+      # it is a defined gate rather than a nonterminal `working:` line the ship
+      # Rules forbid ending a turn on.
+      # shellcheck disable=SC2016  # single quotes are deliberate: the backticks and placeholder must stay literal
+      assert_grep 'Stop at `done: preview ready <file:// or live URL>`' "$brief" \
+        "$variant --ux brief lost its exact preview-ready stop gate"
+      # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+      assert_grep 'append `paused: awaiting captain product review` and wait.' "$brief" \
+        "$variant --ux brief did not declare the wait that follows the preview gate"
+      assert_no_grep "working: preview ready" "$brief" \
+        "$variant --ux brief still stops on a nonterminal working: line"
+      assert_grep "Stage 2 owns the full unit, contract, and Playwright suites" "$brief" \
+        "$variant --ux brief did not hand the full suite to stage 2"
+    fi
   done
   pass "fm-brief.sh: --ux emits the complete product-look stage 1 contract"
+}
+
+# A scout has no branch, no PR, and no second stage, so the product-look section
+# must not add a lifecycle to it: the report's own conclusion stays the single
+# terminal gate the worker can end on.
+test_ux_scout_keeps_one_terminal_gate_and_no_stage_two() {
+  local home id brief gates gate_count
+  home="$TMP_ROOT/ux-scout-gate-home"
+  mkdir -p "$home/data"
+  id="brief-ux-scout-gate"
+  scaffold_ux_brief "$home" "$id" scout
+  brief="$home/data/$id/brief.md"
+  assert_present "$brief" "scout --ux brief was not scaffolded"
+  assert_no_grep "done: preview ready" "$brief" \
+    "scout --ux brief turned the preview into a second terminal gate"
+  assert_no_grep "Stage 2" "$brief" \
+    "scout --ux brief refers to a stage 2 the scout contract never defines"
+  assert_grep "A scout has no stage 2" "$brief" \
+    "scout --ux brief did not state that it has no second stage"
+  # The set of done-gate templates the brief defines, normalised and deduplicated:
+  # a scout must offer the worker exactly one way to end on `done:`.
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks are the brief's own gate delimiters
+  gates=$(grep -o '`done: [^`]*`' "$brief" | sort -u)
+  gate_count=$(printf '%s\n' "$gates" | grep -c .)
+  [ "$gate_count" = 1 ] || fail "scout --ux brief defines $gate_count terminal done: gates, expected 1: $gates"
+  # shellcheck disable=SC2016  # single quotes are deliberate: the backticks are the brief's own gate delimiters
+  case "$gates" in
+    '`done: {one-line conclusion}`') : ;;
+    *) fail "scout --ux brief's single terminal gate is not the report conclusion: $gates" ;;
+  esac
+  pass "fm-brief.sh: --scout --ux keeps the report conclusion as the single terminal gate"
 }
 
 # The handoff step is the one part that must differ per variant: a scout and a
@@ -522,26 +567,61 @@ test_ux_handoff_names_only_steps_its_variant_allows() {
           "$variant --ux brief did not name the concrete stage 1 draft PR step"
         assert_grep "Stage 2 updates that same branch and that same draft PR in place; never open a second PR for this task" "$brief" \
           "$variant --ux brief did not keep stage 2 on the same branch and PR"
+        # The draft never leaves draft by the worker's hand, so the brief has to
+        # name the owner instead of deferring to a Definition of done that never
+        # defines the transition.
+        assert_grep "Leave the pull request in draft." "$brief" \
+          "$variant --ux brief did not tell the worker to leave the PR in draft"
+        assert_grep "Marking it ready for review is firstmate's step, taken after the captain approves the product look; you never mark it ready yourself." "$brief" \
+          "$variant --ux brief did not name firstmate as the owner of ready-for-review"
         ;;
       *)
         assert_no_grep "DRAFT pull request" "$brief" \
           "$variant --ux brief tells a worker to open a draft PR its contract forbids"
         assert_no_grep "never open a second PR for this task" "$brief" \
           "$variant --ux brief carries PR-update wording its contract forbids"
+        assert_no_grep "Leave the pull request in draft." "$brief" \
+          "$variant --ux brief carries draft-PR ownership wording for a PR it never opens"
         ;;
     esac
-    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
-    if [ "$variant" = no-mistakes ]; then
-      assert_grep 'Firstmate starts `/no-mistakes` only after the captain approves the product look.' "$brief" \
-        "no-mistakes --ux brief did not defer its pipeline to product approval"
-      assert_no_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
-        "no-mistakes --ux brief emitted the pipeline-free stage 2 wording as well"
-    else
-      assert_no_grep 'Firstmate starts `/no-mistakes` only after' "$brief" \
-        "$variant --ux brief references a pipeline its delivery contract does not run"
-      assert_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
-        "$variant --ux brief did not gate stage 2 on the captain's approval"
-    fi
+    case "$variant" in
+      no-mistakes)
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_grep 'Firstmate starts `/no-mistakes` only after the captain approves the product look.' "$brief" \
+          "no-mistakes --ux brief did not defer its pipeline to product approval"
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_grep 'firstmate tells you to start `/no-mistakes`; the pipeline updates this same branch and this same PR.' "$brief" \
+          "no-mistakes --ux brief did not say the pipeline reuses the stage 1 branch and PR"
+        assert_no_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
+          "no-mistakes --ux brief emitted the pipeline-free stage 2 wording as well"
+        ;;
+      direct-PR)
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_grep 'Your Definition of done is unchanged: push, open the PR (the draft one you opened above), append `done: PR {url}`. Firstmate owns ready-for-review and merge afterwards.' "$brief" \
+          "direct-PR --ux brief did not reconcile its definition of done with the stage 1 draft PR"
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_no_grep 'Firstmate starts `/no-mistakes` only after' "$brief" \
+          "direct-PR --ux brief references a pipeline its delivery contract does not run"
+        assert_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
+          "direct-PR --ux brief did not gate stage 2 on the captain's approval"
+        ;;
+      local-only)
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_no_grep 'Firstmate starts `/no-mistakes` only after' "$brief" \
+          "local-only --ux brief references a pipeline its delivery contract does not run"
+        assert_no_grep "Firstmate owns ready-for-review" "$brief" \
+          "local-only --ux brief carries PR-ownership wording for a mode with no PR"
+        assert_grep "Stage 2 begins only after the captain approves the product look." "$brief" \
+          "local-only --ux brief did not gate stage 2 on the captain's approval"
+        ;;
+      *)
+        # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+        assert_no_grep 'Firstmate starts `/no-mistakes` only after' "$brief" \
+          "scout --ux brief references a pipeline it never runs"
+        assert_no_grep "Firstmate owns ready-for-review" "$brief" \
+          "scout --ux brief carries PR-ownership wording for a kind with no PR"
+        ;;
+    esac
   done
   pass "fm-brief.sh: --ux handoff names only the PR and pipeline steps each variant allows"
 }
@@ -920,6 +1000,7 @@ test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
 test_ux_contract_is_explicit_and_complete
+test_ux_scout_keeps_one_terminal_gate_and_no_stage_two
 test_ux_handoff_names_only_steps_its_variant_allows
 test_ux_handoff_lines_classify_as_captain_handoff_then_wait
 test_ux_omission_is_loud_for_ship_and_scout
