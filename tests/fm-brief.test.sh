@@ -174,6 +174,9 @@ test_help_includes_entire_header() {
   local help
   help=$("$ROOT/bin/fm-brief.sh" --help)
   assert_contains "$help" "Refuses to overwrite an existing brief." "fm-brief.sh --help omitted its header terminator"
+  assert_contains "$help" "[--ux]" "fm-brief.sh --help omitted --ux from its usage lines"
+  assert_contains "$help" "--ux is mandatory when the captain will look at the experience" \
+    "fm-brief.sh --help does not document when --ux is required"
   pass "fm-brief.sh: --help renders the complete header"
 }
 
@@ -437,6 +440,96 @@ test_herdr_lab_omission_is_loud_for_ship_and_scout() {
       "$kind brief missing the fail-visible regeneration instruction"
   done
   pass "fm-brief.sh: ship and scout scaffolds make omitted Herdr intent fail-visible"
+}
+
+# A product-look task is staged: the captain sees the experience before any full
+# suite runs. The generated contract has to carry every clause the worker would
+# otherwise resolve the wrong way against an acceptance line reading "tests
+# green" next to "stop for product look", so assert each clause, on ship and
+# scout alike.
+test_ux_contract_is_explicit_and_complete() {
+  local home kind id brief
+  home="$TMP_ROOT/ux-contract-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    id="brief-ux-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --scout --ux >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --mode no-mistakes --ux >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$kind --ux brief was not scaffolded"
+    assert_grep "# Product-look stage 1 - HARD CONTRACT" "$brief" \
+      "$kind --ux brief missing its hard product-look contract"
+    assert_grep "the captain reviews this experience before any full suite runs" "$brief" \
+      "$kind --ux brief did not put the captain's look ahead of the full suite"
+    assert_grep "Stage 1 self-verify is Chrome plus a targeted test of the changed behavior only." "$brief" \
+      "$kind --ux brief did not scope stage 1 self-verify to Chrome plus a targeted test"
+    assert_grep "in BOTH light and dark, at every viewport this task declares, using real pointer gestures" "$brief" \
+      "$kind --ux brief lost the light/dark, viewport, and real-gesture self-verify terms"
+    assert_grep "Do NOT run the full unit, contract, or Playwright suite in stage 1" "$brief" \
+      "$kind --ux brief did not forbid the full suite in stage 1"
+    assert_grep "do not wait on any of those suites before reporting the preview" "$brief" \
+      "$kind --ux brief did not forbid waiting on the full suite before the preview"
+    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks and placeholder must stay literal
+    assert_grep 'Stop at `working: preview ready <file:// or live URL>`' "$brief" \
+      "$kind --ux brief lost its exact preview-ready stop gate"
+    assert_grep "open a draft PR first when this brief's delivery mode requires one" "$brief" \
+      "$kind --ux brief lost the mode-conditional draft PR"
+    # shellcheck disable=SC2016  # single quotes are deliberate: the backticks must stay literal
+    assert_grep 'Firstmate starts `/no-mistakes` only after the captain approves the product look.' "$brief" \
+      "$kind --ux brief did not defer the pipeline to product approval"
+    assert_grep 'A "tests green", "Playwright green", or equivalent acceptance line in this brief' "$brief" \
+      "$kind --ux brief did not neutralise a conflicting acceptance line in the task text"
+    assert_grep "Stage 2 owns the full unit, contract, and Playwright suites" "$brief" \
+      "$kind --ux brief did not hand the full suite to stage 2"
+    assert_no_grep "Product-look stage 1 declaration - NOT ENABLED" "$brief" \
+      "$kind --ux brief retained the unguarded declaration"
+  done
+  pass "fm-brief.sh: --ux emits the complete product-look stage 1 contract"
+}
+
+# The scaffold cannot read the {TASK} text filled in later, so an omitted --ux
+# must be visible in the brief itself rather than silently absent.
+test_ux_omission_is_loud_for_ship_and_scout() {
+  local home kind id brief
+  home="$TMP_ROOT/ux-gate-home"
+  mkdir -p "$home/data"
+  for kind in ship scout; do
+    id="brief-ux-gate-$kind"
+    if [ "$kind" = scout ]; then
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --scout >/dev/null 2>&1
+    else
+      FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" someapp --mode no-mistakes >/dev/null 2>&1
+    fi
+    brief="$home/data/$id/brief.md"
+    assert_grep "# Product-look stage 1 declaration - NOT ENABLED" "$brief" \
+      "$kind brief silently omitted the product-look declaration"
+    assert_grep "regenerate the brief with \`--ux\` before implementing" "$brief" \
+      "$kind brief missing the fail-visible regeneration instruction"
+    assert_grep "Do not add a product-look stage-1 contract to this unguarded brief by hand." "$brief" \
+      "$kind brief did not forbid a hand-written product-look contract"
+    assert_no_grep "# Product-look stage 1 - HARD CONTRACT" "$brief" \
+      "$kind brief without --ux emitted the enabled contract"
+  done
+  pass "fm-brief.sh: ship and scout scaffolds make omitted product-look intent fail-visible"
+}
+
+# A charter has no task surface to preview and no stage gate, so accepting --ux
+# there would record a contract that means nothing.
+test_ux_is_refused_on_secondmate_charters() {
+  local home out status
+  home="$TMP_ROOT/ux-secondmate-home"
+  mkdir -p "$home/data"
+  out=$(FM_HOME="$home" FM_SECONDMATE_CHARTER='Supervise the app domain.' \
+    "$ROOT/bin/fm-brief.sh" ux-secondmate --secondmate --no-projects --ux 2>&1); status=$?
+  expect_code 1 "$status" "secondmate --ux must be rejected"
+  assert_contains "$out" "--ux applies only to crewmate ship or scout briefs" \
+    "secondmate --ux refusal did not explain why"
+  assert_absent "$home/data/ux-secondmate/brief.md" \
+    "rejected secondmate --ux still wrote a brief"
+  pass "fm-brief.sh: --ux is refused on secondmate charters and writes nothing"
 }
 
 test_secondmate_no_projects_charter() {
@@ -724,6 +817,9 @@ test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
 test_herdr_lab_omission_is_loud_for_ship_and_scout
 test_herdr_lab_contract_applies_to_scouts_but_not_secondmates
+test_ux_contract_is_explicit_and_complete
+test_ux_omission_is_loud_for_ship_and_scout
+test_ux_is_refused_on_secondmate_charters
 test_secondmate_no_projects_charter
 test_secondmate_marked_request_reporting_contract
 test_secondmate_directory_paths_are_absolute_and_output_is_stable

@@ -6,8 +6,8 @@
 # description, acceptance criteria, and context, and may adjust other sections
 # when the task genuinely deviates (e.g. working an existing external PR instead
 # of shipping a new one).
-# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab]
-#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab]
+# Usage: fm-brief.sh <task-id> <repo-name> --mode <no-mistakes|direct-PR|local-only> [--herdr-lab] [--ux]
+#        fm-brief.sh <task-id> <repo-name> --scout [--herdr-lab] [--ux]
 #        fm-brief.sh <task-id> --secondmate {<project>...|--no-projects}
 #   --scout writes the scout contract instead: the deliverable is a report at
 #   data/<task-id>/report.md (no branch, no push, no PR) and the worktree is scratch.
@@ -27,6 +27,17 @@
 #   The flag must be explicit because {TASK} is filled after scaffolding and the
 #   caller-supplied repo string cannot reliably identify this repo. Briefs made
 #   without it carry a loud declaration so an omitted contract cannot be silent.
+#   --ux is mandatory when the captain will look at the experience the task changes.
+#   It adds the two-stage product-look contract: stage 1 self-verifies in Chrome (light
+#   and dark, the declared viewports, real pointer gestures) plus a targeted test of the
+#   changed behavior only, never the full unit, contract, or Playwright suite, and stops
+#   at "working: preview ready <file:// or live URL>" so the captain reviews the
+#   experience before stage 2 runs. Without it, an acceptance criterion reading "tests
+#   green" next to "stop for product look" is read as one stage and the worker burns the
+#   full suite before the captain has seen anything. The contract outranks such a line in
+#   the task text; stage 2 owns the full suite. The flag is explicit for the same reason
+#   as --herdr-lab, and briefs made without it carry the same loud declaration.
+#   Both flags apply to crewmate ship and scout briefs only; a charter is neither.
 # For ship tasks, --mode is REQUIRED and shapes the definition of done. Firstmate
 # resolves it per task at intake (AGENTS.md section 7); data/projects.md holds the
 # captain's standing posture as context, and this script never reads it:
@@ -103,6 +114,7 @@ else
 fi
 KIND=ship
 HERDR_LAB=0
+UX=0
 NO_PROJECTS=0
 MODE=
 MODE_SET=0
@@ -124,6 +136,7 @@ for a in "$@"; do
     --scout) KIND=scout ;;
     --secondmate) KIND=secondmate ;;
     --herdr-lab) HERDR_LAB=1 ;;
+    --ux) UX=1 ;;
     --no-projects) NO_PROJECTS=1 ;;
     --mode) want_value=mode ;;
     --mode=*) MODE=${a#--mode=}; MODE_SET=1 ;;
@@ -158,6 +171,13 @@ ID=${POS[0]}
 
 if [ "$KIND" = secondmate ] && [ "$HERDR_LAB" -eq 1 ]; then
   echo "error: --herdr-lab applies only to crewmate ship or scout briefs" >&2
+  exit 1
+fi
+
+# A charter has no task surface to preview and no stage gate, so a product-look
+# contract on one would be accepted and then mean nothing. Refuse instead.
+if [ "$KIND" = secondmate ] && [ "$UX" -eq 1 ]; then
+  echo "error: --ux applies only to crewmate ship or scout briefs" >&2
   exit 1
 fi
 
@@ -298,6 +318,35 @@ EOF
 HERDR_SECTION=${HERDR_SECTION%$'\n'}
 fi
 
+# Product-look staging. Both branches are quoted heredocs read into a variable
+# (never wrapped in a command substitution, see tests/fm-brief.test.sh) so the
+# backticks and shell-looking text below reach the worker verbatim.
+if [ "$UX" -eq 1 ]; then
+IFS= read -r -d '' UX_SECTION <<'EOF' || true
+# Product-look stage 1 - HARD CONTRACT
+This brief was explicitly scaffolded with `--ux` because the captain reviews this experience before any full suite runs.
+The work ships in two stages, and this section is the authority on what stage 1 does.
+
+1. The captain reviews the experience first. Nothing in stage 1 waits on a full suite, and no full-suite result gates the preview.
+2. Stage 1 self-verify is Chrome plus a targeted test of the changed behavior only.
+   Drive the real surface with `chrome-devtools-axi` in BOTH light and dark, at every viewport this task declares, using real pointer gestures rather than synthetic events or a screenshot-only pass.
+   Run only the targeted test that covers the behavior you changed.
+3. Do NOT run the full unit, contract, or Playwright suite in stage 1, and do not wait on any of those suites before reporting the preview.
+4. Stop at `working: preview ready <file:// or live URL>` and wait; open a draft PR first when this brief's delivery mode requires one.
+   Firstmate starts `/no-mistakes` only after the captain approves the product look.
+5. A "tests green", "Playwright green", or equivalent acceptance line in this brief's task text does not override this section.
+   Stage 2 owns the full unit, contract, and Playwright suites and every remaining gate; that acceptance criterion is satisfied there, not here.
+EOF
+else
+IFS= read -r -d '' UX_SECTION <<'EOF' || true
+# Product-look stage 1 declaration - NOT ENABLED
+**HARD SAFETY GATE:** this scaffold cannot inspect the task text that replaces `{TASK}` later.
+If this is UX-bearing work the captain will look at, stop and regenerate the brief with `--ux` before implementing.
+Do not add a product-look stage-1 contract to this unguarded brief by hand.
+EOF
+fi
+UX_SECTION=${UX_SECTION%$'\n'}
+
 if [ "$KIND" = scout ]; then
 cat > "$BRIEF" <<EOF
 You are a crewmate: an autonomous worker agent managed by firstmate. Work on your own; do not wait for a human.
@@ -306,6 +355,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 {TASK}
 
 $HERDR_SECTION
+
+$UX_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
@@ -416,6 +467,8 @@ You are a crewmate: an autonomous worker agent managed by firstmate. Work on you
 {TASK}
 
 $HERDR_SECTION
+
+$UX_SECTION
 
 # Setup
 You are in a disposable git worktree of $REPO, at a detached HEAD on a clean default branch.
