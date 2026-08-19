@@ -64,9 +64,12 @@
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
 # Greptile dispatch carries those rules, including a fix round on a PR Greptile
-# already owns. A PR Greptile owns at zero remaining is released with
-# `record <pr-url> greptile exhausted`, which is what actually happened: no
-# dispatch was made.
+# already owns. How a PR is released is never inferred from the balance: which
+# event happened - the service declined, or nothing was dispatched because the
+# pool was dry - is a fact only the operator saw, so a refusal names every
+# release the ledger could truthfully record and lets the operator pick the one
+# that occurred. release_step builds every release command; no other path
+# constructs one, so the wording cannot drift back apart.
 #
 # A fix-round re-review is counted as one more Greptile credit, because Greptile
 # bills a second credit for a re-review on the same PR.
@@ -523,13 +526,15 @@ service_logins() {  # <service>
   esac
 }
 
-# How a PR is handed on from its current owner. Which release happened - the
-# service declined, or nothing was dispatched because the pool was dry - is a
-# fact only the operator saw, so this never derives one from a balance. Where
-# the ledger leaves both possible, it states the balance and names both
-# commands with the condition that tells them apart; where only one release can
-# be true, it names that one. No printed command asks the operator to record an
-# event that did not occur.
+# How a PR is handed on from its current owner, and the single place a release
+# command is built. Which release happened - the service declined, or nothing
+# was dispatched because the pool was dry - is a fact only the operator saw, so
+# this never derives one from a balance. Where the ledger leaves both possible,
+# it states the balance and names both commands with the condition that tells
+# them apart; where only one release can be true, it names that one. No printed
+# command asks the operator to record an event that did not occur. Every caller
+# that needs release wording calls this rather than composing its own, so the
+# two cannot drift apart.
 release_step() {  # <pr-url> <owner>
   local url=$1 owner=$2
   if [ "$owner" = greptile ] && [ "$(greptile_remaining)" -le 0 ]; then
@@ -543,14 +548,16 @@ release_step() {  # <pr-url> <owner>
 # Every Greptile dispatch passes here first: refused outright at zero because
 # the $0 flex cap would make the review a no-op, warned at or below the reserve
 # floor. Auto-picks never reach it - they stop above the floor on their own.
-# Only a PR Greptile actually owns is told to record the `exhausted` release;
-# the ledger is never asked to record a release that did not happen.
+# Only a PR Greptile actually owns has a release to record, and release_step
+# states it: a dry pool alone does not prove the dispatch was never made, so
+# the guard states the cap and delegates the wording rather than choosing an
+# event from the balance.
 greptile_guard() {  # <pr-url> owner|unowned
   local url=$1 held=$2 remaining
   remaining=$(greptile_remaining)
   if [ "$remaining" -le 0 ]; then
     if [ "$held" = owner ]; then
-      refuse "the ledger shows 0 Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
+      refuse "the flex cap is \$0, so a Greptile review would be skipped; $(release_step "$url" greptile) - or reconcile against the dashboard if it disagrees"
     fi
     refuse "the ledger shows 0 Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
   fi

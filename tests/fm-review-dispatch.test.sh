@@ -354,12 +354,14 @@ test_an_exhausted_pool_releases_the_pr_to_the_in_house_review() {
   dispatch "$data" reconcile greptile 0
 
   # A fix round with no credits left is refused, and the refusal must name the
-  # command that records what actually happened.
+  # releases that could have happened rather than picking one from the balance.
   dispatch "$data" choose "$PR_A"
   out=$DISPATCH_OUT
   expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused"
   assert_contains "$out" "record $PR_A greptile exhausted" \
     "the refusal named no supported way forward"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the refusal offered no way to record a refusal that really happened"
 
   dispatch "$data" record "$PR_A" greptile exhausted
   expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
@@ -616,15 +618,27 @@ test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own() {
   pass "recording a review from a non-owner surfaces the leak as it is written"
 }
 
-test_a_release_step_names_the_event_that_actually_happened() {
+test_every_release_path_names_the_events_the_ledger_could_record() {
   local data out
   data=$(new_home release-step)
   dispatch "$data" record "$PR_A" coderabbit refused
   dispatch "$data" record "$PR_A" greptile requested
   dispatch "$data" reconcile greptile 0
 
-  # Greptile owns this PR and its pool is dry, so every path that hands the PR
-  # on must name the exhaustion that happened - never a refusal it never made.
+  # Greptile owns this PR and its pool is dry, so both releases are still
+  # possible: greptile may have declined, or it may never have been dispatched.
+  # Only the operator saw which, so every path that hands the PR on must name
+  # both and let them record the one that happened. A plain fix-round `choose`
+  # is checked alongside the transfer paths because it is the command an
+  # operator reaches for first, and it once named the exhaustion on its own.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the fix-round refusal named no release for a credit-starved owner"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the fix-round refusal named no release for a service that declined while the pool was dry"
+
   dispatch "$data" choose "$PR_A" --after-refusal
   out=$DISPATCH_OUT
   expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
@@ -645,15 +659,17 @@ test_a_release_step_names_the_event_that_actually_happened() {
   assert_contains "$out" "record $PR_A greptile exhausted" \
     "the record refusal named no release for a credit-starved owner"
 
-  # With credits on hand there is no exhaustion to record, so the same paths
-  # name the refusal instead.
+  # With credits on hand no dispatch can have been skipped for want of one, so
+  # only the refusal is possible and the same paths name it alone.
   dispatch "$data" reconcile greptile 20
   dispatch "$data" choose "$PR_A" --after-refusal
   out=$DISPATCH_OUT
   assert_contains "$out" "record $PR_A greptile refused" \
     "a pool with credits left was released as exhausted"
+  assert_not_contains "$out" "record $PR_A greptile exhausted" \
+    "a pool with credits left still offered an exhaustion that could not have happened"
 
-  pass "every printed release names the event the ledger would truthfully record"
+  pass "every printed release names each event the ledger could truthfully record"
 }
 
 test_status_reports_a_pending_fix_round_as_awaiting_review() {
@@ -867,7 +883,7 @@ test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
 test_an_exhausted_pool_refunds_nothing
 test_check_accepts_the_comment_a_released_owner_left_behind
 test_the_in_house_reason_states_only_what_the_ledger_records
-test_a_release_step_names_the_event_that_actually_happened
+test_every_release_path_names_the_events_the_ledger_could_record
 test_status_reports_a_pending_fix_round_as_awaiting_review
 test_a_dry_standing_owner_is_offered_both_releases
 test_the_plan_facts_are_configurable_and_validated
