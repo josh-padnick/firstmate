@@ -37,7 +37,8 @@
 #
 # Exactly one owner per PR: the first recorded `requested` row makes that
 # service the PR's review owner. Fix rounds re-use the same owner, so `choose`
-# on an owned PR prints that owner and refuses to name a different one.
+# on an owned PR prints that owner - with the same cost and `record` step as any
+# other dispatch - and refuses to name a different one.
 # Ownership moves only after a `refused` row for the current owner.
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
@@ -45,7 +46,15 @@
 # ledger records as refused likewise spent no credit and is not counted.
 # Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
 # is captain-explicit only (--service greptile), and at zero remaining it is
-# refused outright because the cap would make the dispatch a no-op.
+# refused outright because the cap would make the dispatch a no-op. Every
+# Greptile dispatch carries those rules, including a fix round on a PR Greptile
+# already owns.
+#
+# A fix-round re-review is counted as one more Greptile credit. Whether Greptile
+# actually bills a second credit for a re-review is an unconfirmed assumption,
+# counted because over-counting only stops auto-picks early while under-counting
+# spends past the reserve floor into a $0-capped no-op. `reconcile` against the
+# dashboard is where this number is corrected, so it is worth checking there.
 #
 # Devin is reserve. `choose` reaches it only on explicit captain choice
 # (--service devin) or, in the after-refusal chain, when the captain has read
@@ -259,8 +268,10 @@ greptile_remaining() {
   # A dispatch the ledger later records as refused consumed no credit, so its
   # `requested` row is cancelled by that PR's next `refused` row. A recorded
   # `reviewed` row locks that credit in first: a service that refuses a later
-  # fix round on a PR it already reviewed still spent the credit. The ledger's
-  # silence stays conservative: a dispatch with no recorded refusal is spent.
+  # fix round on a PR it already reviewed still spent the credit, and a review
+  # with no dispatch of its own behind it - the leak `record` warns about -
+  # counts as spend on its own. The ledger's silence stays conservative: a
+  # dispatch with no recorded refusal is spent.
   while IFS=$'\t' read -r ts pr service event note; do
     [ "$service" = greptile ] || continue
     case "$ts" in "$month"-*) : ;; *) continue ;; esac
@@ -282,6 +293,7 @@ greptile_remaining() {
       reviewed)
         case "$unrefused" in
           *" $pr "*) unrefused=${unrefused/ $pr / } ;;
+          *) used=$((used + 1)) ;;
         esac
         ;;
       refused)
@@ -341,6 +353,21 @@ service_logins() {  # <service>
   esac
 }
 
+# Every Greptile dispatch passes here first: refused outright at zero because
+# the $0 flex cap would make the review a no-op, warned at or below the reserve
+# floor. Auto-picks never reach it - they stop above the floor on their own.
+greptile_guard() {
+  local remaining
+  remaining=$(greptile_remaining)
+  if [ "$remaining" -le 0 ]; then
+    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; reconcile against the dashboard if it disagrees"
+  fi
+  if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
+    printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
+      "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
+  fi
+}
+
 print_choice() {  # <pr-url> <service> <reason>
   local url=$1 service=$2 reason=$3
   printf 'service: %s\n' "$service"
@@ -389,9 +416,10 @@ cmd_choose() {
     if [ "$after_refusal" = 1 ]; then
       refuse "$url is still owned by $PR_OWNER; record the refusal first: bin/fm-review-dispatch.sh record $url $PR_OWNER refused"
     fi
-    printf 'service: %s\n' "$PR_OWNER"
-    printf 'trigger: %s\n' "$(service_trigger "$PR_OWNER")"
-    printf 'reason: existing owner of this PR; fix rounds re-use it\n'
+    if [ "$PR_OWNER" = greptile ]; then
+      greptile_guard
+    fi
+    print_choice "$url" "$PR_OWNER" "existing owner of this PR; fix rounds re-use it"
     return 0
   fi
 
@@ -405,14 +433,7 @@ cmd_choose() {
       reason="retry after the recorded $explicit refusal; wait beats switch"
     fi
     if [ "$explicit" = greptile ]; then
-      remaining=$(greptile_remaining)
-      if [ "$remaining" -le 0 ]; then
-        refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; reconcile against the dashboard if it disagrees"
-      fi
-      if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
-        printf 'warning: %s credits remain, at or below the reserve floor of %s; captain-explicit dispatch only\n' \
-          "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
-      fi
+      greptile_guard
     fi
     print_choice "$url" "$explicit" "$reason"
     return 0

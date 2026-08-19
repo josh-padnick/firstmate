@@ -248,6 +248,96 @@ SH
   pass "the consistency check accepts comment evidence from the owner and flags any other"
 }
 
+test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch() {
+  local data out
+  data=$(new_home fix-round)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+
+  # A fix round on a greptile-owned PR re-uses the owner, and re-triggering a
+  # paid reviewer is a dispatch like any other: it costs a credit and has a
+  # ledger step.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fix round on an owned PR must still answer"
+  assert_contains "$out" 'service: greptile' \
+    "a fix round did not re-use the recorded owner"
+  assert_contains "$out" 'cost: 1 credit' \
+    "a paid fix-round re-review was priced as free"
+  assert_contains "$out" "record $PR_A greptile requested" \
+    "the fix round did not print the step that puts the re-trigger on the ledger"
+
+  # Following that step is what makes the second credit countable.
+  dispatch "$data" record "$PR_A" greptile requested
+  expect_code 0 "$DISPATCH_RC" "recording a fix-round re-trigger must be accepted"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 48 of 50 credits remaining' \
+    "the recorded fix-round re-trigger did not count against the month"
+
+  # CodeRabbit's window costs nothing, so its fix rounds stay free.
+  dispatch "$data" record "$PR_B" coderabbit requested
+  dispatch "$data" choose "$PR_B"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a coderabbit fix round must still answer"
+  assert_contains "$out" 'service: coderabbit' \
+    "a coderabbit fix round did not re-use the recorded owner"
+  assert_not_contains "$out" 'cost:' \
+    "the zero-cost hourly service was priced on a fix round"
+  assert_not_contains "$out" 'reserve floor' \
+    "a free fix round warned about the depletable reserve"
+
+  pass "a fix round is priced and recorded exactly like the dispatch it repeats"
+}
+
+test_a_fix_round_cannot_dispatch_greptile_at_zero_credits() {
+  local data out
+  data=$(new_home fix-round-zero)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # The $0 flex cap has no fix-round exception: the review would be skipped.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused like any other dispatch"
+  assert_contains "$out" 'flex cap' \
+    "the refusal did not explain why the re-review would produce nothing"
+  assert_not_contains "$out" 'trigger: @greptileai' \
+    "the refused fix round still handed over a trigger comment"
+
+  # And a fix round at the floor warns before it spends the reserve.
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fix round at the floor must still be allowed"
+  assert_contains "$out" 'reserve floor' \
+    "a fix round spent from the reserve without warning"
+
+  pass "a fix round carries the zero-credit refusal and the reserve-floor warning"
+}
+
+test_a_review_with_no_dispatch_behind_it_counts_as_spend() {
+  local data out
+  data=$(new_home leaked-review)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  # The leak `record` warns about consumed a real credit even though no
+  # greptile dispatch was ever recorded for this PR.
+  dispatch "$data" record "$PR_A" greptile reviewed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "recording a leaked review must still succeed"
+  assert_contains "$out" 'recording the leak' \
+    "the leak was not surfaced at the record boundary"
+
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "a greptile review with no recorded dispatch was counted as free"
+
+  pass "a greptile review with no dispatch behind it still counts against the month"
+}
+
 test_bad_input_is_refused_before_anything_is_written() {
   local data
   data=$(new_home input)
@@ -423,4 +513,7 @@ test_the_retry_after_a_refusal_is_an_executable_path
 test_a_refused_dispatch_spends_no_credit
 test_a_completed_review_keeps_its_credit_through_a_later_refusal
 test_the_ledger_directory_is_private
+test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch
+test_a_fix_round_cannot_dispatch_greptile_at_zero_credits
+test_a_review_with_no_dispatch_behind_it_counts_as_spend
 test_bad_input_is_refused_before_anything_is_written
