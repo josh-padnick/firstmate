@@ -327,59 +327,6 @@ test_a_fix_round_cannot_dispatch_greptile_at_zero_credits() {
   pass "a fix round carries the zero-credit refusal and the reserve-floor warning"
 }
 
-test_a_review_with_no_dispatch_behind_it_counts_as_spend() {
-  local data out
-  data=$(new_home leaked-review)
-  dispatch "$data" record "$PR_A" coderabbit requested
-
-  # The leak `record` warns about consumed a real credit even though no
-  # greptile dispatch was ever recorded for this PR.
-  dispatch "$data" record "$PR_A" greptile reviewed
-  out=$DISPATCH_OUT
-  expect_code 0 "$DISPATCH_RC" "recording a leaked review must still succeed"
-  assert_contains "$out" 'recording the leak' \
-    "the leak was not surfaced at the record boundary"
-
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "a greptile review with no recorded dispatch was counted as free"
-
-  pass "a greptile review with no dispatch behind it still counts against the month"
-}
-
-test_a_review_is_charged_once_across_a_counting_window() {
-  local data out
-  data=$(new_home cross-window)
-
-  # A dispatch in July is July's credit. Recording the review it produced in
-  # August must not bill August a second time for it.
-  dispatch_at 2026-07-30T10:00:00Z "$data" record "$PR_A" greptile requested
-  dispatch_at 2026-07-30T11:00:00Z "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "the july dispatch did not count against july"
-
-  dispatch_at 2026-08-02T10:00:00Z "$data" record "$PR_A" greptile reviewed
-  dispatch_at 2026-08-02T11:00:00Z "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 50 of 50 credits remaining' \
-    "a review was charged to a month that never dispatched it"
-
-  # A reconcile baseline already reflects the dispatches behind it, so a review
-  # recorded after one must not be counted forward again.
-  data=$(new_home cross-baseline)
-  dispatch_at 2026-08-05T10:00:00Z "$data" record "$PR_B" greptile requested
-  dispatch_at 2026-08-06T10:00:00Z "$data" reconcile greptile 45
-  dispatch_at 2026-08-07T10:00:00Z "$data" record "$PR_B" greptile reviewed
-  dispatch_at 2026-08-07T11:00:00Z "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 45 of 50 credits remaining' \
-    "a review was charged again on top of the baseline that already held it"
-
-  pass "a review is charged once, in the window its own dispatch was counted"
-}
-
 test_an_exhausted_pool_releases_the_pr_to_the_in_house_review() {
   local data out
   data=$(new_home exhausted)
@@ -479,29 +426,6 @@ SH
   pass "a refused or exhausted release explains that service's comment on the PR"
 }
 
-test_a_re_review_of_one_pr_is_charged_again() {
-  local data out
-  data=$(new_home re-review)
-  dispatch "$data" record "$PR_A" coderabbit refused
-  dispatch "$data" record "$PR_A" greptile requested
-  dispatch "$data" record "$PR_A" greptile reviewed
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "the first review did not pair with the dispatch that produced it"
-
-  # Greptile bills a second credit for a re-review of the same PR, so a second
-  # review with only one dispatch behind it is a second credit spent.
-  dispatch "$data" record "$PR_A" greptile reviewed
-  expect_code 0 "$DISPATCH_RC" "recording a fix-round review must succeed"
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 48 of 50 credits remaining' \
-    "a re-review of the same PR was counted as free"
-
-  pass "each greptile review beyond its PR's dispatches costs another credit"
-}
-
 test_the_in_house_reason_states_only_what_the_ledger_records() {
   local data out
   data=$(new_home in-house-reason)
@@ -530,6 +454,86 @@ test_the_in_house_reason_states_only_what_the_ledger_records() {
   pass "the in-house choice reports the ledger's own state and nothing more"
 }
 
+# One ledger per case, so a case cannot inherit another's rows. Each row is
+# "<iso8601-utc>,<service>,<event>" - or "<iso8601-utc>,reconcile,<number>" for
+# a relayed dashboard baseline - and <expected> is the credits the ledger must
+# report remaining when `status` runs at <status-at>.
+charge_case() {  # <name> <expected> <status-at> <row>...
+  local name=$1 expected=$2 at=$3 data row ts field service event
+  shift 3
+  data=$(new_home "charge-$name")
+  for row in "$@"; do
+    IFS=, read -r ts service field <<< "$row"
+    if [ "$service" = reconcile ]; then
+      dispatch_at "$ts" "$data" reconcile greptile "$field"
+    else
+      event=$field
+      dispatch_at "$ts" "$data" record "$PR_A" "$service" "$event"
+    fi
+    expect_code 0 "$DISPATCH_RC" "$name: the ledger rejected the row '$row'"
+  done
+  dispatch_at "$at" "$data" status
+  assert_contains "$DISPATCH_OUT" "greptile: $expected of 50 credits remaining" \
+    "$name: the ledger charged the wrong number of greptile credits"
+}
+
+test_the_greptile_charge_table() {
+  local aug=2026-08-19T10:00:00Z
+
+  # Per PR the ledger charges max(dispatches not cancelled by a later refusal,
+  # recorded reviews). Every row below is a case this contract has been ruled
+  # on, kept together so the whole of it reads at a glance.
+  charge_case plain-dispatch 49 "$aug" \
+    "$aug,greptile,requested"
+  charge_case refunded-dispatch 50 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused"
+  charge_case retry-path 49 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested"
+  charge_case true-leak 49 "$aug" \
+    "$aug,greptile,reviewed"
+  charge_case same-pr-re-review 48 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,reviewed"
+  charge_case reviewed-then-refused 49 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,refused"
+  charge_case refused-then-reviewed 49 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,reviewed"
+  charge_case refunded-then-re-reviewed 48 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested" \
+    "$aug,greptile,reviewed" "$aug,greptile,reviewed"
+  charge_case two-dispatches-two-reviews 48 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed"
+
+  # A credit is charged to the window its own dispatch was recorded in. July
+  # pays for the dispatch; August, where only the review lands, pays nothing.
+  charge_case cross-window-july 49 2026-07-30T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+  charge_case cross-window-august 50 2026-08-02T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+
+  # A relayed dashboard number already reflects the dispatches before it, so a
+  # review recorded after the baseline does not count forward a second time.
+  charge_case reconcile-baseline 45 2026-08-07T11:00:00Z \
+    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-06T10:00:00Z,reconcile,45" \
+    "2026-08-07T10:00:00Z,greptile,reviewed"
+
+  pass "the greptile ledger charges each credit once, in the window that owns it"
+}
+
+test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own() {
+  local data out
+  data=$(new_home leaked-review)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  dispatch "$data" record "$PR_A" greptile reviewed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "recording a leaked review must still succeed"
+  assert_contains "$out" 'recording the leak' \
+    "the leak was not surfaced at the record boundary"
+
+  pass "recording a review from a non-owner surfaces the leak as it is written"
+}
+
 test_bad_input_is_refused_before_anything_is_written() {
   local data
   data=$(new_home input)
@@ -546,65 +550,6 @@ test_bad_input_is_refused_before_anything_is_written() {
     "a refused request still wrote to the ledger"
 
   pass "invalid input is refused before any ledger row is written"
-}
-
-test_a_refused_dispatch_spends_no_credit() {
-  local data out
-  data=$(new_home refunded)
-
-  # A greptile dispatch that the ledger later records as refused consumed
-  # nothing, so the month's remaining credits must come back.
-  dispatch "$data" record "$PR_A" coderabbit refused
-  dispatch "$data" record "$PR_A" greptile requested
-  expect_code 0 "$DISPATCH_RC" "recording a greptile dispatch must succeed"
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "an in-flight greptile dispatch did not count against the month"
-
-  dispatch "$data" record "$PR_A" greptile refused
-  expect_code 0 "$DISPATCH_RC" "recording a greptile refusal must succeed"
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 50 of 50 credits remaining' \
-    "a refused greptile dispatch still burned a credit"
-
-  # The ledger's silence stays conservative: a dispatch with no recorded
-  # refusal is spent.
-  dispatch "$data" record "$PR_B" coderabbit refused
-  dispatch "$data" record "$PR_B" greptile requested
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "an unrefused greptile dispatch stopped counting as spent"
-
-  pass "only greptile dispatches without a recorded refusal count against the month"
-}
-
-test_a_completed_review_keeps_its_credit_through_a_later_refusal() {
-  local data out
-  data=$(new_home reviewed-then-refused)
-
-  # Greptile reviews round one, then rate-limits on a fix round, so the
-  # operator records the refusal that hands the PR on. The delivered review
-  # spent its credit and must not be refunded by that later refusal.
-  dispatch "$data" record "$PR_A" coderabbit refused
-  dispatch "$data" record "$PR_A" greptile requested
-  dispatch "$data" record "$PR_A" greptile reviewed
-  expect_code 0 "$DISPATCH_RC" "recording a delivered review must succeed"
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "a delivered greptile review did not count against the month"
-
-  dispatch "$data" record "$PR_A" greptile refused --note 'rate limited on fix round 2'
-  expect_code 0 "$DISPATCH_RC" "recording a fix-round refusal must succeed"
-  dispatch "$data" status
-  out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "a refusal after a delivered review refunded a credit that was really spent"
-
-  pass "a recorded review locks its credit in against a later refusal on the same PR"
 }
 
 test_the_retry_after_a_refusal_is_an_executable_path() {
@@ -702,16 +647,13 @@ test_ledger_is_private_and_records_every_event
 test_check_flags_a_review_from_a_non_owner
 test_check_accepts_the_comment_a_refusal_left_behind
 test_the_retry_after_a_refusal_is_an_executable_path
-test_a_refused_dispatch_spends_no_credit
-test_a_completed_review_keeps_its_credit_through_a_later_refusal
 test_the_ledger_directory_is_private
+test_the_greptile_charge_table
+test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own
 test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch
 test_a_fix_round_cannot_dispatch_greptile_at_zero_credits
-test_a_review_with_no_dispatch_behind_it_counts_as_spend
-test_a_review_is_charged_once_across_a_counting_window
 test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
 test_an_exhausted_pool_refunds_nothing
 test_check_accepts_the_comment_a_released_owner_left_behind
-test_a_re_review_of_one_pr_is_charged_again
 test_the_in_house_reason_states_only_what_the_ledger_records
 test_bad_input_is_refused_before_anything_is_written

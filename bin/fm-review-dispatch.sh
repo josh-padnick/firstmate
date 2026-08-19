@@ -44,9 +44,10 @@
 # service's pool has no credits left to spend on this PR.
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
-# $0, so an over-budget review is skipped and consumes nothing. A dispatch the
-# ledger records as refused likewise spent no credit and is not counted.
-# Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
+# $0, so an over-budget review is skipped and consumes nothing. Per PR the
+# ledger charges max(dispatches not cancelled by a later refusal, recorded
+# reviews), so a refunded dispatch costs nothing while a review it never
+# produced is still spend. Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
 # Greptile dispatch carries those rules, including a fix round on a PR Greptile
@@ -272,90 +273,99 @@ billing_month() {
   printf '%s\n' "${NOW:0:7}"
 }
 
-# How many greptile dispatches were recorded for a PR, anywhere in the ledger -
-# not scoped to the billing month or the reconcile baseline, so a review whose
-# dispatch sits in an earlier window still finds it.
-greptile_dispatch_count() {  # <pr-url>
-  ledger_rows | awk -F '\t' -v url="$1" '
-    $2 == url && $3 == "greptile" && $4 == "requested" { n++ }
-    END { print n + 0 }
+# Every Greptile credit the ledger says was spent, one line per credit, as
+#
+#   <ledger-row-number>\t<iso8601-utc>
+#
+# of the row that credit is charged to. One fold over the whole ledger, never
+# scoped to a billing month or a reconcile baseline: a review answers for a
+# dispatch recorded in an earlier month just as well as for one recorded today,
+# and scoping the fold is what once charged that review twice.
+#
+# Per PR, one invariant replaces every rule this counting used to carry:
+#
+#   charged = max(uncancelled dispatches, delivered reviews)
+#
+# An uncancelled dispatch is a `requested` row with no later `refused` row left
+# to cancel it; the two pair up in append order. A delivered review is a
+# `reviewed` row. Each dispatch charge is attributed to its own `requested` row,
+# and each review beyond the dispatch count to the `reviewed` row that carried
+# the count past it, so the caller can decide which billing window owns it.
+#
+#   case                      rows                       uncancelled  reviews  charged
+#   plain dispatch            req                        1            0        1
+#   refunded dispatch         req, ref                   0            0        0
+#   retry path                req, ref, req              1            0        1
+#   true leak                 rev                        0            1        1
+#   cross-window review       req (Jul), rev (Aug)       1            1        1
+#   same-PR re-review         req, rev, rev              1            2        2
+#   reviewed then refused     req, rev, ref              0            1        1
+#   refused then reviewed     req, ref, rev              0            1        1
+#   refunded, re-reviewed     req, ref, req, rev, rev    1            2        2
+#
+# "A recorded review locks its credit in against a later refusal" is no longer
+# its own rule: the max holds the charge up on its own once the review is
+# delivered, whatever a later refusal does to the dispatch behind it.
+greptile_charges() {
+  ledger_rows | awk -F '\t' '
+    $3 != "greptile" { next }
+    { pr = $2; seen[pr] = 1 }
+    $4 == "requested" {
+      dispatches[pr]++
+      row[pr, dispatches[pr]] = NR
+      when[pr, dispatches[pr]] = $1
+      next
+    }
+    $4 == "refused" {
+      if (cancelled[pr] < dispatches[pr]) cancelled[pr]++
+      next
+    }
+    $4 == "reviewed" {
+      reviews[pr]++
+      review_row[pr, reviews[pr]] = NR
+      review_when[pr, reviews[pr]] = $1
+      next
+    }
+    END {
+      for (pr in seen) {
+        for (i = cancelled[pr] + 1; i <= dispatches[pr]; i++)
+          printf "%s\t%s\n", row[pr, i], when[pr, i]
+        uncancelled = dispatches[pr] - cancelled[pr]
+        for (j = uncancelled + 1; j <= reviews[pr]; j++)
+          printf "%s\t%s\n", review_row[pr, j], review_when[pr, j]
+      }
+    }
   '
-}
-
-# How many times <value> appears in a space-delimited list.
-list_count() {  # <list> <value>
-  local rest=" $1 " value=$2 n=0
-  while [ "$rest" != "${rest#*" $value "}" ]; do
-    n=$((n + 1))
-    rest=" ${rest#*" $value "}"
-  done
-  printf '%s\n' "$n"
 }
 
 # Greptile credits remaining this billing month. Counts forward from the latest
 # captain-relayed reconcile row in the month when one exists, and from the full
-# monthly allowance otherwise.
+# monthly allowance otherwise: every charge attributed to a row after that
+# baseline and inside the month is spend the baseline does not already hold.
+# Position, not timestamp, orders the ledger, so two rows written in the same
+# second still count once each.
 greptile_remaining() {
-  local month baseline used unrefused reviews ts pr service event note relayed
+  local month baseline baseline_row=0 spent=0 index=0 ts service event note relayed
   month=$(billing_month)
   baseline=$GREPTILE_MONTHLY_CREDITS
-  used=0
-  unrefused=' '
-  reviews=' '
-  # One pass in append order. A reconcile row replaces the baseline and resets
-  # the count, so credits are always counted forward from the captain's most
-  # recent relayed number. Position, not timestamp, orders the ledger: two rows
-  # written in the same second still count once each.
-  #
-  # A dispatch the ledger later records as refused consumed no credit, so its
-  # `requested` row is cancelled by that PR's next `refused` row. A recorded
-  # `reviewed` row locks that credit in first: a service that refuses a later
-  # fix round on a PR it already reviewed still spent the credit. A review with
-  # no dispatch of its own left to pair with - counting every dispatch that PR
-  # ever had, so one in an earlier month or before the latest baseline still
-  # answers for its review - billed a credit nothing else counts, whether it is
-  # a leak or a re-review of a PR the service already reviewed. The ledger's
-  # silence stays conservative: a dispatch with no recorded refusal is spent.
-  while IFS=$'\t' read -r ts pr service event note; do
-    [ "$service" = greptile ] || continue
-    [ "$event" != reviewed ] || reviews="$reviews$pr "
+  while IFS=$'\t' read -r ts _ service event note; do
+    index=$((index + 1))
+    [ "$service" = greptile ] && [ "$event" = reconcile ] || continue
     case "$ts" in "$month"-*) : ;; *) continue ;; esac
-    case "$event" in
-      reconcile)
-        case "$note" in
-          remaining=*) relayed=${note#remaining=} ; relayed=${relayed%% *} ;;
-          *) continue ;;
-        esac
-        case "$relayed" in ''|*[!0-9]*) continue ;; esac
-        baseline=$relayed
-        used=0
-        unrefused=' '
-        ;;
-      requested)
-        used=$((used + 1))
-        unrefused="$unrefused$pr "
-        ;;
-      reviewed)
-        case "$unrefused" in
-          *" $pr "*) unrefused=${unrefused/ $pr / } ;;
-          *)
-            if [ "$(list_count "$reviews" "$pr")" -gt "$(greptile_dispatch_count "$pr")" ]; then
-              used=$((used + 1))
-            fi
-            ;;
-        esac
-        ;;
-      refused)
-        case "$unrefused" in
-          *" $pr "*)
-            unrefused=${unrefused/ $pr / }
-            used=$((used - 1))
-            ;;
-        esac
-        ;;
+    case "$note" in
+      remaining=*) relayed=${note#remaining=} ; relayed=${relayed%% *} ;;
+      *) continue ;;
     esac
+    case "$relayed" in ''|*[!0-9]*) continue ;; esac
+    baseline=$relayed
+    baseline_row=$index
   done < <(ledger_rows)
-  printf '%s\n' "$((baseline - used))"
+
+  while IFS=$'\t' read -r index ts; do
+    [ "$index" -gt "$baseline_row" ] || continue
+    case "$ts" in "$month"-*) spent=$((spent + 1)) ;; esac
+  done < <(greptile_charges)
+  printf '%s\n' "$((baseline - spent))"
 }
 
 # The last captain-relayed number for a service, or the empty string.
