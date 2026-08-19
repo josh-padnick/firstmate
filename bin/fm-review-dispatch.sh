@@ -283,73 +283,78 @@ billing_month() {
 # dispatch recorded in an earlier month just as well as for one recorded today,
 # and scoping the fold is what once charged that review twice.
 #
-# Per PR, one invariant replaces every rule this counting used to carry:
+# Per PR, one order-aware fold replaces every rule this counting used to carry.
+# Walking the ledger in append order:
 #
-#   pre-dispatch reviews = `reviewed` rows before that PR's first `requested`
-#   remaining reviews    = delivered reviews - pre-dispatch reviews
-#   charged              = pre-dispatch reviews
-#                          + max(uncancelled dispatches, remaining reviews)
+#   - a `requested` row opens a standing dispatch;
+#   - a `reviewed` row answers the most recent unanswered standing dispatch,
+#     and charges a credit of its own when there is none to answer;
+#   - a `refused` row cancels the most recent unanswered standing dispatch, so
+#     the refund lands on the dispatch it followed rather than on some other
+#     window's; a dispatch a review already answered is not cancellable.
 #
-# An uncancelled dispatch is a `requested` row with no later `refused` row left
-# to cancel it. The two pair up as the fold walks the ledger: a refusal cancels
-# the dispatch it followed - the most recent one still standing for that PR -
-# so a refund never moves a credit into a window that did not spend it, in
-# either direction. A review
-# that precedes its PR's first dispatch is a credit of its own and is never
-# absorbed by a later dispatch. Each charge is attributed to a row - a dispatch
-# to its `requested` row, a pre-dispatch or excess review to its `reviewed` row
-# - so the caller can decide which billing window owns it.
+#   charged = reviews that charged on their own
+#             + dispatches still standing at the end
 #
-#   case                     rows                     pre  uncanc  rem  charged
-#   plain dispatch           req                      0    1       0    1
-#   refunded dispatch        req, ref                 0    0       0    0
-#   retry path               req, ref, req            0    1       0    1
-#   true leak                rev                      1    0       0    1
-#   cross-window review      req (Jul), rev (Aug)     0    1       1    1
-#   cross-window refusal     req (Jul), req, ref      0    1       0    1
-#   cross-window retry       req (Jul), ref, req      0    1       0    1
-#   same-PR re-review        req, rev, rev            0    1       2    2
-#   reviewed then refused    req, rev, ref            0    0       1    1
-#   refused then reviewed    req, ref, rev            0    0       1    1
-#   refunded, re-reviewed    req, ref, req, rev, rev  0    1       2    2
-#   leaked then dispatched   rev, req                 1    1       0    2
+# A review is never absorbed by a dispatch that came after it - the order the
+# ledger records is the order the credits were spent. Each charge is attributed
+# to a row, a dispatch to its `requested` row and a self-charging review to its
+# `reviewed` row, so the caller can decide which billing window owns it.
+#
+#   case                     rows                      self  standing  charged
+#   plain dispatch           req                       0     1         1
+#   refunded dispatch        req, ref                  0     0         0
+#   retry path               req, ref, req             0     1         1
+#   true leak                rev                       1     0         1
+#   cross-window review      req (Jul), rev (Aug)      0     1         1
+#   cross-window refusal     req (Jul), req, ref       0     1         1
+#   cross-window retry       req (Jul), ref, req       0     1         1
+#   same-PR re-review        req, rev, rev             1     1         2
+#   reviewed then refused    req, rev, ref             0     1         1
+#   refused then reviewed    req, ref, rev             1     0         1
+#   refunded, re-reviewed    req, ref, req, rev, rev   1     1         2
+#   leaked then dispatched   rev, req                  1     1         2
+#   reviewed, refused, retry req, rev, ref, req        0     2         2
 #
 # "A recorded review locks its credit in against a later refusal" is no longer
-# its own rule: the max holds the charge up on its own once the review is
-# delivered, whatever a later refusal does to the dispatch behind it. A true
-# leak still charges exactly one credit, now as a pre-dispatch review.
+# its own rule, and neither is the narrower "a review before this PR's first
+# dispatch is a credit of its own": both fall out of the order-aware fold, in
+# which a delivered review has already answered its dispatch by the time any
+# later row is read.
 greptile_charges() {
   ledger_rows | awk -F '\t' '
     $3 != "greptile" { next }
     { pr = $2; seen[pr] = 1 }
     $4 == "requested" {
-      dispatches[pr]++
-      row[pr, dispatches[pr]] = NR
-      when[pr, dispatches[pr]] = $1
-      standing[pr]++
-      pending[pr, standing[pr]] = dispatches[pr]
+      opened[pr]++
+      row[pr, opened[pr]] = NR
+      when[pr, opened[pr]] = $1
+      standing[pr, opened[pr]] = 1
+      answered[pr, opened[pr]] = 0
       next
     }
     $4 == "refused" {
-      if (standing[pr] > 0) standing[pr]--
+      for (i = opened[pr]; i >= 1; i--)
+        if (standing[pr, i] && !answered[pr, i]) { standing[pr, i] = 0; break }
       next
     }
     $4 == "reviewed" {
-      reviews[pr]++
-      review_row[pr, reviews[pr]] = NR
-      review_when[pr, reviews[pr]] = $1
-      if (dispatches[pr] == 0) pre[pr]++
+      for (i = opened[pr]; i >= 1; i--)
+        if (standing[pr, i] && !answered[pr, i]) { answered[pr, i] = 1; break }
+      if (i < 1) {
+        self[pr]++
+        self_row[pr, self[pr]] = NR
+        self_when[pr, self[pr]] = $1
+      }
       next
     }
     END {
       for (pr in seen) {
-        uncancelled = standing[pr]
-        for (i = 1; i <= pre[pr]; i++)
-          printf "%s\t%s\n", review_row[pr, i], review_when[pr, i]
-        for (i = 1; i <= uncancelled; i++)
-          printf "%s\t%s\n", row[pr, pending[pr, i]], when[pr, pending[pr, i]]
-        for (j = pre[pr] + uncancelled + 1; j <= reviews[pr]; j++)
-          printf "%s\t%s\n", review_row[pr, j], review_when[pr, j]
+        for (i = 1; i <= self[pr]; i++)
+          printf "%s\t%s\n", self_row[pr, i], self_when[pr, i]
+        for (i = 1; i <= opened[pr]; i++)
+          if (standing[pr, i])
+            printf "%s\t%s\n", row[pr, i], when[pr, i]
       }
     }
   '
@@ -432,11 +437,16 @@ service_logins() {  # <service>
 # Every Greptile dispatch passes here first: refused outright at zero because
 # the $0 flex cap would make the review a no-op, warned at or below the reserve
 # floor. Auto-picks never reach it - they stop above the floor on their own.
-greptile_guard() {  # <pr-url>
-  local url=$1 remaining
+# Only a PR Greptile actually owns is told to record the `exhausted` release;
+# the ledger is never asked to record a release that did not happen.
+greptile_guard() {  # <pr-url> owner|unowned
+  local url=$1 held=$2 remaining
   remaining=$(greptile_remaining)
   if [ "$remaining" -le 0 ]; then
-    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
+    if [ "$held" = owner ]; then
+      refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
+    fi
+    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
   fi
   if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
     printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
@@ -493,7 +503,7 @@ cmd_choose() {
       refuse "$url is still owned by $PR_OWNER; record the refusal first: bin/fm-review-dispatch.sh record $url $PR_OWNER refused"
     fi
     if [ "$PR_OWNER" = greptile ]; then
-      greptile_guard "$url"
+      greptile_guard "$url" owner
     fi
     print_choice "$url" "$PR_OWNER" "existing owner of this PR; fix rounds re-use it"
     return 0
@@ -511,7 +521,7 @@ cmd_choose() {
       reason="retry after the recorded $explicit exhaustion"
     fi
     if [ "$explicit" = greptile ]; then
-      greptile_guard "$url"
+      greptile_guard "$url" unowned
     fi
     print_choice "$url" "$explicit" "$reason"
     return 0

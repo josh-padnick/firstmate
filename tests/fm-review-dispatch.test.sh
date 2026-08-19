@@ -177,6 +177,16 @@ test_zero_credits_refuses_even_an_explicit_greptile_dispatch() {
   assert_contains "$out" 'reconcile' \
     "the refusal did not offer the reconcile path for a disagreeing dashboard"
 
+  # Greptile never held this PR, so the refusal must not send the operator off
+  # to record a release that did not happen.
+  assert_not_contains "$out" 'exhausted' \
+    "the refusal named a release for a PR the service was never dispatched to"
+  dispatch "$data" check "$PR_A" --ledger-only
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an unowned PR must still fail the ownership check"
+  assert_contains "$out" 'owner: none recorded' \
+    "the refused dispatch left a release row on a PR that was never dispatched"
+
   pass "a dry pool under the \$0 flex cap is refused rather than dispatched into a skip"
 }
 
@@ -285,7 +295,10 @@ test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch() {
   assert_contains "$out" 'greptile: 48 of 50 credits remaining' \
     "the recorded fix-round re-trigger did not count against the month"
 
-  # CodeRabbit's window costs nothing, so its fix rounds stay free.
+  # CodeRabbit's window costs nothing, so its fix rounds stay free - checked
+  # with the ledger sitting on the reserve floor, where a guard wrongly applied
+  # to a coderabbit owner would have something to warn about.
+  dispatch "$data" reconcile greptile 10
   dispatch "$data" record "$PR_B" coderabbit requested
   dispatch "$data" choose "$PR_B"
   out=$DISPATCH_OUT
@@ -480,10 +493,12 @@ charge_case() {  # <name> <expected> <status-at> <row>...
 test_the_greptile_charge_table() {
   local aug=2026-08-19T10:00:00Z
 
-  # Per PR the ledger charges the reviews that arrived before the PR was ever
-  # dispatched, plus max(dispatches not cancelled by a later refusal, the
-  # reviews after that first dispatch). Every row below is a case this contract
-  # has been ruled on, kept together so the whole of it reads at a glance.
+  # Per PR the ledger walks its rows in order: a review answers the most recent
+  # unanswered standing dispatch or charges a credit of its own, and a refusal
+  # cancels the most recent unanswered standing dispatch. What is charged is
+  # the self-charging reviews plus the dispatches still standing. Every row
+  # below is a case this contract has been ruled on, kept together so the whole
+  # of it reads at a glance.
   charge_case plain-dispatch 49 "$aug" \
     "$aug,greptile,requested"
   charge_case refunded-dispatch 50 "$aug" \
@@ -504,6 +519,18 @@ test_the_greptile_charge_table() {
   charge_case two-dispatches-two-reviews 48 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,reviewed" \
     "$aug,greptile,requested" "$aug,greptile,reviewed"
+
+  # A delivered review answers its own dispatch, so the refusal that follows it
+  # has nothing left to refund and the retry after it is a second credit.
+  charge_case reviewed-refused-retried 48 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" \
+    "$aug,greptile,refused" "$aug,greptile,requested"
+  charge_case reviewed-refused-retried-july 49 2026-07-31T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
+    "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
+  charge_case reviewed-refused-retried-august 49 2026-08-04T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
+    "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
 
   # A credit is charged to the window its own dispatch was recorded in. July
   # pays for the dispatch; August, where only the review lands, pays nothing.
