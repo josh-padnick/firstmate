@@ -291,9 +291,10 @@ billing_month() {
 #                          + max(uncancelled dispatches, remaining reviews)
 #
 # An uncancelled dispatch is a `requested` row with no later `refused` row left
-# to cancel it; the two pair up in append order, a refusal answering the
-# dispatch it followed, and the charge stays with the earliest dispatch rows so
-# a refusal cannot move a credit into a window that never spent it. A review
+# to cancel it. The two pair up as the fold walks the ledger: a refusal cancels
+# the dispatch it followed - the most recent one still standing for that PR -
+# so a refund never moves a credit into a window that did not spend it, in
+# either direction. A review
 # that precedes its PR's first dispatch is a credit of its own and is never
 # absorbed by a later dispatch. Each charge is attributed to a row - a dispatch
 # to its `requested` row, a pre-dispatch or excess review to its `reviewed` row
@@ -306,6 +307,7 @@ billing_month() {
 #   true leak                rev                      1    0       0    1
 #   cross-window review      req (Jul), rev (Aug)     0    1       1    1
 #   cross-window refusal     req (Jul), req, ref      0    1       0    1
+#   cross-window retry       req (Jul), ref, req      0    1       0    1
 #   same-PR re-review        req, rev, rev            0    1       2    2
 #   reviewed then refused    req, rev, ref            0    0       1    1
 #   refused then reviewed    req, ref, rev            0    0       1    1
@@ -324,10 +326,12 @@ greptile_charges() {
       dispatches[pr]++
       row[pr, dispatches[pr]] = NR
       when[pr, dispatches[pr]] = $1
+      standing[pr]++
+      pending[pr, standing[pr]] = dispatches[pr]
       next
     }
     $4 == "refused" {
-      if (cancelled[pr] < dispatches[pr]) cancelled[pr]++
+      if (standing[pr] > 0) standing[pr]--
       next
     }
     $4 == "reviewed" {
@@ -339,11 +343,11 @@ greptile_charges() {
     }
     END {
       for (pr in seen) {
-        uncancelled = dispatches[pr] - cancelled[pr]
+        uncancelled = standing[pr]
         for (i = 1; i <= pre[pr]; i++)
           printf "%s\t%s\n", review_row[pr, i], review_when[pr, i]
         for (i = 1; i <= uncancelled; i++)
-          printf "%s\t%s\n", row[pr, i], when[pr, i]
+          printf "%s\t%s\n", row[pr, pending[pr, i]], when[pr, pending[pr, i]]
         for (j = pre[pr] + uncancelled + 1; j <= reviews[pr]; j++)
           printf "%s\t%s\n", review_row[pr, j], review_when[pr, j]
       }

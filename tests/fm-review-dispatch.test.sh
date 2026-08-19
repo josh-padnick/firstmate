@@ -480,9 +480,10 @@ charge_case() {  # <name> <expected> <status-at> <row>...
 test_the_greptile_charge_table() {
   local aug=2026-08-19T10:00:00Z
 
-  # Per PR the ledger charges max(dispatches not cancelled by a later refusal,
-  # recorded reviews). Every row below is a case this contract has been ruled
-  # on, kept together so the whole of it reads at a glance.
+  # Per PR the ledger charges the reviews that arrived before the PR was ever
+  # dispatched, plus max(dispatches not cancelled by a later refusal, the
+  # reviews after that first dispatch). Every row below is a case this contract
+  # has been ruled on, kept together so the whole of it reads at a glance.
   charge_case plain-dispatch 49 "$aug" \
     "$aug,greptile,requested"
   charge_case refunded-dispatch 50 "$aug" \
@@ -517,19 +518,29 @@ test_the_greptile_charge_table() {
     "$aug,greptile,reviewed" "$aug,greptile,requested"
 
   # A refusal answers the dispatch it followed, so the credit stays charged to
-  # the window that really spent it rather than moving into the later one.
+  # the window that really spent it - whether the surviving dispatch is the
+  # earlier one or the retry that came after the refund.
   charge_case cross-window-refusal-july 49 2026-07-31T11:00:00Z \
     "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
     "2026-08-11T10:00:00Z,greptile,refused"
   charge_case cross-window-refusal-august 50 2026-08-12T11:00:00Z \
     "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
     "2026-08-11T10:00:00Z,greptile,refused"
+  charge_case cross-window-retry-july 50 2026-07-31T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-07-30T11:00:00Z,greptile,refused" \
+    "2026-08-03T10:00:00Z,greptile,requested"
+  charge_case cross-window-retry-august 49 2026-08-04T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-07-30T11:00:00Z,greptile,refused" \
+    "2026-08-03T10:00:00Z,greptile,requested"
 
   # A relayed dashboard number already reflects the dispatches before it, so a
   # review recorded after the baseline does not count forward a second time.
   charge_case reconcile-baseline 45 2026-08-07T11:00:00Z \
     "2026-08-05T10:00:00Z,greptile,requested" "2026-08-06T10:00:00Z,reconcile,45" \
     "2026-08-07T10:00:00Z,greptile,reviewed"
+  charge_case reconcile-baseline-retry 44 2026-08-08T11:00:00Z \
+    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-05T11:00:00Z,greptile,refused" \
+    "2026-08-06T10:00:00Z,reconcile,45" "2026-08-07T10:00:00Z,greptile,requested"
 
   pass "the greptile ledger charges each credit once, in the window that owns it"
 }
