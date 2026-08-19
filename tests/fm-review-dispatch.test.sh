@@ -437,6 +437,99 @@ test_an_exhausted_pool_refunds_nothing() {
   pass "recording an exhausted pool never refunds an already-spent credit"
 }
 
+test_check_accepts_the_comment_a_released_owner_left_behind() {
+  local data out fakebin
+  data=$(new_home check-exhausted)
+  fakebin=$(fm_fakebin "$TMP_ROOT/check-exhausted")
+
+  # The path the exhausted event exists for: coderabbit refuses, greptile
+  # reviews round one, its pool runs dry, and the in-house review takes over.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  dispatch "$data" record "$PR_A" greptile exhausted
+  dispatch "$data" record "$PR_A" in-house requested
+
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\n'
+SH
+  chmod +x "$fakebin/gh"
+  DISPATCH_FAKEBIN=$fakebin
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a released owner's own review must not read as a leak"
+  assert_contains "$out" 'verdict: consistent' \
+    "the check refused the release path the ledger records in full"
+
+  # A service with no recorded reason to be on this PR is still a leak.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\ndevin-ai-integration\n'
+SH
+  chmod +x "$fakebin/gh"
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  DISPATCH_FAKEBIN=
+  expect_code 2 "$DISPATCH_RC" "an unexplained third service must still fail the check"
+  assert_contains "$out" 'leak: devin' \
+    "the check did not name the service the ledger explains nothing about"
+
+  pass "a refused or exhausted release explains that service's comment on the PR"
+}
+
+test_a_re_review_of_one_pr_is_charged_again() {
+  local data out
+  data=$(new_home re-review)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "the first review did not pair with the dispatch that produced it"
+
+  # Greptile bills a second credit for a re-review of the same PR, so a second
+  # review with only one dispatch behind it is a second credit spent.
+  dispatch "$data" record "$PR_A" greptile reviewed
+  expect_code 0 "$DISPATCH_RC" "recording a fix-round review must succeed"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 48 of 50 credits remaining' \
+    "a re-review of the same PR was counted as free"
+
+  pass "each greptile review beyond its PR's dispatches costs another credit"
+}
+
+test_the_in_house_reason_states_only_what_the_ledger_records() {
+  local data out
+  data=$(new_home in-house-reason)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile refused
+
+  # Devin has no row at all here: the reason must not claim one.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a dry fleet must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over"
+  assert_contains "$out" 'devin is unreachable without --devin-quota-confirmed' \
+    "the reason did not name why the unrecorded reserve was skipped"
+  assert_not_contains "$out" 'every third-party service is recorded' \
+    "the reason claimed a devin event the ledger never recorded"
+
+  # Once devin is genuinely recorded, the ledger does say every service is out.
+  dispatch "$data" record "$PR_A" devin refused
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fully recorded dry fleet must still get a reviewer"
+  assert_contains "$out" 'every third-party service is recorded as refused or exhausted' \
+    "the reason did not report the state the ledger actually holds"
+
+  pass "the in-house choice reports the ledger's own state and nothing more"
+}
+
 test_bad_input_is_refused_before_anything_is_written() {
   local data
   data=$(new_home input)
@@ -618,4 +711,7 @@ test_a_review_with_no_dispatch_behind_it_counts_as_spend
 test_a_review_is_charged_once_across_a_counting_window
 test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
 test_an_exhausted_pool_refunds_nothing
+test_check_accepts_the_comment_a_released_owner_left_behind
+test_a_re_review_of_one_pr_is_charged_again
+test_the_in_house_reason_states_only_what_the_ledger_records
 test_bad_input_is_refused_before_anything_is_written

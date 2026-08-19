@@ -272,25 +272,36 @@ billing_month() {
   printf '%s\n' "${NOW:0:7}"
 }
 
-# Whether any greptile dispatch was ever recorded for a PR, anywhere in the
-# ledger. A review with one behind it was counted when that dispatch was; a
-# review with none is a leak that consumed a credit nothing else counts.
-has_greptile_dispatch() {  # <pr-url>
+# How many greptile dispatches were recorded for a PR, anywhere in the ledger -
+# not scoped to the billing month or the reconcile baseline, so a review whose
+# dispatch sits in an earlier window still finds it.
+greptile_dispatch_count() {  # <pr-url>
   ledger_rows | awk -F '\t' -v url="$1" '
-    $2 == url && $3 == "greptile" && $4 == "requested" { found = 1 }
-    END { exit !found }
+    $2 == url && $3 == "greptile" && $4 == "requested" { n++ }
+    END { print n + 0 }
   '
+}
+
+# How many times <value> appears in a space-delimited list.
+list_count() {  # <list> <value>
+  local rest=" $1 " value=$2 n=0
+  while [ "$rest" != "${rest#*" $value "}" ]; do
+    n=$((n + 1))
+    rest=" ${rest#*" $value "}"
+  done
+  printf '%s\n' "$n"
 }
 
 # Greptile credits remaining this billing month. Counts forward from the latest
 # captain-relayed reconcile row in the month when one exists, and from the full
 # monthly allowance otherwise.
 greptile_remaining() {
-  local month baseline used unrefused ts pr service event note relayed
+  local month baseline used unrefused reviews ts pr service event note relayed
   month=$(billing_month)
   baseline=$GREPTILE_MONTHLY_CREDITS
   used=0
   unrefused=' '
+  reviews=' '
   # One pass in append order. A reconcile row replaces the baseline and resets
   # the count, so credits are always counted forward from the captain's most
   # recent relayed number. Position, not timestamp, orders the ledger: two rows
@@ -299,14 +310,15 @@ greptile_remaining() {
   # A dispatch the ledger later records as refused consumed no credit, so its
   # `requested` row is cancelled by that PR's next `refused` row. A recorded
   # `reviewed` row locks that credit in first: a service that refuses a later
-  # fix round on a PR it already reviewed still spent the credit, and a review
-  # with no dispatch anywhere in the ledger behind it - the leak `record` warns
-  # about - counts as spend on its own. A review whose dispatch is simply
-  # outside this counting window, in an earlier month or before the latest
-  # baseline, was already counted there. The ledger's silence stays
-  # conservative: a dispatch with no recorded refusal is spent.
+  # fix round on a PR it already reviewed still spent the credit. A review with
+  # no dispatch of its own left to pair with - counting every dispatch that PR
+  # ever had, so one in an earlier month or before the latest baseline still
+  # answers for its review - billed a credit nothing else counts, whether it is
+  # a leak or a re-review of a PR the service already reviewed. The ledger's
+  # silence stays conservative: a dispatch with no recorded refusal is spent.
   while IFS=$'\t' read -r ts pr service event note; do
     [ "$service" = greptile ] || continue
+    [ "$event" != reviewed ] || reviews="$reviews$pr "
     case "$ts" in "$month"-*) : ;; *) continue ;; esac
     case "$event" in
       reconcile)
@@ -326,7 +338,11 @@ greptile_remaining() {
       reviewed)
         case "$unrefused" in
           *" $pr "*) unrefused=${unrefused/ $pr / } ;;
-          *) has_greptile_dispatch "$pr" || used=$((used + 1)) ;;
+          *)
+            if [ "$(list_count "$reviews" "$pr")" -gt "$(greptile_dispatch_count "$pr")" ]; then
+              used=$((used + 1))
+            fi
+            ;;
         esac
         ;;
       refused)
@@ -485,7 +501,12 @@ cmd_choose() {
   # unconfirmed reserve is as unavailable as a recorded one.
   if list_has "$PR_UNAVAILABLE" greptile &&
     { [ "$devin_confirmed" = 0 ] || list_has "$PR_UNAVAILABLE" devin; }; then
-    print_choice "$url" in-house "every third-party service is recorded as refused or exhausted for this PR"
+    if list_has "$PR_UNAVAILABLE" devin; then
+      reason="every third-party service is recorded as refused or exhausted for this PR"
+    else
+      reason="coderabbit and greptile are recorded as refused or exhausted for this PR, and devin is unreachable without --devin-quota-confirmed"
+    fi
+    print_choice "$url" in-house "$reason"
     return 0
   fi
 
@@ -680,11 +701,12 @@ EOF
 
   printf 'evidence: %s\n' "${found:-none}"
 
-  # A service this PR recorded as refused has a comment here for that refusal -
-  # CodeRabbit delivers its rate-limit notice as one - so its evidence is
-  # explained rather than leaked. Every other non-owner with evidence is a leak.
+  # A service this PR released through a refusal or an exhaustion has a comment
+  # here for it - CodeRabbit delivers its rate-limit notice as one, and a
+  # released owner leaves its own review behind - so its evidence is explained
+  # rather than leaked. Every other non-owner with evidence is a leak.
   for service in $found; do
-    if [ "$service" != "$PR_OWNER" ] && ! list_has "$PR_REFUSED" "$service"; then
+    if [ "$service" != "$PR_OWNER" ] && ! list_has "$PR_UNAVAILABLE" "$service"; then
       list_add leaks "$service"
     fi
   done
