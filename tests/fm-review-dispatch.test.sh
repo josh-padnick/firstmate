@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Behavioral regressions for bin/fm-review-dispatch.sh: the exactly-one owner
 # rule, the refusal-before-fallback chain, the Greptile reserve floor, the
-# ledger's monthly reconcile, the terminal in-house fallback, and the
-# dispatch-side consistency check.
+# anchored billing cycle and its reconcile baseline, the terminal in-house
+# fallback, and the dispatch-side consistency check.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -15,7 +15,7 @@ PR_A=https://github.com/josh-padnick/firstmate/pull/101
 PR_B=https://github.com/josh-padnick/firstmate/pull/102
 
 # Each case gets its own data directory so one case's ledger cannot leak into
-# the next. NOW is pinned so the billing-month arithmetic is deterministic.
+# the next. NOW is pinned so the billing-cycle arithmetic is deterministic.
 new_home() {  # <name>; echoes the data directory
   local data="$TMP_ROOT/$1/data"
   mkdir -p "$data"
@@ -23,21 +23,27 @@ new_home() {  # <name>; echoes the data directory
 }
 
 # Runs the helper in THIS shell (never a command substitution) so both the
-# captured output and the exit status survive for the assertions.
+# captured output and the exit status survive for the assertions. The plan
+# overrides are cleared on every call so the cases below exercise the built-in
+# allowance and reset day rather than whatever the operator has exported; a
+# case that wants a different plan puts it in DISPATCH_ENV.
 DISPATCH_OUT=
 DISPATCH_RC=0
 DISPATCH_FAKEBIN=
 DISPATCH_NOW=2026-08-19T10:00:00Z
+DISPATCH_ENV=()
 dispatch() {  # <data-dir> <args...>; sets DISPATCH_OUT and DISPATCH_RC
   local data=$1
   shift
   DISPATCH_RC=0
   DISPATCH_OUT=$(PATH="${DISPATCH_FAKEBIN:+$DISPATCH_FAKEBIN:}$PATH" \
+    env -u FM_REVIEW_DISPATCH_GREPTILE_CREDITS -u FM_REVIEW_DISPATCH_BILLING_DAY \
     FM_DATA_OVERRIDE="$data" FM_REVIEW_DISPATCH_NOW="$DISPATCH_NOW" \
+    ${DISPATCH_ENV[@]+"${DISPATCH_ENV[@]}"} \
     "$DISPATCH" "$@" 2>&1) || DISPATCH_RC=$?
 }
 
-# The same call with the clock moved, for the billing-month arithmetic.
+# The same call with the clock moved, for the billing-cycle arithmetic.
 dispatch_at() {  # <iso8601-utc> <data-dir> <args...>
   local now=$1 previous=$DISPATCH_NOW
   shift
@@ -140,7 +146,7 @@ test_reserve_floor_stops_auto_picks_but_not_the_captain() {
   dispatch "$data" record "$PR_A" greptile requested
   dispatch "$data" status
   out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 10 of 50 credits remaining' \
+  assert_contains "$out" 'greptile: 10 of 30 credits remaining' \
     "the ledger did not count the dispatch down from the relayed number"
   assert_contains "$out" 'captain-explicit only' \
     "status did not report that auto-picks have stopped at the floor"
@@ -292,8 +298,8 @@ test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch() {
   expect_code 0 "$DISPATCH_RC" "recording a fix-round re-trigger must be accepted"
   dispatch "$data" status
   out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 48 of 50 credits remaining' \
-    "the recorded fix-round re-trigger did not count against the month"
+  assert_contains "$out" 'greptile: 28 of 30 credits remaining' \
+    "the recorded fix-round re-trigger did not count against the cycle"
 
   # CodeRabbit's window costs nothing, so its fix rounds stay free - checked
   # with the ledger sitting on the reserve floor, where a guard wrongly applied
@@ -382,8 +388,8 @@ test_an_exhausted_pool_refunds_nothing() {
   dispatch "$data" record "$PR_A" greptile requested
   dispatch "$data" status
   out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
-    "the greptile dispatch did not count against the month"
+  assert_contains "$out" 'greptile: 29 of 30 credits remaining' \
+    "the greptile dispatch did not count against the cycle"
 
   # Exhaustion says a later dispatch was never made; it says nothing about the
   # credit the earlier one already spent.
@@ -391,7 +397,7 @@ test_an_exhausted_pool_refunds_nothing() {
   expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
   dispatch "$data" status
   out=$DISPATCH_OUT
-  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+  assert_contains "$out" 'greptile: 29 of 30 credits remaining' \
     "an exhausted row refunded a credit that was really spent"
 
   pass "recording an exhausted pool never refunds an already-spent credit"
@@ -486,7 +492,7 @@ charge_case() {  # <name> <expected> <status-at> <row>...
     expect_code 0 "$DISPATCH_RC" "$name: the ledger rejected the row '$row'"
   done
   dispatch_at "$at" "$data" status
-  assert_contains "$DISPATCH_OUT" "greptile: $expected of 50 credits remaining" \
+  assert_contains "$DISPATCH_OUT" "greptile: $expected of 30 credits remaining" \
     "$name: the ledger charged the wrong number of greptile credits"
 }
 
@@ -499,77 +505,101 @@ test_the_greptile_charge_table() {
   # the self-charging reviews plus the dispatches still standing. Every row
   # below is a case this contract has been ruled on, kept together so the whole
   # of it reads at a glance.
-  charge_case plain-dispatch 49 "$aug" \
+  charge_case plain-dispatch 29 "$aug" \
     "$aug,greptile,requested"
-  charge_case refunded-dispatch 50 "$aug" \
+  charge_case refunded-dispatch 30 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,refused"
-  charge_case retry-path 49 "$aug" \
+  charge_case retry-path 29 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested"
-  charge_case true-leak 49 "$aug" \
+  charge_case true-leak 29 "$aug" \
     "$aug,greptile,reviewed"
-  charge_case same-pr-re-review 48 "$aug" \
+  charge_case same-pr-re-review 28 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,reviewed"
-  charge_case reviewed-then-refused 49 "$aug" \
+  charge_case reviewed-then-refused 29 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,refused"
-  charge_case refused-then-reviewed 49 "$aug" \
+  charge_case refused-then-reviewed 29 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,reviewed"
-  charge_case refunded-then-re-reviewed 48 "$aug" \
+  charge_case refunded-then-re-reviewed 28 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested" \
     "$aug,greptile,reviewed" "$aug,greptile,reviewed"
-  charge_case two-dispatches-two-reviews 48 "$aug" \
+  charge_case two-dispatches-two-reviews 28 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,reviewed" \
     "$aug,greptile,requested" "$aug,greptile,reviewed"
 
   # A delivered review answers its own dispatch, so the refusal that follows it
   # has nothing left to refund and the retry after it is a second credit.
-  charge_case reviewed-refused-retried 48 "$aug" \
+  charge_case reviewed-refused-retried 28 "$aug" \
     "$aug,greptile,requested" "$aug,greptile,reviewed" \
     "$aug,greptile,refused" "$aug,greptile,requested"
-  charge_case reviewed-refused-retried-july 49 2026-07-31T11:00:00Z \
+
+  # The same rows read from either side of a reset. The allowance resets on the
+  # 26th, so the cycle that holds 2026-07-24 opened on 2026-06-26 and the one
+  # that holds 2026-08-04 opened on 2026-07-26: each charges exactly one
+  # credit, and they are different credits.
+  charge_case reviewed-refused-retried-earlier-cycle 29 2026-07-24T11:00:00Z \
     "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
     "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
-  charge_case reviewed-refused-retried-august 49 2026-08-04T11:00:00Z \
+  charge_case reviewed-refused-retried-later-cycle 29 2026-08-04T11:00:00Z \
     "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
     "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
 
-  # A credit is charged to the window its own dispatch was recorded in. July
-  # pays for the dispatch; August, where only the review lands, pays nothing.
-  charge_case cross-window-july 49 2026-07-30T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
-  charge_case cross-window-august 50 2026-08-02T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+  # A credit is charged to the cycle its own dispatch was recorded in. The
+  # cycle holding the dispatch pays; the next one, where only the review lands,
+  # pays nothing.
+  charge_case cross-cycle-review-earlier 29 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+  charge_case cross-cycle-review-later 30 2026-08-02T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
 
   # A review that arrived before this PR was ever dispatched is a credit of its
   # own: the later dispatch cannot answer for it.
-  charge_case leaked-then-dispatched 48 "$aug" \
+  charge_case leaked-then-dispatched 28 "$aug" \
     "$aug,greptile,reviewed" "$aug,greptile,requested"
 
   # A refusal answers the dispatch it followed, so the credit stays charged to
-  # the window that really spent it - whether the surviving dispatch is the
+  # the cycle that really spent it - whether the surviving dispatch is the
   # earlier one or the retry that came after the refund.
-  charge_case cross-window-refusal-july 49 2026-07-31T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+  charge_case cross-cycle-refusal-earlier 29 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
     "2026-08-11T10:00:00Z,greptile,refused"
-  charge_case cross-window-refusal-august 50 2026-08-12T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+  charge_case cross-cycle-refusal-later 30 2026-08-12T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
     "2026-08-11T10:00:00Z,greptile,refused"
-  charge_case cross-window-retry-july 50 2026-07-31T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-07-30T11:00:00Z,greptile,refused" \
+  charge_case cross-cycle-retry-earlier 30 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-20T11:00:00Z,greptile,refused" \
     "2026-08-03T10:00:00Z,greptile,requested"
-  charge_case cross-window-retry-august 49 2026-08-04T11:00:00Z \
-    "2026-07-30T10:00:00Z,greptile,requested" "2026-07-30T11:00:00Z,greptile,refused" \
+  charge_case cross-cycle-retry-later 29 2026-08-04T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-20T11:00:00Z,greptile,refused" \
     "2026-08-03T10:00:00Z,greptile,requested"
+
+  # The cycle is anchored on the reset day, not on the calendar month, and
+  # these two cases are the ones that tell the difference. A dispatch on 30
+  # July is still being paid for on 4 August because both sit in the cycle that
+  # opened on 26 July; a dispatch on 2 August has already been left behind by
+  # 27 August, because the reset on the 26th opened a new cycle inside the same
+  # calendar month. Counting by calendar month would invert both.
+  charge_case charge-outlives-the-month-boundary 29 2026-08-04T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested"
+  charge_case charge-expires-at-the-reset 30 2026-08-27T11:00:00Z \
+    "2026-08-02T10:00:00Z,greptile,requested"
 
   # A relayed dashboard number already reflects the dispatches before it, so a
   # review recorded after the baseline does not count forward a second time.
-  charge_case reconcile-baseline 45 2026-08-07T11:00:00Z \
-    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-06T10:00:00Z,reconcile,45" \
+  charge_case reconcile-baseline 25 2026-08-07T11:00:00Z \
+    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-06T10:00:00Z,reconcile,25" \
     "2026-08-07T10:00:00Z,greptile,reviewed"
-  charge_case reconcile-baseline-retry 44 2026-08-08T11:00:00Z \
+  charge_case reconcile-baseline-retry 24 2026-08-08T11:00:00Z \
     "2026-08-05T10:00:00Z,greptile,requested" "2026-08-05T11:00:00Z,greptile,refused" \
-    "2026-08-06T10:00:00Z,reconcile,45" "2026-08-07T10:00:00Z,greptile,requested"
+    "2026-08-06T10:00:00Z,reconcile,25" "2026-08-07T10:00:00Z,greptile,requested"
 
-  pass "the greptile ledger charges each credit once, in the window that owns it"
+  # A baseline expires with its own cycle. The relayed 25 was read on 2 August
+  # and the reset on the 26th has since opened a new cycle, so by 27 August the
+  # count starts from the full allowance again rather than from a number that
+  # described the cycle before it.
+  charge_case reconcile-baseline-expires-at-the-reset 29 2026-08-27T11:00:00Z \
+    "2026-08-02T10:00:00Z,reconcile,25" "2026-08-27T10:00:00Z,greptile,requested"
+
+  pass "the greptile ledger charges each credit once, in the cycle that owns it"
 }
 
 test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own() {
@@ -617,7 +647,7 @@ test_a_release_step_names_the_event_that_actually_happened() {
 
   # With credits on hand there is no exhaustion to record, so the same paths
   # name the refusal instead.
-  dispatch "$data" reconcile greptile 40
+  dispatch "$data" reconcile greptile 20
   dispatch "$data" choose "$PR_A" --after-refusal
   out=$DISPATCH_OUT
   assert_contains "$out" "record $PR_A greptile refused" \
@@ -653,7 +683,7 @@ test_a_dry_standing_owner_is_offered_both_releases() {
   dispatch "$data" record "$PR_A" coderabbit refused
   dispatch "$data" record "$PR_A" greptile requested
   dispatch "$data" status
-  assert_contains "$DISPATCH_OUT" 'greptile: 0 of 50 credits remaining' \
+  assert_contains "$DISPATCH_OUT" 'greptile: 0 of 30 credits remaining' \
     "the standing dispatch did not spend the last credit"
 
   # The ledger reads zero and a dispatch is standing, so either release could
@@ -672,10 +702,47 @@ test_a_dry_standing_owner_is_offered_both_releases() {
   dispatch "$data" record "$PR_A" greptile refused
   expect_code 0 "$DISPATCH_RC" "recording the refusal that happened must succeed"
   dispatch "$data" status
-  assert_contains "$DISPATCH_OUT" 'greptile: 1 of 50 credits remaining' \
+  assert_contains "$DISPATCH_OUT" 'greptile: 1 of 30 credits remaining' \
     "the refusal did not return the credit the guessed exhaustion would have kept"
 
   pass "a dry ledger with a standing owner names both releases instead of guessing"
+}
+
+test_the_plan_facts_are_configurable_and_validated() {
+  local data
+  data=$(new_home plan-facts)
+
+  # The allowance and the reset day describe the captain's Greptile plan, so a
+  # plan change is a configuration change rather than a code change.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_GREPTILE_CREDITS=12)
+  dispatch "$data" status
+  expect_code 0 "$DISPATCH_RC" "a configured allowance must be accepted"
+  assert_contains "$DISPATCH_OUT" 'greptile: 12 of 12 credits remaining' \
+    "the configured allowance was ignored"
+
+  # The clock is pinned at 2026-08-19, which the default 26th anchor puts in
+  # the cycle that opened on 26 July. A 20th anchor has already reset that
+  # month, so the same instant sits in a cycle that opened on 20 July.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_BILLING_DAY=20)
+  dispatch "$data" status
+  expect_code 0 "$DISPATCH_RC" "a configured reset day must be accepted"
+  assert_contains "$DISPATCH_OUT" 'billing cycle: 2026-07-20, next reset 2026-08-20' \
+    "the configured reset day did not move the billing cycle"
+
+  # A reset day that some months do not have would mean different things in
+  # different months, so it is refused rather than quietly reinterpreted.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_BILLING_DAY=31)
+  dispatch "$data" status
+  expect_code 1 "$DISPATCH_RC" "a reset day no month can honour must be refused"
+  assert_contains "$DISPATCH_OUT" 'must be 1-28' \
+    "the refusal did not say which reset days are accepted"
+
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_GREPTILE_CREDITS=lots)
+  dispatch "$data" status
+  expect_code 1 "$DISPATCH_RC" "a non-numeric allowance must be refused"
+
+  DISPATCH_ENV=()
+  pass "the allowance and the reset day are configurable and refused when impossible"
 }
 
 test_bad_input_is_refused_before_anything_is_written() {
@@ -803,4 +870,5 @@ test_the_in_house_reason_states_only_what_the_ledger_records
 test_a_release_step_names_the_event_that_actually_happened
 test_status_reports_a_pending_fix_round_as_awaiting_review
 test_a_dry_standing_owner_is_offered_both_releases
+test_the_plan_facts_are_configurable_and_validated
 test_bad_input_is_refused_before_anything_is_written

@@ -52,6 +52,14 @@
 # still standing, so a refunded dispatch costs nothing while a review no
 # dispatch can answer for is still spend.
 #
+# The allowance is GREPTILE_MONTHLY_CREDITS reviews per billing cycle, and the
+# cycle resets on GREPTILE_BILLING_DAY of the month rather than on the calendar
+# boundary. With the default 26th, the cycle holding 19 August 2026 runs from
+# 26 July to 25 August and the next reset is 26 August, so a row from earlier
+# in the same calendar month can belong to the previous cycle. Charges and
+# relayed reconcile baselines are both counted inside that cycle. Both values
+# are read from the environment so a plan change needs no code change.
+#
 # Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
@@ -86,7 +94,8 @@
 # service out of its selection, and neither refunds a credit already spent. No
 # balance API
 # exists, so this file is the source of truth for remaining Greptile credits;
-# the captain's dashboard is the monthly reconciliation source, and
+# the captain's dashboard is the reconciliation source, relayed once a cycle,
+# and
 # `reconcile greptile <remaining>` writes the relayed number as a `remaining=`
 # note that later credit math counts forward from. Drift is corrected in the
 # ledger rather than guessed at.
@@ -103,6 +112,11 @@
 #   FM_HOME                    home whose data/ holds the ledger
 #   FM_DATA_OVERRIDE           data directory override
 #   FM_REVIEW_DISPATCH_NOW     ISO-8601 UTC timestamp used instead of the clock
+#   FM_REVIEW_DISPATCH_GREPTILE_CREDITS
+#                              reviews included per billing cycle (default 30)
+#   FM_REVIEW_DISPATCH_BILLING_DAY
+#                              day of the month the allowance resets, 1-28
+#                              (default 26)
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -114,9 +128,13 @@ DATA="${FM_DATA_OVERRIDE:-$FM_HOME/data}"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/fm-pr-lib.sh"
 
-# Greptile's included allowance and the reserve the auto-picks never spend.
-# Decision 3 of the BIG-143 plan: one constant, not a pacing schedule.
-GREPTILE_MONTHLY_CREDITS=50
+# Greptile's included allowance, the day of the month it resets on, and the
+# reserve the auto-picks never spend. Decision 3 of the BIG-143 plan: one
+# constant, not a pacing schedule. The allowance and the reset day describe the
+# captain's current plan rather than anything intrinsic, so both are
+# overridable; the reserve floor is the plan-independent policy and is not.
+GREPTILE_MONTHLY_CREDITS=${FM_REVIEW_DISPATCH_GREPTILE_CREDITS:-30}
+GREPTILE_BILLING_DAY=${FM_REVIEW_DISPATCH_BILLING_DAY:-26}
 GREPTILE_RESERVE_FLOOR=10
 
 LEDGER_DIR="$DATA/review-dispatch"
@@ -179,6 +197,26 @@ lock_acquire() {
 }
 
 # --- validation -------------------------------------------------------------
+
+# The two plan facts an override can move. Checked once per run so a bad value
+# stops here instead of silently producing a wrong window or a wrong balance.
+# A reset day is capped at 28 because that is the last day every month has; a
+# larger anchor would mean different things in different months.
+validate_config() {
+  case "$GREPTILE_MONTHLY_CREDITS" in
+    ''|*[!0-9]*)
+      fail "FM_REVIEW_DISPATCH_GREPTILE_CREDITS must be a whole number: $GREPTILE_MONTHLY_CREDITS" ;;
+  esac
+  case "$GREPTILE_BILLING_DAY" in
+    ''|*[!0-9]*)
+      fail "FM_REVIEW_DISPATCH_BILLING_DAY must be a whole number: $GREPTILE_BILLING_DAY" ;;
+  esac
+  GREPTILE_MONTHLY_CREDITS=$((10#$GREPTILE_MONTHLY_CREDITS))
+  GREPTILE_BILLING_DAY=$((10#$GREPTILE_BILLING_DAY))
+  if [ "$GREPTILE_BILLING_DAY" -lt 1 ] || [ "$GREPTILE_BILLING_DAY" -gt 28 ]; then
+    fail "FM_REVIEW_DISPATCH_BILLING_DAY must be 1-28, a day every month has: $GREPTILE_BILLING_DAY"
+  fi
+}
 
 validate_service() {  # <service>
   case "${1:-}" in
@@ -286,9 +324,38 @@ fold_pr_state() {  # <pr-url>
 }
 
 
-# The billing month the ledger counts against, as YYYY-MM.
-billing_month() {
-  printf '%s\n' "${NOW:0:7}"
+# The billing cycle the ledger counts against, as "<start> <next-reset>", both
+# YYYY-MM-DD. The allowance resets on GREPTILE_BILLING_DAY, so the cycle
+# holding NOW starts on that day of this month when NOW is on or past it and on
+# that day of the previous month otherwise.
+billing_cycle() {
+  local year month day next_year next_month
+  year=$((10#${NOW:0:4}))
+  month=$((10#${NOW:5:2}))
+  day=$((10#${NOW:8:2}))
+  if [ "$day" -lt "$GREPTILE_BILLING_DAY" ]; then
+    month=$((month - 1))
+    if [ "$month" -lt 1 ]; then
+      month=12
+      year=$((year - 1))
+    fi
+  fi
+  next_year=$year
+  next_month=$((month + 1))
+  if [ "$next_month" -gt 12 ]; then
+    next_month=1
+    next_year=$((next_year + 1))
+  fi
+  printf '%04d-%02d-%02d %04d-%02d-%02d\n' \
+    "$year" "$month" "$GREPTILE_BILLING_DAY" \
+    "$next_year" "$next_month" "$GREPTILE_BILLING_DAY"
+}
+
+# A ledger timestamp is in the cycle when it sorts at or after the cycle start
+# and before the next reset. ISO-8601 UTC sorts lexicographically and both
+# bounds are date prefixes of it, so string comparison is the whole test.
+in_cycle() {  # <iso8601-utc> <cycle-start> <next-reset>
+  [[ ! $1 < $2 && $1 < $3 ]]
 }
 
 # Every Greptile credit the ledger says was spent, one line per credit, as
@@ -296,8 +363,8 @@ billing_month() {
 #   <ledger-row-number>\t<iso8601-utc>
 #
 # of the row that credit is charged to. One fold over the whole ledger, never
-# scoped to a billing month or a reconcile baseline: a review answers for a
-# dispatch recorded in an earlier month just as well as for one recorded today,
+# scoped to a billing cycle or a reconcile baseline: a review answers for a
+# dispatch recorded in an earlier cycle just as well as for one recorded today,
 # and scoping the fold is what once charged that review twice.
 #
 # Per PR, one order-aware fold replaces every rule this counting used to carry.
@@ -323,9 +390,9 @@ billing_month() {
 #   refunded dispatch        req, ref                  0     0         0
 #   retry path               req, ref, req             0     1         1
 #   true leak                rev                       1     0         1
-#   cross-window review      req (Jul), rev (Aug)      0     1         1
-#   cross-window refusal     req (Jul), req, ref       0     1         1
-#   cross-window retry       req (Jul), ref, req       0     1         1
+#   cross-cycle review       req (prev), rev (this)    0     1         1
+#   cross-cycle refusal      req (prev), req, ref      0     1         1
+#   cross-cycle retry        req (prev), ref, req      0     1         1
 #   same-PR re-review        req, rev, rev             1     1         2
 #   reviewed then refused    req, rev, ref             0     1         1
 #   refused then reviewed    req, ref, rev             1     0         1
@@ -377,20 +444,23 @@ greptile_charges() {
   '
 }
 
-# Greptile credits remaining this billing month. Counts forward from the latest
-# captain-relayed reconcile row in the month when one exists, and from the full
-# monthly allowance otherwise: every charge attributed to a row after that
-# baseline and inside the month is spend the baseline does not already hold.
-# Position, not timestamp, orders the ledger, so two rows written in the same
-# second still count once each.
+# Greptile credits remaining this billing cycle. Counts forward from the latest
+# captain-relayed reconcile row inside the cycle when one exists, and from the
+# full allowance otherwise: every charge attributed to a row after that
+# baseline and inside the cycle is spend the baseline does not already hold. A
+# reconcile row therefore expires with its cycle, even when the next cycle
+# starts in the same calendar month. Position, not timestamp, orders the
+# ledger, so two rows written in the same second still count once each.
 greptile_remaining() {
-  local month baseline baseline_row=0 spent=0 index=0 ts service event note relayed
-  month=$(billing_month)
+  local cycle start next baseline baseline_row=0 spent=0 index=0 ts service event note relayed
+  cycle=$(billing_cycle)
+  start=${cycle% *}
+  next=${cycle#* }
   baseline=$GREPTILE_MONTHLY_CREDITS
   while IFS=$'\t' read -r ts _ service event note; do
     index=$((index + 1))
     [ "$service" = greptile ] && [ "$event" = reconcile ] || continue
-    case "$ts" in "$month"-*) : ;; *) continue ;; esac
+    in_cycle "$ts" "$start" "$next" || continue
     case "$note" in
       remaining=*) relayed=${note#remaining=} ; relayed=${relayed%% *} ;;
       *) continue ;;
@@ -402,7 +472,9 @@ greptile_remaining() {
 
   while IFS=$'\t' read -r index ts; do
     [ "$index" -gt "$baseline_row" ] || continue
-    case "$ts" in "$month"-*) spent=$((spent + 1)) ;; esac
+    if in_cycle "$ts" "$start" "$next"; then
+      spent=$((spent + 1))
+    fi
   done < <(greptile_charges)
   printf '%s\n' "$((baseline - spent))"
 }
@@ -451,26 +523,6 @@ service_logins() {  # <service>
   esac
 }
 
-# Every Greptile dispatch passes here first: refused outright at zero because
-# the $0 flex cap would make the review a no-op, warned at or below the reserve
-# floor. Auto-picks never reach it - they stop above the floor on their own.
-# Only a PR Greptile actually owns is told to record the `exhausted` release;
-# the ledger is never asked to record a release that did not happen.
-greptile_guard() {  # <pr-url> owner|unowned
-  local url=$1 held=$2 remaining
-  remaining=$(greptile_remaining)
-  if [ "$remaining" -le 0 ]; then
-    if [ "$held" = owner ]; then
-      refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
-    fi
-    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
-  fi
-  if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
-    printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
-      "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
-  fi
-}
-
 # How a PR is handed on from its current owner. Which release happened - the
 # service declined, or nothing was dispatched because the pool was dry - is a
 # fact only the operator saw, so this never derives one from a balance. Where
@@ -481,11 +533,31 @@ greptile_guard() {  # <pr-url> owner|unowned
 release_step() {  # <pr-url> <owner>
   local url=$1 owner=$2
   if [ "$owner" = greptile ] && [ "$(greptile_remaining)" -le 0 ]; then
-    printf 'the ledger shows 0 Greptile credits this month, so record what happened - bin/fm-review-dispatch.sh record %s greptile refused if greptile declined, or bin/fm-review-dispatch.sh record %s greptile exhausted if no dispatch was made\n' \
+    printf 'the ledger shows 0 Greptile credits this cycle, so record what happened - bin/fm-review-dispatch.sh record %s greptile refused if greptile declined, or bin/fm-review-dispatch.sh record %s greptile exhausted if no dispatch was made\n' \
       "$url" "$url"
     return 0
   fi
   printf 'bin/fm-review-dispatch.sh record %s %s refused\n' "$url" "$owner"
+}
+
+# Every Greptile dispatch passes here first: refused outright at zero because
+# the $0 flex cap would make the review a no-op, warned at or below the reserve
+# floor. Auto-picks never reach it - they stop above the floor on their own.
+# Only a PR Greptile actually owns is told to record the `exhausted` release;
+# the ledger is never asked to record a release that did not happen.
+greptile_guard() {  # <pr-url> owner|unowned
+  local url=$1 held=$2 remaining
+  remaining=$(greptile_remaining)
+  if [ "$remaining" -le 0 ]; then
+    if [ "$held" = owner ]; then
+      refuse "the ledger shows 0 Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
+    fi
+    refuse "the ledger shows 0 Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
+  fi
+  if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
+    printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
+      "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
+  fi
 }
 
 print_choice() {  # <pr-url> <service> <reason>
@@ -679,10 +751,10 @@ cmd_reconcile() {
 }
 
 cmd_status() {
-  local month remaining relayed url owner last_refusal open
-  month=$(billing_month)
+  local cycle remaining relayed url owner last_refusal open
+  cycle=$(billing_cycle)
   remaining=$(greptile_remaining)
-  printf 'billing month: %s\n' "$month"
+  printf 'billing cycle: %s, next reset %s\n' "${cycle% *}" "${cycle#* }"
   printf 'greptile: %s of %s credits remaining, reserve floor %s' \
     "$remaining" "$GREPTILE_MONTHLY_CREDITS" "$GREPTILE_RESERVE_FLOOR"
   if [ "$remaining" -gt "$GREPTILE_RESERVE_FLOOR" ]; then
@@ -797,11 +869,14 @@ EOF
 COMMAND=$1
 shift
 case "$COMMAND" in
+  -h|--help) usage; exit 0 ;;
+esac
+validate_config
+case "$COMMAND" in
   choose) cmd_choose "$@" ;;
   record) cmd_record "$@" ;;
   reconcile) cmd_reconcile "$@" ;;
   status) cmd_status "$@" ;;
   check) cmd_check "$@" ;;
-  -h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac
