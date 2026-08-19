@@ -299,6 +299,32 @@ test_a_refused_dispatch_spends_no_credit() {
   pass "only greptile dispatches without a recorded refusal count against the month"
 }
 
+test_a_completed_review_keeps_its_credit_through_a_later_refusal() {
+  local data out
+  data=$(new_home reviewed-then-refused)
+
+  # Greptile reviews round one, then rate-limits on a fix round, so the
+  # operator records the refusal that hands the PR on. The delivered review
+  # spent its credit and must not be refunded by that later refusal.
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  expect_code 0 "$DISPATCH_RC" "recording a delivered review must succeed"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "a delivered greptile review did not count against the month"
+
+  dispatch "$data" record "$PR_A" greptile refused --note 'rate limited on fix round 2'
+  expect_code 0 "$DISPATCH_RC" "recording a fix-round refusal must succeed"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "a refusal after a delivered review refunded a credit that was really spent"
+
+  pass "a recorded review locks its credit in against a later refusal on the same PR"
+}
+
 test_the_retry_after_a_refusal_is_an_executable_path() {
   local data out
   data=$(new_home retry)
@@ -395,5 +421,6 @@ test_check_flags_a_review_from_a_non_owner
 test_check_accepts_the_comment_a_refusal_left_behind
 test_the_retry_after_a_refusal_is_an_executable_path
 test_a_refused_dispatch_spends_no_credit
+test_a_completed_review_keeps_its_credit_through_a_later_refusal
 test_the_ledger_directory_is_private
 test_bad_input_is_refused_before_anything_is_written

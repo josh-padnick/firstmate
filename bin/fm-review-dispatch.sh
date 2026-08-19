@@ -257,7 +257,9 @@ greptile_remaining() {
   # written in the same second still count once each.
   #
   # A dispatch the ledger later records as refused consumed no credit, so its
-  # `requested` row is cancelled by that PR's next `refused` row. The ledger's
+  # `requested` row is cancelled by that PR's next `refused` row. A recorded
+  # `reviewed` row locks that credit in first: a service that refuses a later
+  # fix round on a PR it already reviewed still spent the credit. The ledger's
   # silence stays conservative: a dispatch with no recorded refusal is spent.
   while IFS=$'\t' read -r ts pr service event note; do
     [ "$service" = greptile ] || continue
@@ -276,6 +278,11 @@ greptile_remaining() {
       requested)
         used=$((used + 1))
         unrefused="$unrefused$pr "
+        ;;
+      reviewed)
+        case "$unrefused" in
+          *" $pr "*) unrefused=${unrefused/ $pr / } ;;
+        esac
         ;;
       refused)
         case "$unrefused" in
