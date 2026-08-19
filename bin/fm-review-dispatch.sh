@@ -10,8 +10,9 @@
 # Usage:
 #   fm-review-dispatch.sh choose <pr-url> [--after-refusal] [--service <name>]
 #                                         [--devin-quota-confirmed]
-#   fm-review-dispatch.sh record <pr-url> <service> requested|refused|reviewed
-#                                         [--note <text>]
+#   fm-review-dispatch.sh record <pr-url> <service> <event> [--note <text>]
+#                                 <event> is requested, refused, reviewed,
+#                                 or exhausted
 #   fm-review-dispatch.sh reconcile <service> <remaining> [--note <text>]
 #   fm-review-dispatch.sh status
 #   fm-review-dispatch.sh check <pr-url> [--ledger-only]
@@ -38,8 +39,9 @@
 # Exactly one owner per PR: the first recorded `requested` row makes that
 # service the PR's review owner. Fix rounds re-use the same owner, so `choose`
 # on an owned PR prints that owner - with the same cost and `record` step as any
-# other dispatch - and refuses to name a different one.
-# Ownership moves only after a `refused` row for the current owner.
+# other dispatch - and refuses to name a different one. Ownership moves only
+# after a `refused` row for the current owner, or an `exhausted` row when that
+# service's pool has no credits left to spend on this PR.
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
 # $0, so an over-budget review is skipped and consumes nothing. A dispatch the
@@ -48,13 +50,12 @@
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
 # Greptile dispatch carries those rules, including a fix round on a PR Greptile
-# already owns.
+# already owns. A PR Greptile owns at zero remaining is released with
+# `record <pr-url> greptile exhausted`, which is what actually happened: no
+# dispatch was made.
 #
-# A fix-round re-review is counted as one more Greptile credit. Whether Greptile
-# actually bills a second credit for a re-review is an unconfirmed assumption,
-# counted because over-counting only stops auto-picks early while under-counting
-# spends past the reserve floor into a $0-capped no-op. `reconcile` against the
-# dashboard is where this number is corrected, so it is worth checking there.
+# A fix-round re-review is counted as one more Greptile credit, because Greptile
+# bills a second credit for a re-review on the same PR.
 #
 # Devin is reserve. `choose` reaches it only on explicit captain choice
 # (--service devin) or, in the after-refusal chain, when the captain has read
@@ -62,14 +63,20 @@
 # countable, so no automatic path infers it.
 #
 # When every pool is unavailable, `choose` names the in-house adversarial
-# review rather than stalling.
+# review rather than stalling. Once every third-party service is recorded as
+# refused or exhausted for a PR, that choice needs no --after-refusal: the flag
+# guards moves to a paid pool, and the in-house review costs nothing.
 #
 # The ledger is $FM_HOME/data/review-dispatch/ledger.tsv, captain-private and
 # gitignored with the rest of data/. One tab-separated row per event:
 #
 #   <iso8601-utc>	<pr-url or ->	<service>	<event>	<note>
 #
-# Events are requested, refused, reviewed, and reconcile. No balance API
+# Events are requested, refused, reviewed, exhausted, and reconcile. A
+# `refused` row says the service declined; an `exhausted` row says its pool had
+# no credits, so nothing was dispatched. Both release the PR and take that
+# service out of its selection, and neither refunds a credit already spent. No
+# balance API
 # exists, so this file is the source of truth for remaining Greptile credits;
 # the captain's dashboard is the monthly reconciliation source, and
 # `reconcile greptile <remaining>` writes the relayed number as a `remaining=`
@@ -173,8 +180,8 @@ validate_service() {  # <service>
 
 validate_event() {  # <event>
   case "${1:-}" in
-    requested|refused|reviewed) : ;;
-    *) fail "unknown event: ${1:-} (requested, refused, reviewed)" ;;
+    requested|refused|reviewed|exhausted) : ;;
+    *) fail "unknown event: ${1:-} (requested, refused, reviewed, exhausted)" ;;
   esac
 }
 
@@ -222,14 +229,18 @@ pr_rows() {  # <pr-url>
 }
 
 # The PR's state machine, folded in append order. Sets:
-#   PR_OWNER    the live review owner, empty when ownership is open
-#   PR_REFUSED  space-delimited services that refused this PR
-#   PR_REVIEWED space-delimited services whose review was recorded
+#   PR_OWNER       the live review owner, empty when ownership is open
+#   PR_REFUSED     space-delimited services that refused this PR
+#   PR_EXHAUSTED   space-delimited services whose pool was dry for this PR
+#   PR_REVIEWED    space-delimited services whose review was recorded
+#   PR_UNAVAILABLE refused and exhausted together: out of this PR's selection
 fold_pr_state() {  # <pr-url>
   local ts service event
   PR_OWNER=
   PR_REFUSED=
+  PR_EXHAUSTED=
   PR_REVIEWED=
+  PR_UNAVAILABLE=
   while IFS=$'\t' read -r ts _ service event _; do
     [ -n "${ts:-}" ] || continue
     case "$event" in
@@ -240,15 +251,35 @@ fold_pr_state() {  # <pr-url>
           PR_OWNER=
         fi
         ;;
+      exhausted)
+        list_add PR_EXHAUSTED "$service"
+        if [ "$PR_OWNER" = "$service" ]; then
+          PR_OWNER=
+        fi
+        ;;
       reviewed) list_add PR_REVIEWED "$service" ;;
     esac
   done < <(pr_rows "$1")
+  PR_UNAVAILABLE=$PR_REFUSED
+  for service in $PR_EXHAUSTED; do
+    list_add PR_UNAVAILABLE "$service"
+  done
 }
 
 
 # The billing month the ledger counts against, as YYYY-MM.
 billing_month() {
   printf '%s\n' "${NOW:0:7}"
+}
+
+# Whether any greptile dispatch was ever recorded for a PR, anywhere in the
+# ledger. A review with one behind it was counted when that dispatch was; a
+# review with none is a leak that consumed a credit nothing else counts.
+has_greptile_dispatch() {  # <pr-url>
+  ledger_rows | awk -F '\t' -v url="$1" '
+    $2 == url && $3 == "greptile" && $4 == "requested" { found = 1 }
+    END { exit !found }
+  '
 }
 
 # Greptile credits remaining this billing month. Counts forward from the latest
@@ -269,9 +300,11 @@ greptile_remaining() {
   # `requested` row is cancelled by that PR's next `refused` row. A recorded
   # `reviewed` row locks that credit in first: a service that refuses a later
   # fix round on a PR it already reviewed still spent the credit, and a review
-  # with no dispatch of its own behind it - the leak `record` warns about -
-  # counts as spend on its own. The ledger's silence stays conservative: a
-  # dispatch with no recorded refusal is spent.
+  # with no dispatch anywhere in the ledger behind it - the leak `record` warns
+  # about - counts as spend on its own. A review whose dispatch is simply
+  # outside this counting window, in an earlier month or before the latest
+  # baseline, was already counted there. The ledger's silence stays
+  # conservative: a dispatch with no recorded refusal is spent.
   while IFS=$'\t' read -r ts pr service event note; do
     [ "$service" = greptile ] || continue
     case "$ts" in "$month"-*) : ;; *) continue ;; esac
@@ -293,7 +326,7 @@ greptile_remaining() {
       reviewed)
         case "$unrefused" in
           *" $pr "*) unrefused=${unrefused/ $pr / } ;;
-          *) used=$((used + 1)) ;;
+          *) has_greptile_dispatch "$pr" || used=$((used + 1)) ;;
         esac
         ;;
       refused)
@@ -356,11 +389,11 @@ service_logins() {  # <service>
 # Every Greptile dispatch passes here first: refused outright at zero because
 # the $0 flex cap would make the review a no-op, warned at or below the reserve
 # floor. Auto-picks never reach it - they stop above the floor on their own.
-greptile_guard() {
-  local remaining
+greptile_guard() {  # <pr-url>
+  local url=$1 remaining
   remaining=$(greptile_remaining)
   if [ "$remaining" -le 0 ]; then
-    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; reconcile against the dashboard if it disagrees"
+    refuse "the ledger shows 0 Greptile credits this month and the flex cap is \$0, so the review would be skipped; release the PR with: bin/fm-review-dispatch.sh record $url greptile exhausted - or reconcile against the dashboard if it disagrees"
   fi
   if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
     printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
@@ -417,7 +450,7 @@ cmd_choose() {
       refuse "$url is still owned by $PR_OWNER; record the refusal first: bin/fm-review-dispatch.sh record $url $PR_OWNER refused"
     fi
     if [ "$PR_OWNER" = greptile ]; then
-      greptile_guard
+      greptile_guard "$url"
     fi
     print_choice "$url" "$PR_OWNER" "existing owner of this PR; fix rounds re-use it"
     return 0
@@ -431,24 +464,36 @@ cmd_choose() {
     reason="explicit captain choice"
     if list_has "$PR_REFUSED" "$explicit"; then
       reason="retry after the recorded $explicit refusal; wait beats switch"
+    elif list_has "$PR_EXHAUSTED" "$explicit"; then
+      reason="retry after the recorded $explicit exhaustion"
     fi
     if [ "$explicit" = greptile ]; then
-      greptile_guard
+      greptile_guard "$url"
     fi
     print_choice "$url" "$explicit" "$reason"
     return 0
   fi
 
-  if ! list_has "$PR_REFUSED" coderabbit; then
+  if ! list_has "$PR_UNAVAILABLE" coderabbit; then
     print_choice "$url" coderabbit "default service; its hourly allowance costs no credits"
     return 0
   fi
 
-  if [ "$after_refusal" = 0 ]; then
-    refuse "coderabbit refused $url; wait beats switch. Re-trigger it after its retry window with: bin/fm-review-dispatch.sh choose $url --service coderabbit - or pass --after-refusal when waiting would genuinely block the captain"
+  # A dry fleet gets our own review rather than a stall, and --after-refusal is
+  # not asked for it: that flag guards a move to a paid pool, and this one is
+  # free. Devin is unreachable without --devin-quota-confirmed, so an
+  # unconfirmed reserve is as unavailable as a recorded one.
+  if list_has "$PR_UNAVAILABLE" greptile &&
+    { [ "$devin_confirmed" = 0 ] || list_has "$PR_UNAVAILABLE" devin; }; then
+    print_choice "$url" in-house "every third-party service is recorded as refused or exhausted for this PR"
+    return 0
   fi
 
-  if ! list_has "$PR_REFUSED" greptile; then
+  if [ "$after_refusal" = 0 ]; then
+    refuse "coderabbit is recorded as unavailable for $url; wait beats switch. Re-trigger it after its retry window with: bin/fm-review-dispatch.sh choose $url --service coderabbit - or pass --after-refusal when waiting would genuinely block the captain"
+  fi
+
+  if ! list_has "$PR_UNAVAILABLE" greptile; then
     remaining=$(greptile_remaining)
     if [ "$remaining" -gt "$GREPTILE_RESERVE_FLOOR" ]; then
       print_choice "$url" greptile "coderabbit refused and $remaining credits remain, above the reserve floor of $GREPTILE_RESERVE_FLOOR"
@@ -458,7 +503,7 @@ cmd_choose() {
       "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
   fi
 
-  if [ "$devin_confirmed" = 1 ] && ! list_has "$PR_REFUSED" devin; then
+  if [ "$devin_confirmed" = 1 ] && ! list_has "$PR_UNAVAILABLE" devin; then
     print_choice "$url" devin "coderabbit refused, greptile unavailable, and the captain confirmed Devin quota"
     return 0
   fi
@@ -584,7 +629,7 @@ cmd_status() {
 }
 
 cmd_check() {
-  local url ledger_only=0 comments logins login service found='' leaks=''
+  local url ledger_only=0 comments logins login service found='' leaks='' released
   [ "$#" -ge 1 ] || fail "check needs a PR URL"
   url=$(validate_pr_url "$1")
   shift
@@ -599,8 +644,11 @@ cmd_check() {
   fold_pr_state "$url"
   if [ -n "$PR_OWNER" ]; then
     printf 'owner: %s\n' "$PR_OWNER"
-  elif [ -n "$PR_REFUSED" ]; then
-    printf 'owner: none (refused: %s)\n' "$PR_REFUSED"
+  elif [ -n "$PR_REFUSED$PR_EXHAUSTED" ]; then
+    released=''
+    [ -z "$PR_REFUSED" ] || released="refused: $PR_REFUSED"
+    [ -z "$PR_EXHAUSTED" ] || released="${released:+$released; }exhausted: $PR_EXHAUSTED"
+    printf 'owner: none (%s)\n' "$released"
   else
     printf 'owner: none recorded\n'
   fi

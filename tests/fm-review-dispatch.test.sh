@@ -27,13 +27,23 @@ new_home() {  # <name>; echoes the data directory
 DISPATCH_OUT=
 DISPATCH_RC=0
 DISPATCH_FAKEBIN=
+DISPATCH_NOW=2026-08-19T10:00:00Z
 dispatch() {  # <data-dir> <args...>; sets DISPATCH_OUT and DISPATCH_RC
   local data=$1
   shift
   DISPATCH_RC=0
   DISPATCH_OUT=$(PATH="${DISPATCH_FAKEBIN:+$DISPATCH_FAKEBIN:}$PATH" \
-    FM_DATA_OVERRIDE="$data" FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z \
+    FM_DATA_OVERRIDE="$data" FM_REVIEW_DISPATCH_NOW="$DISPATCH_NOW" \
     "$DISPATCH" "$@" 2>&1) || DISPATCH_RC=$?
+}
+
+# The same call with the clock moved, for the billing-month arithmetic.
+dispatch_at() {  # <iso8601-utc> <data-dir> <args...>
+  local now=$1 previous=$DISPATCH_NOW
+  shift
+  DISPATCH_NOW=$now
+  dispatch "$@"
+  DISPATCH_NOW=$previous
 }
 
 test_coderabbit_is_the_default_and_owns_the_pr() {
@@ -338,6 +348,95 @@ test_a_review_with_no_dispatch_behind_it_counts_as_spend() {
   pass "a greptile review with no dispatch behind it still counts against the month"
 }
 
+test_a_review_is_charged_once_across_a_counting_window() {
+  local data out
+  data=$(new_home cross-window)
+
+  # A dispatch in July is July's credit. Recording the review it produced in
+  # August must not bill August a second time for it.
+  dispatch_at 2026-07-30T10:00:00Z "$data" record "$PR_A" greptile requested
+  dispatch_at 2026-07-30T11:00:00Z "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "the july dispatch did not count against july"
+
+  dispatch_at 2026-08-02T10:00:00Z "$data" record "$PR_A" greptile reviewed
+  dispatch_at 2026-08-02T11:00:00Z "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 50 of 50 credits remaining' \
+    "a review was charged to a month that never dispatched it"
+
+  # A reconcile baseline already reflects the dispatches behind it, so a review
+  # recorded after one must not be counted forward again.
+  data=$(new_home cross-baseline)
+  dispatch_at 2026-08-05T10:00:00Z "$data" record "$PR_B" greptile requested
+  dispatch_at 2026-08-06T10:00:00Z "$data" reconcile greptile 45
+  dispatch_at 2026-08-07T10:00:00Z "$data" record "$PR_B" greptile reviewed
+  dispatch_at 2026-08-07T11:00:00Z "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 45 of 50 credits remaining' \
+    "a review was charged again on top of the baseline that already held it"
+
+  pass "a review is charged once, in the window its own dispatch was counted"
+}
+
+test_an_exhausted_pool_releases_the_pr_to_the_in_house_review() {
+  local data out
+  data=$(new_home exhausted)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # A fix round with no credits left is refused, and the refusal must name the
+  # command that records what actually happened.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the refusal named no supported way forward"
+
+  dispatch "$data" record "$PR_A" greptile exhausted
+  expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
+  dispatch "$data" check "$PR_A" --ledger-only
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'exhausted: greptile' \
+    "the exhausted pool did not release its ownership of the PR"
+
+  # A dry fleet gets our own review, and does not have to claim a refusal it
+  # never received to get there.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a dry fleet must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over once every pool was recorded dry"
+  assert_contains "$out" 'doctrine:' \
+    "the in-house choice did not carry its review doctrine"
+
+  pass "an exhausted pool releases the PR and the in-house review takes it over"
+}
+
+test_an_exhausted_pool_refunds_nothing() {
+  local data out
+  data=$(new_home exhausted-credits)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "the greptile dispatch did not count against the month"
+
+  # Exhaustion says a later dispatch was never made; it says nothing about the
+  # credit the earlier one already spent.
+  dispatch "$data" record "$PR_A" greptile exhausted
+  expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "an exhausted row refunded a credit that was really spent"
+
+  pass "recording an exhausted pool never refunds an already-spent credit"
+}
+
 test_bad_input_is_refused_before_anything_is_written() {
   local data
   data=$(new_home input)
@@ -516,4 +615,7 @@ test_the_ledger_directory_is_private
 test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch
 test_a_fix_round_cannot_dispatch_greptile_at_zero_credits
 test_a_review_with_no_dispatch_behind_it_counts_as_spend
+test_a_review_is_charged_once_across_a_counting_window
+test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
+test_an_exhausted_pool_refunds_nothing
 test_bad_input_is_refused_before_anything_is_written
