@@ -511,6 +511,20 @@ test_the_greptile_charge_table() {
   charge_case cross-window-august 50 2026-08-02T11:00:00Z \
     "2026-07-30T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
 
+  # A review that arrived before this PR was ever dispatched is a credit of its
+  # own: the later dispatch cannot answer for it.
+  charge_case leaked-then-dispatched 48 "$aug" \
+    "$aug,greptile,reviewed" "$aug,greptile,requested"
+
+  # A refusal answers the dispatch it followed, so the credit stays charged to
+  # the window that really spent it rather than moving into the later one.
+  charge_case cross-window-refusal-july 49 2026-07-31T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+    "2026-08-11T10:00:00Z,greptile,refused"
+  charge_case cross-window-refusal-august 50 2026-08-12T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+    "2026-08-11T10:00:00Z,greptile,refused"
+
   # A relayed dashboard number already reflects the dispatches before it, so a
   # review recorded after the baseline does not count forward a second time.
   charge_case reconcile-baseline 45 2026-08-07T11:00:00Z \

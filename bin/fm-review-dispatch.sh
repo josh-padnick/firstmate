@@ -45,8 +45,9 @@
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
 # $0, so an over-budget review is skipped and consumes nothing. Per PR the
-# ledger charges max(dispatches not cancelled by a later refusal, recorded
-# reviews), so a refunded dispatch costs nothing while a review it never
+# ledger charges each dispatch not cancelled by a later refusal, each review a
+# dispatch cannot answer for, and each review that arrived before the PR was
+# ever dispatched, so a refunded dispatch costs nothing while a review it never
 # produced is still spend. Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
@@ -284,28 +285,37 @@ billing_month() {
 #
 # Per PR, one invariant replaces every rule this counting used to carry:
 #
-#   charged = max(uncancelled dispatches, delivered reviews)
+#   pre-dispatch reviews = `reviewed` rows before that PR's first `requested`
+#   remaining reviews    = delivered reviews - pre-dispatch reviews
+#   charged              = pre-dispatch reviews
+#                          + max(uncancelled dispatches, remaining reviews)
 #
 # An uncancelled dispatch is a `requested` row with no later `refused` row left
-# to cancel it; the two pair up in append order. A delivered review is a
-# `reviewed` row. Each dispatch charge is attributed to its own `requested` row,
-# and each review beyond the dispatch count to the `reviewed` row that carried
-# the count past it, so the caller can decide which billing window owns it.
+# to cancel it; the two pair up in append order, a refusal answering the
+# dispatch it followed, and the charge stays with the earliest dispatch rows so
+# a refusal cannot move a credit into a window that never spent it. A review
+# that precedes its PR's first dispatch is a credit of its own and is never
+# absorbed by a later dispatch. Each charge is attributed to a row - a dispatch
+# to its `requested` row, a pre-dispatch or excess review to its `reviewed` row
+# - so the caller can decide which billing window owns it.
 #
-#   case                      rows                       uncancelled  reviews  charged
-#   plain dispatch            req                        1            0        1
-#   refunded dispatch         req, ref                   0            0        0
-#   retry path                req, ref, req              1            0        1
-#   true leak                 rev                        0            1        1
-#   cross-window review       req (Jul), rev (Aug)       1            1        1
-#   same-PR re-review         req, rev, rev              1            2        2
-#   reviewed then refused     req, rev, ref              0            1        1
-#   refused then reviewed     req, ref, rev              0            1        1
-#   refunded, re-reviewed     req, ref, req, rev, rev    1            2        2
+#   case                     rows                     pre  uncanc  rem  charged
+#   plain dispatch           req                      0    1       0    1
+#   refunded dispatch        req, ref                 0    0       0    0
+#   retry path               req, ref, req            0    1       0    1
+#   true leak                rev                      1    0       0    1
+#   cross-window review      req (Jul), rev (Aug)     0    1       1    1
+#   cross-window refusal     req (Jul), req, ref      0    1       0    1
+#   same-PR re-review        req, rev, rev            0    1       2    2
+#   reviewed then refused    req, rev, ref            0    0       1    1
+#   refused then reviewed    req, ref, rev            0    0       1    1
+#   refunded, re-reviewed    req, ref, req, rev, rev  0    1       2    2
+#   leaked then dispatched   rev, req                 1    1       0    2
 #
 # "A recorded review locks its credit in against a later refusal" is no longer
 # its own rule: the max holds the charge up on its own once the review is
-# delivered, whatever a later refusal does to the dispatch behind it.
+# delivered, whatever a later refusal does to the dispatch behind it. A true
+# leak still charges exactly one credit, now as a pre-dispatch review.
 greptile_charges() {
   ledger_rows | awk -F '\t' '
     $3 != "greptile" { next }
@@ -324,14 +334,17 @@ greptile_charges() {
       reviews[pr]++
       review_row[pr, reviews[pr]] = NR
       review_when[pr, reviews[pr]] = $1
+      if (dispatches[pr] == 0) pre[pr]++
       next
     }
     END {
       for (pr in seen) {
-        for (i = cancelled[pr] + 1; i <= dispatches[pr]; i++)
-          printf "%s\t%s\n", row[pr, i], when[pr, i]
         uncancelled = dispatches[pr] - cancelled[pr]
-        for (j = uncancelled + 1; j <= reviews[pr]; j++)
+        for (i = 1; i <= pre[pr]; i++)
+          printf "%s\t%s\n", review_row[pr, i], review_when[pr, i]
+        for (i = 1; i <= uncancelled; i++)
+          printf "%s\t%s\n", row[pr, i], when[pr, i]
+        for (j = pre[pr] + uncancelled + 1; j <= reviews[pr]; j++)
           printf "%s\t%s\n", review_row[pr, j], review_when[pr, j]
       }
     }
