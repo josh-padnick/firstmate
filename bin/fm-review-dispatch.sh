@@ -30,8 +30,10 @@
 # recorded, because silence is not refusal and a slow first service reviewing
 # after a second was dispatched would double-spend. Wait beats switch: a
 # CodeRabbit refusal names its own retry time, and re-triggering it is the
-# default response. --after-refusal is the caller's statement that waiting
-# would genuinely block the captain.
+# default response - `choose <pr-url> --service coderabbit` names that retry and
+# prints the `record` step that puts the re-trigger back on the ledger.
+# --after-refusal is the caller's statement that waiting would genuinely block
+# the captain.
 #
 # Exactly one owner per PR: the first recorded `requested` row makes that
 # service the PR's review owner. Fix rounds re-use the same owner, so `choose`
@@ -39,9 +41,10 @@
 # Ownership moves only after a `refused` row for the current owner.
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
-# $0, so an over-budget review is skipped and consumes nothing. Auto-picks stop
-# at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile is
-# captain-explicit only (--service greptile), and at zero remaining it is
+# $0, so an over-budget review is skipped and consumes nothing. A dispatch the
+# ledger records as refused likewise spent no credit and is not counted.
+# Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
+# is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op.
 #
 # Devin is reserve. `choose` reaches it only on explicit captain choice
@@ -68,7 +71,8 @@
 # itself. Evidence lives in PR comments rather than GitHub review objects, so
 # the comparison reads comment authors through `gh --json` (the structured
 # surface; gh-axi is the agent-facing one). A second service's evidence on an
-# owned PR is reported as a leak.
+# owned PR is reported as a leak, unless the ledger records that service as
+# having refused this PR: its refusal is itself delivered as a comment.
 #
 # Environment:
 #   FM_HOME                    home whose data/ holds the ledger
@@ -127,8 +131,11 @@ trap cleanup EXIT
 # cannot both decide a PR is unowned. A holder that died mid-write is broken
 # after FM_REVIEW_DISPATCH_LOCK_STALE_SECS.
 lock_acquire() {
-  local tries=0 now mtime age
+  local tries=0 now mtime age old_umask
+  old_umask=$(umask)
+  umask 077
   mkdir -p "$LEDGER_DIR"
+  umask "$old_umask"
   while ! mkdir "$LOCK" 2>/dev/null; do
     tries=$((tries + 1))
     if [ "$tries" -ge 40 ]; then
@@ -239,15 +246,20 @@ billing_month() {
 # captain-relayed reconcile row in the month when one exists, and from the full
 # monthly allowance otherwise.
 greptile_remaining() {
-  local month baseline used ts service event note relayed
+  local month baseline used unrefused ts pr service event note relayed
   month=$(billing_month)
   baseline=$GREPTILE_MONTHLY_CREDITS
   used=0
+  unrefused=' '
   # One pass in append order. A reconcile row replaces the baseline and resets
   # the count, so credits are always counted forward from the captain's most
   # recent relayed number. Position, not timestamp, orders the ledger: two rows
   # written in the same second still count once each.
-  while IFS=$'\t' read -r ts _ service event note; do
+  #
+  # A dispatch the ledger later records as refused consumed no credit, so its
+  # `requested` row is cancelled by that PR's next `refused` row. The ledger's
+  # silence stays conservative: a dispatch with no recorded refusal is spent.
+  while IFS=$'\t' read -r ts pr service event note; do
     [ "$service" = greptile ] || continue
     case "$ts" in "$month"-*) : ;; *) continue ;; esac
     case "$event" in
@@ -259,8 +271,20 @@ greptile_remaining() {
         case "$relayed" in ''|*[!0-9]*) continue ;; esac
         baseline=$relayed
         used=0
+        unrefused=' '
         ;;
-      requested) used=$((used + 1)) ;;
+      requested)
+        used=$((used + 1))
+        unrefused="$unrefused$pr "
+        ;;
+      refused)
+        case "$unrefused" in
+          *" $pr "*)
+            unrefused=${unrefused/ $pr / }
+            used=$((used - 1))
+            ;;
+        esac
+        ;;
     esac
   done < <(ledger_rows)
   printf '%s\n' "$((baseline - used))"
@@ -333,7 +357,7 @@ print_choice() {  # <pr-url> <service> <reason>
 # --- commands ---------------------------------------------------------------
 
 cmd_choose() {
-  local url after_refusal=0 explicit='' devin_confirmed=0 remaining
+  local url after_refusal=0 explicit='' devin_confirmed=0 remaining reason
   [ "$#" -ge 1 ] || fail "choose needs a PR URL"
   url=$(validate_pr_url "$1")
   shift
@@ -365,8 +389,13 @@ cmd_choose() {
   fi
 
   if [ -n "$explicit" ]; then
+    # Wait beats switch: re-triggering the service that refused is the default
+    # response, so an explicit pick of a service this PR already recorded as
+    # refused is the retry path, not a second owner. It re-establishes ownership
+    # through the same `record ... requested` step every other choice prints.
+    reason="explicit captain choice"
     if list_has "$PR_REFUSED" "$explicit"; then
-      refuse "$explicit already refused $url; it cannot own the same PR twice"
+      reason="retry after the recorded $explicit refusal; wait beats switch"
     fi
     if [ "$explicit" = greptile ]; then
       remaining=$(greptile_remaining)
@@ -378,7 +407,7 @@ cmd_choose() {
           "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
       fi
     fi
-    print_choice "$url" "$explicit" "explicit captain choice"
+    print_choice "$url" "$explicit" "$reason"
     return 0
   fi
 
@@ -388,7 +417,7 @@ cmd_choose() {
   fi
 
   if [ "$after_refusal" = 0 ]; then
-    refuse "coderabbit refused $url; wait beats switch. Re-trigger it after its retry window, or pass --after-refusal when waiting would block the captain"
+    refuse "coderabbit refused $url; wait beats switch. Re-trigger it after its retry window with: bin/fm-review-dispatch.sh choose $url --service coderabbit - or pass --after-refusal when waiting would genuinely block the captain"
   fi
 
   if ! list_has "$PR_REFUSED" greptile; then
@@ -575,8 +604,11 @@ EOF
 
   printf 'evidence: %s\n' "${found:-none}"
 
+  # A service this PR recorded as refused has a comment here for that refusal -
+  # CodeRabbit delivers its rate-limit notice as one - so its evidence is
+  # explained rather than leaked. Every other non-owner with evidence is a leak.
   for service in $found; do
-    if [ "$service" != "$PR_OWNER" ]; then
+    if [ "$service" != "$PR_OWNER" ] && ! list_has "$PR_REFUSED" "$service"; then
       list_add leaks "$service"
     fi
   done

@@ -266,6 +266,124 @@ test_bad_input_is_refused_before_anything_is_written() {
   pass "invalid input is refused before any ledger row is written"
 }
 
+test_a_refused_dispatch_spends_no_credit() {
+  local data out
+  data=$(new_home refunded)
+
+  # A greptile dispatch that the ledger later records as refused consumed
+  # nothing, so the month's remaining credits must come back.
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  expect_code 0 "$DISPATCH_RC" "recording a greptile dispatch must succeed"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "an in-flight greptile dispatch did not count against the month"
+
+  dispatch "$data" record "$PR_A" greptile refused
+  expect_code 0 "$DISPATCH_RC" "recording a greptile refusal must succeed"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 50 of 50 credits remaining' \
+    "a refused greptile dispatch still burned a credit"
+
+  # The ledger's silence stays conservative: a dispatch with no recorded
+  # refusal is spent.
+  dispatch "$data" record "$PR_B" coderabbit refused
+  dispatch "$data" record "$PR_B" greptile requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 49 of 50 credits remaining' \
+    "an unrefused greptile dispatch stopped counting as spent"
+
+  pass "only greptile dispatches without a recorded refusal count against the month"
+}
+
+test_the_retry_after_a_refusal_is_an_executable_path() {
+  local data out
+  data=$(new_home retry)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused --note 'retry in 12 minutes'
+
+  # The wait-beats-switch refusal must name a command that actually works.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a plain choose after a refusal must still decline to switch"
+  assert_contains "$out" "choose $PR_A --service coderabbit" \
+    "the refusal did not name the re-trigger command it recommends"
+
+  dispatch "$data" choose "$PR_A" --service coderabbit
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "re-triggering the refusing service must be a supported choice"
+  assert_contains "$out" 'service: coderabbit' \
+    "the retry path did not name the service being re-triggered"
+  assert_contains "$out" "record $PR_A coderabbit requested" \
+    "the retry path did not print the ledger step that restores ownership"
+
+  # Following that printed step must put ownership back, so the depletable
+  # pools stay shut while the re-triggered review is in flight.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  expect_code 0 "$DISPATCH_RC" "the printed record step must be accepted"
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a re-triggered owner must block a second dispatch"
+  assert_contains "$out" 'still owned by coderabbit' \
+    "the re-trigger did not re-establish ownership of the PR"
+
+  pass "the re-trigger the refusal recommends is a supported choose that restores ownership"
+}
+
+test_check_accepts_the_comment_a_refusal_left_behind() {
+  local data out fakebin
+  data=$(new_home check-refused)
+  fakebin=$(fm_fakebin "$TMP_ROOT/check-refused")
+
+  # The design's own fallback path: coderabbit refuses (in a PR comment) and
+  # greptile takes the PR over.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\n'
+SH
+  chmod +x "$fakebin/gh"
+  DISPATCH_FAKEBIN=$fakebin
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "the refused predecessor's own comment must not read as a leak"
+  assert_contains "$out" 'verdict: consistent' \
+    "the check refused the fallback path the ledger is designed to record"
+
+  # A service that neither owns the PR nor refused it is still a leak.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\ndevin-ai-integration\n'
+SH
+  chmod +x "$fakebin/gh"
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  DISPATCH_FAKEBIN=
+  expect_code 2 "$DISPATCH_RC" "an unexplained third service must still fail the check"
+  assert_contains "$out" 'leak: devin' \
+    "the check did not name the service with no recorded reason to be here"
+
+  pass "a recorded refusal explains that service's comment while other leaks still fail"
+}
+
+test_the_ledger_directory_is_private() {
+  local data perms
+  data=$(new_home ledger-dir)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  assert_present "$data/review-dispatch" "the ledger directory was not created"
+  perms=$(stat -f %Lp "$data/review-dispatch" 2>/dev/null || stat -c %a "$data/review-dispatch" 2>/dev/null)
+  [ "$perms" = 700 ] || fail "the ledger directory must stay captain-private (mode $perms)"
+
+  pass "the ledger directory is created captain-private"
+}
+
 test_coderabbit_is_the_default_and_owns_the_pr
 test_exactly_one_owner_survives_a_second_dispatch_attempt
 test_fallback_needs_a_recorded_refusal_and_prefers_waiting
@@ -274,4 +392,8 @@ test_zero_credits_refuses_even_an_explicit_greptile_dispatch
 test_devin_stays_in_reserve_until_quota_is_confirmed
 test_ledger_is_private_and_records_every_event
 test_check_flags_a_review_from_a_non_owner
+test_check_accepts_the_comment_a_refusal_left_behind
+test_the_retry_after_a_refusal_is_an_executable_path
+test_a_refused_dispatch_spends_no_credit
+test_the_ledger_directory_is_private
 test_bad_input_is_refused_before_anything_is_written
