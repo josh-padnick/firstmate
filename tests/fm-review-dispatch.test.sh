@@ -600,8 +600,8 @@ test_a_release_step_names_the_event_that_actually_happened() {
   expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
   assert_contains "$out" "record $PR_A greptile exhausted" \
     "the transfer named no release for a credit-starved owner"
-  assert_not_contains "$out" "greptile refused" \
-    "the transfer told the operator to record a refusal that never happened"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the transfer named no release for a service that declined while the pool was dry"
 
   dispatch "$data" choose "$PR_A" --service in-house
   out=$DISPATCH_OUT
@@ -644,6 +644,38 @@ test_status_reports_a_pending_fix_round_as_awaiting_review() {
     "a re-dispatched PR was reported as already reviewed"
 
   pass "the open-owners list reports the newest dispatch rather than any past review"
+}
+
+test_a_dry_standing_owner_is_offered_both_releases() {
+  local data out
+  data=$(new_home dry-owner)
+  dispatch "$data" reconcile greptile 1
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" status
+  assert_contains "$DISPATCH_OUT" 'greptile: 0 of 50 credits remaining' \
+    "the standing dispatch did not spend the last credit"
+
+  # The ledger reads zero and a dispatch is standing, so either release could
+  # be the true one. The tool states the balance and names both rather than
+  # guessing which event the operator saw.
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
+  assert_contains "$out" "record $PR_A greptile refused if greptile declined" \
+    "the release named no refusal for a service that may have declined"
+  assert_contains "$out" "record $PR_A greptile exhausted if no dispatch was made" \
+    "the release named no exhaustion for a pool the ledger shows dry"
+
+  # Recording what really happened returns the credit the cancelled dispatch
+  # never spent - the outcome a guessed `exhausted` row would have forfeited.
+  dispatch "$data" record "$PR_A" greptile refused
+  expect_code 0 "$DISPATCH_RC" "recording the refusal that happened must succeed"
+  dispatch "$data" status
+  assert_contains "$DISPATCH_OUT" 'greptile: 1 of 50 credits remaining' \
+    "the refusal did not return the credit the guessed exhaustion would have kept"
+
+  pass "a dry ledger with a standing owner names both releases instead of guessing"
 }
 
 test_bad_input_is_refused_before_anything_is_written() {
@@ -770,4 +802,5 @@ test_check_accepts_the_comment_a_released_owner_left_behind
 test_the_in_house_reason_states_only_what_the_ledger_records
 test_a_release_step_names_the_event_that_actually_happened
 test_status_reports_a_pending_fix_round_as_awaiting_review
+test_a_dry_standing_owner_is_offered_both_releases
 test_bad_input_is_refused_before_anything_is_written

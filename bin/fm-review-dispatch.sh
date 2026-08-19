@@ -69,9 +69,11 @@
 # countable, so no automatic path infers it.
 #
 # When every pool is unavailable, `choose` names the in-house adversarial
-# review rather than stalling. Once every third-party service is recorded as
-# refused or exhausted for a PR, that choice needs no --after-refusal: the flag
-# guards moves to a paid pool, and the in-house review costs nothing.
+# review rather than stalling. That choice needs no --after-refusal once
+# coderabbit and greptile are both recorded as refused or exhausted for the PR
+# and devin is either recorded the same way or unreachable because
+# --devin-quota-confirmed was not passed: the flag guards moves to a paid pool,
+# and the in-house review costs nothing.
 #
 # The ledger is $FM_HOME/data/review-dispatch/ledger.tsv, captain-private and
 # gitignored with the rest of data/. One tab-separated row per event:
@@ -94,7 +96,8 @@
 # the comparison reads comment authors through `gh --json` (the structured
 # surface; gh-axi is the agent-facing one). A second service's evidence on an
 # owned PR is reported as a leak, unless the ledger records that service as
-# having refused this PR: its refusal is itself delivered as a comment.
+# having refused or exhausted on this PR: a refusal is itself delivered as a
+# comment, and a released owner leaves its own review behind.
 #
 # Environment:
 #   FM_HOME                    home whose data/ holds the ledger
@@ -468,16 +471,21 @@ greptile_guard() {  # <pr-url> owner|unowned
   fi
 }
 
-# The command that hands a PR on from its current owner, naming the release
-# that actually happened: an exhausted pool when the ledger shows nothing left
-# to spend, and a refusal otherwise. No printed command ever asks the operator
-# to record an event that did not occur.
+# How a PR is handed on from its current owner. Which release happened - the
+# service declined, or nothing was dispatched because the pool was dry - is a
+# fact only the operator saw, so this never derives one from a balance. Where
+# the ledger leaves both possible, it states the balance and names both
+# commands with the condition that tells them apart; where only one release can
+# be true, it names that one. No printed command asks the operator to record an
+# event that did not occur.
 release_step() {  # <pr-url> <owner>
-  local url=$1 owner=$2 event=refused
+  local url=$1 owner=$2
   if [ "$owner" = greptile ] && [ "$(greptile_remaining)" -le 0 ]; then
-    event=exhausted
+    printf 'the ledger shows 0 Greptile credits this month, so record what happened - bin/fm-review-dispatch.sh record %s greptile refused if greptile declined, or bin/fm-review-dispatch.sh record %s greptile exhausted if no dispatch was made\n' \
+      "$url" "$url"
+    return 0
   fi
-  printf 'bin/fm-review-dispatch.sh record %s %s %s\n' "$url" "$owner" "$event"
+  printf 'bin/fm-review-dispatch.sh record %s %s refused\n' "$url" "$owner"
 }
 
 print_choice() {  # <pr-url> <service> <reason>
