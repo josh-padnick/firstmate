@@ -45,10 +45,14 @@
 #
 # Greptile costs one of GREPTILE_MONTHLY_CREDITS per review and its flex cap is
 # $0, so an over-budget review is skipped and consumes nothing. Per PR the
-# ledger charges each dispatch not cancelled by a later refusal, each review a
-# dispatch cannot answer for, and each review that arrived before the PR was
-# ever dispatched, so a refunded dispatch costs nothing while a review it never
-# produced is still spend. Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
+# ledger walks its own rows in order: a `reviewed` row answers the most recent
+# unanswered standing dispatch and charges a credit of its own when there is
+# none, and a `refused` row cancels the most recent unanswered standing
+# dispatch. What is charged is those self-charging reviews plus the dispatches
+# still standing, so a refunded dispatch costs nothing while a review no
+# dispatch can answer for is still spend.
+#
+# Auto-picks stop at GREPTILE_RESERVE_FLOOR remaining; below the floor Greptile
 # is captain-explicit only (--service greptile), and at zero remaining it is
 # refused outright because the cap would make the dispatch a no-op. Every
 # Greptile dispatch carries those rules, including a fix round on a PR Greptile
@@ -234,32 +238,42 @@ pr_rows() {  # <pr-url>
 #   PR_OWNER       the live review owner, empty when ownership is open
 #   PR_REFUSED     space-delimited services that refused this PR
 #   PR_EXHAUSTED   space-delimited services whose pool was dry for this PR
-#   PR_REVIEWED    space-delimited services whose review was recorded
+#   PR_OWNER_REVIEWED 1 when a review is recorded for the owner's newest
+#                     dispatch, 0 while that dispatch is still awaited
 #   PR_UNAVAILABLE refused and exhausted together: out of this PR's selection
 fold_pr_state() {  # <pr-url>
   local ts service event
   PR_OWNER=
   PR_REFUSED=
   PR_EXHAUSTED=
-  PR_REVIEWED=
+  PR_OWNER_REVIEWED=0
   PR_UNAVAILABLE=
   while IFS=$'\t' read -r ts _ service event _; do
     [ -n "${ts:-}" ] || continue
     case "$event" in
-      requested) PR_OWNER=$service ;;
+      requested)
+        PR_OWNER=$service
+        PR_OWNER_REVIEWED=0
+        ;;
       refused)
         list_add PR_REFUSED "$service"
         if [ "$PR_OWNER" = "$service" ]; then
           PR_OWNER=
+          PR_OWNER_REVIEWED=0
         fi
         ;;
       exhausted)
         list_add PR_EXHAUSTED "$service"
         if [ "$PR_OWNER" = "$service" ]; then
           PR_OWNER=
+          PR_OWNER_REVIEWED=0
         fi
         ;;
-      reviewed) list_add PR_REVIEWED "$service" ;;
+      reviewed)
+        if [ "$PR_OWNER" = "$service" ]; then
+          PR_OWNER_REVIEWED=1
+        fi
+        ;;
     esac
   done < <(pr_rows "$1")
   PR_UNAVAILABLE=$PR_REFUSED
@@ -454,6 +468,18 @@ greptile_guard() {  # <pr-url> owner|unowned
   fi
 }
 
+# The command that hands a PR on from its current owner, naming the release
+# that actually happened: an exhausted pool when the ledger shows nothing left
+# to spend, and a refusal otherwise. No printed command ever asks the operator
+# to record an event that did not occur.
+release_step() {  # <pr-url> <owner>
+  local url=$1 owner=$2 event=refused
+  if [ "$owner" = greptile ] && [ "$(greptile_remaining)" -le 0 ]; then
+    event=exhausted
+  fi
+  printf 'bin/fm-review-dispatch.sh record %s %s %s\n' "$url" "$owner" "$event"
+}
+
 print_choice() {  # <pr-url> <service> <reason>
   local url=$1 service=$2 reason=$3
   printf 'service: %s\n' "$service"
@@ -497,10 +523,10 @@ cmd_choose() {
 
   if [ -n "$PR_OWNER" ]; then
     if [ -n "$explicit" ] && [ "$explicit" != "$PR_OWNER" ]; then
-      refuse "$url is already owned by $PR_OWNER; record its refusal before dispatching $explicit"
+      refuse "$url is already owned by $PR_OWNER; release it first: $(release_step "$url" "$PR_OWNER") - then dispatch $explicit"
     fi
     if [ "$after_refusal" = 1 ]; then
-      refuse "$url is still owned by $PR_OWNER; record the refusal first: bin/fm-review-dispatch.sh record $url $PR_OWNER refused"
+      refuse "$url is still owned by $PR_OWNER; release it first: $(release_step "$url" "$PR_OWNER")"
     fi
     if [ "$PR_OWNER" = greptile ]; then
       greptile_guard "$url" owner
@@ -594,7 +620,7 @@ cmd_record() {
   case "$event" in
     requested)
       if [ -n "$PR_OWNER" ] && [ "$PR_OWNER" != "$service" ]; then
-        refuse "$url is already owned by $PR_OWNER; record its refusal before recording a $service dispatch"
+        refuse "$url is already owned by $PR_OWNER; release it first: $(release_step "$url" "$PR_OWNER") - then record the $service dispatch"
       fi
       if [ "$service" = greptile ]; then
         remaining=$(greptile_remaining)
@@ -676,7 +702,7 @@ cmd_status() {
     fold_pr_state "$url"
     [ -n "$PR_OWNER" ] || continue
     owner=$PR_OWNER
-    if list_has "$PR_REVIEWED" "$owner"; then
+    if [ "$PR_OWNER_REVIEWED" = 1 ]; then
       printf '  %s %s (review recorded)\n' "$url" "$owner"
     else
       printf '  %s %s (awaiting review)\n' "$url" "$owner"

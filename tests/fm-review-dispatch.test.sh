@@ -102,7 +102,7 @@ test_fallback_needs_a_recorded_refusal_and_prefers_waiting() {
   dispatch "$data" choose "$PR_A" --after-refusal
   out=$DISPATCH_OUT
   expect_code 2 "$DISPATCH_RC" "--after-refusal must refuse before the refusal is recorded"
-  assert_contains "$out" 'record the refusal first' \
+  assert_contains "$out" "record $PR_A coderabbit refused" \
     "the refusal did not point at the ledger step that unlocks the fallback"
 
   dispatch "$data" record "$PR_A" coderabbit refused --note 'retry in 12 minutes'
@@ -586,6 +586,66 @@ test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own() {
   pass "recording a review from a non-owner surfaces the leak as it is written"
 }
 
+test_a_release_step_names_the_event_that_actually_happened() {
+  local data out
+  data=$(new_home release-step)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # Greptile owns this PR and its pool is dry, so every path that hands the PR
+  # on must name the exhaustion that happened - never a refusal it never made.
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the transfer named no release for a credit-starved owner"
+  assert_not_contains "$out" "greptile refused" \
+    "the transfer told the operator to record a refusal that never happened"
+
+  dispatch "$data" choose "$PR_A" --service in-house
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "dispatching a second service must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the explicit-service refusal named no release for a credit-starved owner"
+
+  dispatch "$data" record "$PR_A" in-house requested
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "recording a second owner must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the record refusal named no release for a credit-starved owner"
+
+  # With credits on hand there is no exhaustion to record, so the same paths
+  # name the refusal instead.
+  dispatch "$data" reconcile greptile 40
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "a pool with credits left was released as exhausted"
+
+  pass "every printed release names the event the ledger would truthfully record"
+}
+
+test_status_reports_a_pending_fix_round_as_awaiting_review() {
+  local data out
+  data=$(new_home open-owners)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit reviewed
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" "$PR_A coderabbit (review recorded)" \
+    "a delivered review was not reported as recorded"
+
+  # A fix round re-dispatches the same owner, and that dispatch is waiting.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" "$PR_A coderabbit (awaiting review)" \
+    "a re-dispatched PR was reported as already reviewed"
+
+  pass "the open-owners list reports the newest dispatch rather than any past review"
+}
+
 test_bad_input_is_refused_before_anything_is_written() {
   local data
   data=$(new_home input)
@@ -708,4 +768,6 @@ test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
 test_an_exhausted_pool_refunds_nothing
 test_check_accepts_the_comment_a_released_owner_left_behind
 test_the_in_house_reason_states_only_what_the_ledger_records
+test_a_release_step_names_the_event_that_actually_happened
+test_status_reports_a_pending_fix_round_as_awaiting_review
 test_bad_input_is_refused_before_anything_is_written
