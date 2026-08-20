@@ -181,6 +181,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Modification time in epoch seconds. Platform-detected rather than a
+# `stat -f || stat -c` fallback: BSD's format flag is GNU's file-system flag,
+# so on Linux the BSD form writes a filesystem dump to stdout before failing
+# and the fallback's number is appended to that dump rather than replacing it.
+file_mtime() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %m "$1" 2>/dev/null
+  else
+    stat -c %Y "$1" 2>/dev/null
+  fi
+}
+
 # Serialize the read-modify-write in record/reconcile so two concurrent writers
 # cannot both decide a PR is unowned. A holder that died mid-write is broken
 # after FM_REVIEW_DISPATCH_LOCK_STALE_SECS.
@@ -194,7 +206,8 @@ lock_acquire() {
     tries=$((tries + 1))
     if [ "$tries" -ge 40 ]; then
       now=$(date +%s)
-      mtime=$(stat -f %m "$LOCK" 2>/dev/null || stat -c %Y "$LOCK" 2>/dev/null || echo "$now")
+      mtime=$(file_mtime "$LOCK")
+      [ -n "$mtime" ] || mtime=$now
       age=$((now - mtime))
       if [ "$age" -ge "${FM_REVIEW_DISPATCH_LOCK_STALE_SECS:-5}" ]; then
         rmdir "$LOCK" 2>/dev/null || rm -rf "$LOCK" 2>/dev/null || true

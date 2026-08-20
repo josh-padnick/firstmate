@@ -27,6 +27,18 @@ new_home() {  # <name>; echoes the data directory
 # overrides are cleared on every call so the cases below exercise the built-in
 # allowance and reset day rather than whatever the operator has exported; a
 # case that wants a different plan puts it in DISPATCH_ENV.
+# Permission bits as octal digits. Platform-detected, never the
+# `stat -f || stat -c` fallback: BSD's format flag is GNU's file-system flag,
+# so on Linux the BSD form dumps filesystem statistics to stdout and the
+# fallback's mode is appended to that dump rather than replacing it.
+path_mode() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
+}
+
 DISPATCH_OUT=
 DISPATCH_RC=0
 DISPATCH_FAKEBIN=
@@ -232,7 +244,7 @@ test_ledger_is_private_and_records_every_event() {
     "the review row is missing from the ledger"
   assert_grep 'first round' "$ledger" "the note was dropped"
 
-  perms=$(stat -f %Lp "$ledger" 2>/dev/null || stat -c %a "$ledger" 2>/dev/null)
+  perms=$(path_mode "$ledger")
   [ "$perms" = 600 ] || fail "the ledger must stay captain-private (mode $perms)"
 
   pass "the ledger records each event privately with its note"
@@ -968,13 +980,38 @@ test_the_ledger_directory_is_private() {
   dispatch "$data" record "$PR_A" coderabbit requested
 
   assert_present "$data/review-dispatch" "the ledger directory was not created"
-  perms=$(stat -f %Lp "$data/review-dispatch" 2>/dev/null || stat -c %a "$data/review-dispatch" 2>/dev/null)
+  perms=$(path_mode "$data/review-dispatch")
   [ "$perms" = 700 ] || fail "the ledger directory must stay captain-private (mode $perms)"
 
   pass "the ledger directory is created captain-private"
 }
 
+# A writer that died mid-write leaves its lock directory behind. Breaking it
+# reads the lock's age, so the mtime probe has to work on the host running the
+# helper rather than writing filesystem statistics where a number belongs.
+test_an_abandoned_lock_is_broken_so_the_write_still_lands() {
+  local data ledger
+  data=$(new_home stale-lock)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  expect_code 0 "$DISPATCH_RC" "the first dispatch must be recorded"
+  ledger="$data/review-dispatch/ledger.tsv"
+
+  mkdir "$ledger.lock" || fail "the abandoned lock could not be staged"
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_LOCK_STALE_SECS=0)
+  dispatch "$data" record "$PR_A" coderabbit reviewed
+  DISPATCH_ENV=()
+
+  expect_code 0 "$DISPATCH_RC" \
+    "an abandoned lock must be broken rather than fail the write: $DISPATCH_OUT"
+  assert_grep "$PR_A"$'\t'"coderabbit"$'\t'"reviewed" "$ledger" \
+    "the row written after breaking the lock is missing from the ledger"
+  [ ! -d "$ledger.lock" ] || fail "the lock was not released after the write"
+
+  pass "an abandoned lock is broken so the row still lands"
+}
+
 test_coderabbit_is_the_default_and_owns_the_pr
+test_an_abandoned_lock_is_broken_so_the_write_still_lands
 test_exactly_one_owner_survives_a_second_dispatch_attempt
 test_fallback_needs_a_recorded_refusal_and_prefers_waiting
 test_reserve_floor_stops_auto_picks_but_not_the_captain
