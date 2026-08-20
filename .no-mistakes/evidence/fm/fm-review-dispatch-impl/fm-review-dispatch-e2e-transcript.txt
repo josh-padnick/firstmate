@@ -1,0 +1,315 @@
+======================================================================
+ fm-review-dispatch.sh - end-to-end operator walkthrough
+ ledger + credit state under FM_DATA_OVERRIDE sandbox; clock pinned
+======================================================================
+
+### 1. CodeRabbit is the default, and the first recorded dispatch owns the PR
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101
+service: coderabbit
+trigger: @coderabbitai review
+reason: default service; its hourly allowance costs no credits
+pre-check: @coderabbitai rate limit (zero cost, reports the rolling window)
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+recorded: https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+[exit 0]
+
+
+### 1b. A fix round re-uses the same owner, and a second service is refused
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101
+service: coderabbit
+trigger: @coderabbitai review
+reason: existing owner of this PR; fix rounds re-use it
+pre-check: @coderabbitai rate limit (zero cost, reports the rolling window)
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101 --service greptile
+fm-review-dispatch: https://github.com/josh-padnick/firstmate/pull/101 is already owned by coderabbit; release it first: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused - then dispatch greptile
+[exit 2]
+
+
+### 2. Wait beats switch: silence is not refusal, so the paid pools stay shut
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101 --after-refusal
+fm-review-dispatch: https://github.com/josh-padnick/firstmate/pull/101 is still owned by coderabbit; release it first: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused
+[exit 2]
+
+
+### 3. Only a recorded refusal opens the depletable pools
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused --note rate limited until 11:20 UTC
+recorded: https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101
+fm-review-dispatch: coderabbit is recorded as unavailable for https://github.com/josh-padnick/firstmate/pull/101; wait beats switch. Re-trigger it after its retry window with: bin/fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101 --service coderabbit - or pass --after-refusal when waiting would genuinely block the captain
+[exit 2]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101 --after-refusal
+service: greptile
+trigger: @greptileai
+reason: coderabbit refused and 30 credits remain, above the reserve floor of 10
+cost: 1 credit, 30 remaining before this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+[exit 0]
+
+
+### 4. Greptile charging: a dispatch stands, its review answers it, a fix round costs a second credit
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+recorded: https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: none relayed yet
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: last refusal 2026-08-19T10:00:00Z on https://github.com/josh-padnick/firstmate/pull/101 (rate limited until 11:20 UTC)
+open owners:
+  https://github.com/josh-padnick/firstmate/pull/101 greptile (awaiting review)
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile reviewed
+recorded: https://github.com/josh-padnick/firstmate/pull/101 greptile reviewed
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: none relayed yet
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: last refusal 2026-08-19T10:00:00Z on https://github.com/josh-padnick/firstmate/pull/101 (rate limited until 11:20 UTC)
+open owners:
+  https://github.com/josh-padnick/firstmate/pull/101 greptile (review recorded)
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/101
+service: greptile
+trigger: @greptileai
+reason: existing owner of this PR; fix rounds re-use it
+cost: 1 credit, 29 remaining before this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+[exit 0]
+
+
+### 5. The captain-private ledger (mode 0700 dir, 0600 file)
+
+$ ls -ld $FM_HOME/data/review-dispatch $FM_HOME/data/review-dispatch/ledger.tsv
+drwx------@ 3 personal  wheel   96 Aug 19 18:07 $SANDBOX/one-owner/data/review-dispatch
+-rw-------@ 1 personal  wheel  425 Aug 19 18:07 $SANDBOX/one-owner/data/review-dispatch/ledger.tsv
+
+$ cat $FM_HOME/data/review-dispatch/ledger.tsv
+#date	pr	service	event	note
+2026-08-19T10:00:00Z	https://github.com/josh-padnick/firstmate/pull/101	coderabbit	requested	
+2026-08-19T10:00:00Z	https://github.com/josh-padnick/firstmate/pull/101	coderabbit	refused	rate limited until 11:20 UTC
+2026-08-19T10:00:00Z	https://github.com/josh-padnick/firstmate/pull/101	greptile	requested	
+2026-08-19T10:00:00Z	https://github.com/josh-padnick/firstmate/pull/101	greptile	reviewed	
+
+
+### 6. The reserve floor of 10 stops auto-picks but not the captain
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh reconcile greptile 10 --note relayed from the dashboard
+reconciled: greptile remaining=10
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused --note rate limited
+recorded: https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --after-refusal
+note: greptile skipped, 10 credits at or below the reserve floor of 10 (captain-explicit only)
+service: in-house
+trigger: (no bot comment - dispatch the in-house adversarial review)
+reason: coderabbit is recorded as refused or exhausted for this PR, greptile is held back by the reserve floor at 10 credits and stays spendable on an explicit --service greptile, and devin is unreachable without --devin-quota-confirmed
+doctrine: https://github.com/josh-padnick/code-review (read AGENTS.md before reviewing)
+attestation: required in the BIG-164 format before the gate accepts this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 in-house requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --service greptile
+warning: 10 credits remain, at or below the reserve floor of 10; below the floor greptile is captain-explicit only
+service: greptile
+trigger: @greptileai
+reason: explicit captain choice
+cost: 1 credit, 10 remaining before this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile requested
+[exit 0]
+
+
+### 7. At zero credits the $0 flex cap makes a dispatch a no-op, so it is refused outright
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh reconcile greptile 0 --note cycle consumed
+reconciled: greptile remaining=0
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused
+recorded: https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --service greptile
+fm-review-dispatch: the ledger shows 0 Greptile credits this cycle and the flex cap is $0, so the review would be skipped; nothing was dispatched, so https://github.com/josh-padnick/firstmate/pull/102 has nothing to release; reconcile against the dashboard if it disagrees
+[exit 2]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --after-refusal
+note: greptile skipped, 0 credits at or below the reserve floor of 10 (captain-explicit only)
+service: in-house
+trigger: (no bot comment - dispatch the in-house adversarial review)
+reason: coderabbit is recorded as refused or exhausted for this PR, greptile has 0 credits this cycle, so the $0 flex cap would skip the review, and devin is unreachable without --devin-quota-confirmed
+doctrine: https://github.com/josh-padnick/code-review (read AGENTS.md before reviewing)
+attestation: required in the BIG-164 format before the gate accepts this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 in-house requested
+[exit 0]
+
+
+### 8. An exhausted pool releases the PR; in-house needs no --after-refusal
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile exhausted --note pool dry, nothing dispatched
+recorded: https://github.com/josh-padnick/firstmate/pull/102 greptile exhausted
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102
+service: in-house
+trigger: (no bot comment - dispatch the in-house adversarial review)
+reason: coderabbit and greptile are recorded as refused or exhausted for this PR, and devin is unreachable without --devin-quota-confirmed
+doctrine: https://github.com/josh-padnick/code-review (read AGENTS.md before reviewing)
+attestation: required in the BIG-164 format before the gate accepts this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 in-house requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 0 of 30 credits remaining, reserve floor 10 - captain-explicit only
+greptile reconcile: 2026-08-19T10:00:00Z remaining=0 cycle consumed
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: last refusal 2026-08-19T10:00:00Z on https://github.com/josh-padnick/firstmate/pull/102
+open owners:
+  none
+[exit 0]
+
+
+### 9. Devin stays in reserve until the captain confirms the dashboard quota
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused
+recorded: https://github.com/josh-padnick/firstmate/pull/102 coderabbit refused
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile exhausted
+recorded: https://github.com/josh-padnick/firstmate/pull/102 greptile exhausted
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --after-refusal
+service: in-house
+trigger: (no bot comment - dispatch the in-house adversarial review)
+reason: coderabbit and greptile are recorded as refused or exhausted for this PR, and devin is unreachable without --devin-quota-confirmed
+doctrine: https://github.com/josh-padnick/code-review (read AGENTS.md before reviewing)
+attestation: required in the BIG-164 format before the gate accepts this review
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 in-house requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --after-refusal --devin-quota-confirmed
+service: devin
+trigger: /devin review
+reason: coderabbit and greptile are recorded as refused or exhausted for this PR; the captain confirmed Devin quota
+record: bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 devin requested
+[exit 0]
+
+
+### 10. The release-command rule: name both releases when both could be true
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile requested
+recorded: https://github.com/josh-padnick/firstmate/pull/102 greptile requested
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh reconcile greptile 0
+reconciled: greptile remaining=0
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh choose https://github.com/josh-padnick/firstmate/pull/102 --service devin
+fm-review-dispatch: https://github.com/josh-padnick/firstmate/pull/102 is already owned by greptile; release it first: the ledger shows 0 Greptile credits this cycle, so record what happened - bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile refused if greptile declined, or bin/fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/102 greptile exhausted if no dispatch was made - then dispatch devin
+[exit 2]
+
+
+### 11. The billing cycle is anchored on the 26th, not the calendar month
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-20T09:00:00Z fm-review-dispatch.sh reconcile greptile 12 --note relayed from the dashboard
+reconciled: greptile remaining=12
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-25T09:00:00Z fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 12 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: 2026-08-20T09:00:00Z remaining=12 relayed from the dashboard
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: no refusal recorded
+open owners:
+  none
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-26T09:00:00Z fm-review-dispatch.sh status
+billing cycle: 2026-08-26, next reset 2026-09-26
+greptile: 30 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: 2026-08-20T09:00:00Z remaining=12 relayed from the dashboard
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: no refusal recorded
+open owners:
+  none
+[exit 0]
+
+
+### 12. Plan facts are environment-overridable and the reset day is validated
+
+$ FM_REVIEW_DISPATCH_GREPTILE_CREDITS=50 FM_REVIEW_DISPATCH_BILLING_DAY=1 fm-review-dispatch.sh status
+billing cycle: 2026-08-01, next reset 2026-09-01
+greptile: 50 of 50 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: none relayed yet
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: no refusal recorded
+open owners:
+  none
+[exit 0]
+
+$ FM_REVIEW_DISPATCH_BILLING_DAY=31 fm-review-dispatch.sh status
+fm-review-dispatch: FM_REVIEW_DISPATCH_BILLING_DAY must be 1-28, a day every month has: 31
+[exit 1]
+
+
+### 13. Bad input is refused before any ledger row is written
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record notaurl coderabbit requested
+fm-review-dispatch: not a pull request URL: notaurl
+[exit 1]
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit bogusevent
+fm-review-dispatch: unknown event: bogusevent (requested, refused, reviewed, exhausted)
+[exit 1]
+
+$ ls $FM_HOME/data/review-dispatch/
+ls: $SANDBOX/badinput/data/review-dispatch/: No such file or directory
+
+
+### 14. check compares the recorded owner against the review evidence on the PR
+
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+recorded: https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+[exit 0]
+
+# (PR carries only the owner comment: coderabbitai)
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh check https://github.com/josh-padnick/firstmate/pull/101
+owner: coderabbit
+evidence: coderabbit
+verdict: consistent
+[exit 0]
+
+# (PR now also carries a second service comment: greptile-apps)
+$ FM_REVIEW_DISPATCH_NOW=2026-08-19T10:00:00Z fm-review-dispatch.sh check https://github.com/josh-padnick/firstmate/pull/101
+owner: coderabbit
+evidence: coderabbit greptile
+fm-review-dispatch: leak: greptile reviewed https://github.com/josh-padnick/firstmate/pull/101, which is owned by coderabbit
+[exit 2]
+

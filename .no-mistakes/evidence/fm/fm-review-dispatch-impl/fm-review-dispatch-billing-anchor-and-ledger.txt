@@ -1,0 +1,78 @@
+======================================================================
+ A. The 26th anchor is load-bearing: the same ledger, counted two ways
+======================================================================
+
+Each case below is run twice against an identical ledger - once with the
+shipped anchor (reset on the 26th) and once with calendar-month counting
+(reset on the 1st). The expected value is the one the test suite pins.
+
+-- charge-outlives-the-month-boundary (status at 2026-08-04T11:00:00Z; suite expects 29 remaining)
+   reset on the 26th (shipped): billing cycle: 2026-07-26, next reset 2026-08-26|greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+   reset on the 1st (calendar): billing cycle: 2026-08-01, next reset 2026-09-01|greptile: 30 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+
+-- charge-expires-at-the-reset (status at 2026-08-27T11:00:00Z; suite expects 30 remaining)
+   reset on the 26th (shipped): billing cycle: 2026-08-26, next reset 2026-09-26|greptile: 30 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+   reset on the 1st (calendar): billing cycle: 2026-08-01, next reset 2026-09-01|greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+
+-- reconcile-baseline-expires-at-the-reset (status at 2026-08-27T11:00:00Z; suite expects 29 remaining)
+   reset on the 26th (shipped): billing cycle: 2026-08-26, next reset 2026-09-26|greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+   reset on the 1st (calendar): billing cycle: 2026-08-01, next reset 2026-09-01|greptile: 24 of 30 credits remaining, reserve floor 10 - auto-picks allowed|
+
+======================================================================
+ B. An exhausted row releases the PR and refunds nothing
+======================================================================
+
+$ fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused
+recorded: https://github.com/josh-padnick/firstmate/pull/101 coderabbit refused
+[exit 0]
+
+$ fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+recorded: https://github.com/josh-padnick/firstmate/pull/101 greptile requested
+[exit 0]
+
+$ fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile reviewed
+recorded: https://github.com/josh-padnick/firstmate/pull/101 greptile reviewed
+[exit 0]
+
+$ fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: none relayed yet
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: last refusal 2026-08-19T10:00:00Z on https://github.com/josh-padnick/firstmate/pull/101
+open owners:
+  https://github.com/josh-padnick/firstmate/pull/101 greptile (review recorded)
+[exit 0]
+
+# The credit above was really spent. Recording a later exhausted pool
+# releases the PR but must not hand that credit back.
+$ fm-review-dispatch.sh record https://github.com/josh-padnick/firstmate/pull/101 greptile exhausted --note pool dry on the fix round, nothing dispatched
+recorded: https://github.com/josh-padnick/firstmate/pull/101 greptile exhausted
+[exit 0]
+
+$ fm-review-dispatch.sh status
+billing cycle: 2026-07-26, next reset 2026-08-26
+greptile: 29 of 30 credits remaining, reserve floor 10 - auto-picks allowed
+greptile reconcile: none relayed yet
+devin: reserve, captain-explicit; last relayed quota: none
+coderabbit: last refusal 2026-08-19T10:00:00Z on https://github.com/josh-padnick/firstmate/pull/101
+open owners:
+  none
+[exit 0]
+
+======================================================================
+ C. The default ledger location under FM_HOME (no override)
+======================================================================
+
+$ FM_HOME=$SANDBOX/home fm-review-dispatch.sh record <pr> coderabbit requested
+recorded: https://github.com/josh-padnick/firstmate/pull/101 coderabbit requested
+[exit 0]
+
+$ find $FM_HOME/data -exec ls -ld {} +
+drwx------@ 3 personal  wheel   96 Aug 19 18:08 $SANDBOX/home/data
+drwx------@ 3 personal  wheel   96 Aug 19 18:08 $SANDBOX/home/data/review-dispatch
+-rw-------@ 1 personal  wheel  122 Aug 19 18:08 $SANDBOX/home/data/review-dispatch/ledger.tsv
+
+$ git check-ignore -v data/review-dispatch/ledger.tsv   # in the firstmate repo
+.gitignore:3:data/	data/review-dispatch/ledger.tsv
+[exit 0]
