@@ -1,0 +1,1040 @@
+#!/usr/bin/env bash
+# Behavioral regressions for bin/fm-review-dispatch.sh: the exactly-one owner
+# rule, the refusal-before-fallback chain, the Greptile reserve floor, the
+# anchored billing cycle and its reconcile baseline, the terminal in-house
+# fallback, and the dispatch-side consistency check.
+set -u
+
+# shellcheck source=tests/lib.sh
+. "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+DISPATCH="$ROOT/bin/fm-review-dispatch.sh"
+TMP_ROOT=$(fm_test_tmproot fm-review-dispatch)
+
+PR_A=https://github.com/josh-padnick/firstmate/pull/101
+PR_B=https://github.com/josh-padnick/firstmate/pull/102
+
+# Each case gets its own data directory so one case's ledger cannot leak into
+# the next. NOW is pinned so the billing-cycle arithmetic is deterministic.
+new_home() {  # <name>; echoes the data directory
+  local data="$TMP_ROOT/$1/data"
+  mkdir -p "$data"
+  printf '%s\n' "$data"
+}
+
+# Runs the helper in THIS shell (never a command substitution) so both the
+# captured output and the exit status survive for the assertions. The plan
+# overrides are cleared on every call so the cases below exercise the built-in
+# allowance and reset day rather than whatever the operator has exported; a
+# case that wants a different plan puts it in DISPATCH_ENV.
+# Permission bits as octal digits. Platform-detected, never the
+# `stat -f || stat -c` fallback: BSD's format flag is GNU's file-system flag,
+# so on Linux the BSD form dumps filesystem statistics to stdout and the
+# fallback's mode is appended to that dump rather than replacing it.
+path_mode() {  # <path>
+  if [ "$(uname)" = Darwin ]; then
+    stat -f %Lp "$1" 2>/dev/null
+  else
+    stat -c %a "$1" 2>/dev/null
+  fi
+}
+
+DISPATCH_OUT=
+DISPATCH_RC=0
+DISPATCH_FAKEBIN=
+DISPATCH_NOW=2026-08-19T10:00:00Z
+DISPATCH_ENV=()
+dispatch() {  # <data-dir> <args...>; sets DISPATCH_OUT and DISPATCH_RC
+  local data=$1
+  shift
+  DISPATCH_RC=0
+  DISPATCH_OUT=$(PATH="${DISPATCH_FAKEBIN:+$DISPATCH_FAKEBIN:}$PATH" \
+    env -u FM_REVIEW_DISPATCH_GREPTILE_CREDITS -u FM_REVIEW_DISPATCH_BILLING_DAY \
+    FM_DATA_OVERRIDE="$data" FM_REVIEW_DISPATCH_NOW="$DISPATCH_NOW" \
+    ${DISPATCH_ENV[@]+"${DISPATCH_ENV[@]}"} \
+    "$DISPATCH" "$@" 2>&1) || DISPATCH_RC=$?
+}
+
+# The same call with the clock moved, for the billing-cycle arithmetic.
+dispatch_at() {  # <iso8601-utc> <data-dir> <args...>
+  local now=$1 previous=$DISPATCH_NOW
+  shift
+  DISPATCH_NOW=$now
+  dispatch "$@"
+  DISPATCH_NOW=$previous
+}
+
+test_coderabbit_is_the_default_and_owns_the_pr() {
+  local data out
+  data=$(new_home default)
+
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fresh PR must get a dispatch"
+  assert_contains "$out" 'service: coderabbit' \
+    "the zero-cost hourly service is not the default pick"
+  assert_contains "$out" '@coderabbitai review' \
+    "the exact trigger comment is missing from the choice"
+
+  dispatch "$data" record "$PR_A" coderabbit requested
+  expect_code 0 "$DISPATCH_RC" "recording the first dispatch must succeed"
+
+  # A fix round re-uses the owner rather than naming a second service.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fix round on an owned PR must still answer"
+  assert_contains "$out" 'service: coderabbit' \
+    "a fix round did not re-use the recorded owner"
+  assert_contains "$out" 'existing owner' \
+    "the choice did not say the PR is already owned"
+
+  pass "CodeRabbit leads by default and stays the PR's owner across fix rounds"
+}
+
+test_exactly_one_owner_survives_a_second_dispatch_attempt() {
+  local data out
+  data=$(new_home exactly-one)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  dispatch "$data" choose "$PR_A" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "choosing a second service on an owned PR must be refused"
+  assert_contains "$out" 'already owned by coderabbit' \
+    "the refusal did not name the recorded owner"
+
+  dispatch "$data" record "$PR_A" greptile requested
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "recording a second owner must be refused"
+  assert_contains "$out" 'already owned by coderabbit' \
+    "the ledger accepted a second review owner"
+
+  pass "a PR keeps exactly one review owner until a refusal is recorded"
+}
+
+test_fallback_needs_a_recorded_refusal_and_prefers_waiting() {
+  local data out
+  data=$(new_home refusal)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  # Silence is not refusal: the fallback stays shut until the refusal is on record.
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "--after-refusal must refuse before the refusal is recorded"
+  assert_contains "$out" "record $PR_A coderabbit refused" \
+    "the refusal did not point at the ledger step that unlocks the fallback"
+
+  dispatch "$data" record "$PR_A" coderabbit refused --note 'retry in 12 minutes'
+  expect_code 0 "$DISPATCH_RC" "recording a refusal must succeed"
+
+  # Wait beats switch: a plain choose still declines to spend a credit.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a recorded refusal must not silently spend a credit"
+  assert_contains "$out" 'wait beats switch' \
+    "the refusal did not offer the wait-and-retrigger default"
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "the fallback must open once the refusal is recorded"
+  assert_contains "$out" 'service: greptile' \
+    "the recorded refusal did not move ownership down the priority order"
+
+  pass "the depletable pools open only after an explicit refusal is on record"
+}
+
+test_reserve_floor_stops_auto_picks_but_not_the_captain() {
+  local data out
+  data=$(new_home floor)
+  # The captain relays 11 remaining, so one dispatch lands the ledger on the floor.
+  dispatch "$data" reconcile greptile 11 --note 'dashboard read'
+  expect_code 0 "$DISPATCH_RC" "a relayed dashboard number must be recordable"
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'service: greptile' \
+    "one credit above the floor must still auto-pick greptile"
+
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 10 of 30 credits remaining' \
+    "the ledger did not count the dispatch down from the relayed number"
+  assert_contains "$out" 'captain-explicit only' \
+    "status did not report that auto-picks have stopped at the floor"
+
+  dispatch "$data" record "$PR_B" coderabbit refused
+  dispatch "$data" choose "$PR_B" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a dry fleet must still get a reviewer"
+  assert_not_contains "$out" 'service: greptile' \
+    "an auto-pick spent a credit from the reserve"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over when every pool was unavailable"
+
+  # The floor bounds automatic picks only; the captain can still spend it.
+  dispatch "$data" choose "$PR_B" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "an explicit captain choice must survive the floor"
+  assert_contains "$out" 'service: greptile' \
+    "the captain could not spend reserve credits explicitly"
+
+  pass "auto-picks stop at the reserve floor while captain-explicit dispatch continues"
+}
+
+test_zero_credits_refuses_even_an_explicit_greptile_dispatch() {
+  local data out
+  data=$(new_home zero)
+  dispatch "$data" reconcile greptile 0
+
+  dispatch "$data" choose "$PR_A" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a no-op dispatch under the \$0 cap must be refused"
+  assert_contains "$out" 'flex cap' \
+    "the refusal did not explain why the review would produce nothing"
+  assert_contains "$out" 'reconcile' \
+    "the refusal did not offer the reconcile path for a disagreeing dashboard"
+
+  # Greptile never held this PR, so the refusal must not send the operator off
+  # to record a release that did not happen.
+  assert_not_contains "$out" 'exhausted' \
+    "the refusal named a release for a PR the service was never dispatched to"
+  dispatch "$data" check "$PR_A" --ledger-only
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an unowned PR must still fail the ownership check"
+  assert_contains "$out" 'owner: none recorded' \
+    "the refused dispatch left a release row on a PR that was never dispatched"
+
+  pass "a dry pool under the \$0 flex cap is refused rather than dispatched into a skip"
+}
+
+test_devin_stays_in_reserve_until_quota_is_confirmed() {
+  local data out
+  data=$(new_home devin)
+  dispatch "$data" reconcile greptile 0
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  assert_not_contains "$out" 'service: devin' \
+    "devin was auto-picked without a confirmed dashboard quota"
+
+  dispatch "$data" choose "$PR_A" --after-refusal --devin-quota-confirmed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a confirmed devin quota must open the reserve"
+  assert_contains "$out" 'service: devin' \
+    "a confirmed quota did not reach the reserve service"
+  assert_contains "$out" '/devin review' \
+    "the devin trigger comment is missing"
+
+  pass "Devin is reached only on explicit choice or a confirmed dashboard quota"
+}
+
+test_ledger_is_private_and_records_every_event() {
+  local data ledger perms
+  data=$(new_home ledger)
+  dispatch "$data" record "$PR_A" coderabbit requested --note 'first round'
+  dispatch "$data" record "$PR_A" coderabbit reviewed
+  ledger="$data/review-dispatch/ledger.tsv"
+
+  assert_present "$ledger" "the ledger was not created"
+  assert_grep "$PR_A"$'\t'"coderabbit"$'\t'"requested" "$ledger" \
+    "the dispatch row is missing from the ledger"
+  assert_grep "$PR_A"$'\t'"coderabbit"$'\t'"reviewed" "$ledger" \
+    "the review row is missing from the ledger"
+  assert_grep 'first round' "$ledger" "the note was dropped"
+
+  perms=$(path_mode "$ledger")
+  [ "$perms" = 600 ] || fail "the ledger must stay captain-private (mode $perms)"
+
+  pass "the ledger records each event privately with its note"
+}
+
+test_check_flags_a_review_from_a_non_owner() {
+  local data out fakebin
+  data=$(new_home check)
+  fakebin=$(fm_fakebin "$TMP_ROOT/check")
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  # Evidence lives in PR comments, so the check reads comment authors. First a
+  # PR carrying only the owner's comment.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\n'
+SH
+  chmod +x "$fakebin/gh"
+  DISPATCH_FAKEBIN=$fakebin
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a PR reviewed by its recorded owner must pass the check"
+  assert_contains "$out" 'verdict: consistent' \
+    "the owner's own review was not accepted as consistent"
+
+  # Then the same PR also carrying a second service's comment: a migration leak.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\n'
+SH
+  chmod +x "$fakebin/gh"
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  DISPATCH_FAKEBIN=
+  expect_code 2 "$DISPATCH_RC" "a second service's review must not pass the check"
+  assert_contains "$out" 'leak: greptile' \
+    "the check did not name the service that reviewed outside its ownership"
+
+  pass "the consistency check accepts comment evidence from the owner and flags any other"
+}
+
+test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch() {
+  local data out
+  data=$(new_home fix-round)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+
+  # A fix round on a greptile-owned PR re-uses the owner, and re-triggering a
+  # paid reviewer is a dispatch like any other: it costs a credit and has a
+  # ledger step.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fix round on an owned PR must still answer"
+  assert_contains "$out" 'service: greptile' \
+    "a fix round did not re-use the recorded owner"
+  assert_contains "$out" 'cost: 1 credit' \
+    "a paid fix-round re-review was priced as free"
+  assert_contains "$out" "record $PR_A greptile requested" \
+    "the fix round did not print the step that puts the re-trigger on the ledger"
+
+  # Following that step is what makes the second credit countable.
+  dispatch "$data" record "$PR_A" greptile requested
+  expect_code 0 "$DISPATCH_RC" "recording a fix-round re-trigger must be accepted"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 28 of 30 credits remaining' \
+    "the recorded fix-round re-trigger did not count against the cycle"
+
+  # CodeRabbit's window costs nothing, so its fix rounds stay free - checked
+  # with the ledger sitting on the reserve floor, where a guard wrongly applied
+  # to a coderabbit owner would have something to warn about.
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" record "$PR_B" coderabbit requested
+  dispatch "$data" choose "$PR_B"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a coderabbit fix round must still answer"
+  assert_contains "$out" 'service: coderabbit' \
+    "a coderabbit fix round did not re-use the recorded owner"
+  assert_not_contains "$out" 'cost:' \
+    "the zero-cost hourly service was priced on a fix round"
+  assert_not_contains "$out" 'reserve floor' \
+    "a free fix round warned about the depletable reserve"
+
+  pass "a fix round is priced and recorded exactly like the dispatch it repeats"
+}
+
+test_a_fix_round_cannot_dispatch_greptile_at_zero_credits() {
+  local data out
+  data=$(new_home fix-round-zero)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # The $0 flex cap has no fix-round exception: the review would be skipped.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused like any other dispatch"
+  assert_contains "$out" 'flex cap' \
+    "the refusal did not explain why the re-review would produce nothing"
+  assert_not_contains "$out" 'trigger: @greptileai' \
+    "the refused fix round still handed over a trigger comment"
+
+  # And a fix round at the floor warns before it spends the reserve.
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fix round at the floor must still be allowed"
+  assert_contains "$out" 'reserve floor' \
+    "a fix round spent from the reserve without warning"
+
+  pass "a fix round carries the zero-credit refusal and the reserve-floor warning"
+}
+
+test_an_exhausted_pool_releases_the_pr_to_the_in_house_review() {
+  local data out
+  data=$(new_home exhausted)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # A fix round with no credits left is refused, and the refusal must name the
+  # releases that could have happened rather than picking one from the balance.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the refusal named no supported way forward"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the refusal offered no way to record a refusal that really happened"
+
+  dispatch "$data" record "$PR_A" greptile exhausted
+  expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
+  dispatch "$data" check "$PR_A" --ledger-only
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'exhausted: greptile' \
+    "the exhausted pool did not release its ownership of the PR"
+
+  # A dry fleet gets our own review, and does not have to claim a refusal it
+  # never received to get there.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a dry fleet must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over once every pool was recorded dry"
+  assert_contains "$out" 'doctrine:' \
+    "the in-house choice did not carry its review doctrine"
+
+  pass "an exhausted pool releases the PR and the in-house review takes it over"
+}
+
+test_an_exhausted_pool_refunds_nothing() {
+  local data out
+  data=$(new_home exhausted-credits)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 29 of 30 credits remaining' \
+    "the greptile dispatch did not count against the cycle"
+
+  # Exhaustion says a later dispatch was never made; it says nothing about the
+  # credit the earlier one already spent.
+  dispatch "$data" record "$PR_A" greptile exhausted
+  expect_code 0 "$DISPATCH_RC" "recording an exhausted pool must be accepted"
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: 29 of 30 credits remaining' \
+    "an exhausted row refunded a credit that was really spent"
+
+  pass "recording an exhausted pool never refunds an already-spent credit"
+}
+
+test_check_accepts_the_comment_a_released_owner_left_behind() {
+  local data out fakebin
+  data=$(new_home check-exhausted)
+  fakebin=$(fm_fakebin "$TMP_ROOT/check-exhausted")
+
+  # The path the exhausted event exists for: coderabbit refuses, greptile
+  # reviews round one, its pool runs dry, and the in-house review takes over.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  dispatch "$data" record "$PR_A" greptile exhausted
+  dispatch "$data" record "$PR_A" in-house requested
+
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\n'
+SH
+  chmod +x "$fakebin/gh"
+  DISPATCH_FAKEBIN=$fakebin
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a released owner's own review must not read as a leak"
+  assert_contains "$out" 'verdict: consistent' \
+    "the check refused the release path the ledger records in full"
+
+  # A service with no recorded reason to be on this PR is still a leak.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\ndevin-ai-integration\n'
+SH
+  chmod +x "$fakebin/gh"
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  DISPATCH_FAKEBIN=
+  expect_code 2 "$DISPATCH_RC" "an unexplained third service must still fail the check"
+  assert_contains "$out" 'leak: devin' \
+    "the check did not name the service the ledger explains nothing about"
+
+  pass "a refused or exhausted release explains that service's comment on the PR"
+}
+
+test_the_in_house_reason_states_only_what_the_ledger_records() {
+  local data out
+  data=$(new_home in-house-reason)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile refused
+
+  # Devin has no row at all here: the reason must not claim one.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a dry fleet must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over"
+  assert_contains "$out" 'devin is unreachable without --devin-quota-confirmed' \
+    "the reason did not name why the unrecorded reserve was skipped"
+  assert_not_contains "$out" 'every third-party service is recorded' \
+    "the reason claimed a devin event the ledger never recorded"
+
+  # Once devin is genuinely recorded, the ledger does say every service is out.
+  dispatch "$data" record "$PR_A" devin refused
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fully recorded dry fleet must still get a reviewer"
+  assert_contains "$out" 'every third-party service is recorded as refused or exhausted' \
+    "the reason did not report the state the ledger actually holds"
+
+  pass "the in-house choice reports the ledger's own state and nothing more"
+}
+
+# The reserve floor is not a release. A pool the floor is holding back is still
+# there to spend, and the reason for passing it over has to say which of the two
+# it is, because the operator's next move differs: a released service is gone
+# for this PR, a reserved one is one --service greptile away.
+test_the_terminal_in_house_reason_separates_a_floor_hold_from_a_release() {
+  local data out
+  data=$(new_home in-house-floor)
+  # Exactly on the floor: auto-picks stop, but nothing about greptile is
+  # recorded for this PR and devin has no row at all.
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fleet with nothing auto-pickable must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over when the floor stopped the auto-pick"
+  assert_contains "$out" 'coderabbit is recorded as refused or exhausted for this PR' \
+    "the reason did not name the one release the ledger really holds"
+  assert_contains "$out" 'greptile is held back by the reserve floor at 10 credits' \
+    "the reason did not name the floor hold that actually excluded greptile"
+  assert_contains "$out" 'devin is unreachable without --devin-quota-confirmed' \
+    "the reason did not name why the unrecorded reserve was skipped"
+  assert_not_contains "$out" 'greptile is recorded as refused or exhausted' \
+    "the reason claimed a greptile release the ledger never recorded"
+  assert_not_contains "$out" 'every third-party service is recorded' \
+    "the reason claimed events for services the ledger never recorded"
+
+  # The claim the reason makes about the reserve has to be true: a floor-held
+  # pool is still spendable on an explicit captain choice.
+  dispatch "$data" choose "$PR_A" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "the reason promised a spendable pool the tool then refused"
+  assert_contains "$out" 'service: greptile' \
+    "a pool the reason called spendable could not be dispatched"
+
+  pass "the terminal in-house reason names a floor hold as a hold, not a release"
+}
+
+test_the_devin_reason_names_the_state_the_ledger_holds() {
+  local data out
+  data=$(new_home devin-reason)
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  # Devin opens on a confirmed quota while greptile sits on the floor, so the
+  # reserve is picked over a pool that was never released.
+  dispatch "$data" choose "$PR_A" --after-refusal --devin-quota-confirmed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a confirmed devin quota must open the reserve"
+  assert_contains "$out" 'service: devin' \
+    "the confirmed reserve was not reached"
+  assert_contains "$out" 'coderabbit is recorded as refused or exhausted for this PR' \
+    "the devin reason did not name the release the ledger holds"
+  assert_contains "$out" 'greptile is held back by the reserve floor at 10 credits' \
+    "the devin reason did not name the floor hold that actually excluded greptile"
+  assert_not_contains "$out" 'greptile is recorded as refused or exhausted' \
+    "the devin reason claimed a greptile release the ledger never recorded"
+
+  # With a real greptile release on the ledger the same path says so instead.
+  dispatch "$data" record "$PR_A" greptile refused
+  dispatch "$data" choose "$PR_A" --after-refusal --devin-quota-confirmed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a released greptile must still hand on to the reserve"
+  assert_contains "$out" 'coderabbit and greptile are recorded as refused or exhausted for this PR' \
+    "the devin reason did not report the releases the ledger now holds"
+
+  pass "the devin choice reports the ledger's own state and nothing more"
+}
+
+# Dispatches recorded past a reconciled zero drive the balance below zero, and
+# the size of that drift is exactly what makes "reconcile against the dashboard"
+# actionable. The refusals must print the number `status` reports, not a zero.
+test_a_negative_balance_is_reported_as_the_number_the_ledger_holds() {
+  local data out remaining
+  data=$(new_home negative-balance)
+  dispatch "$data" reconcile greptile 0
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  dispatch "$data" record "$PR_A" greptile requested
+
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: -2 of 30 credits remaining' \
+    "two dispatches past a reconciled zero did not read as a negative balance"
+  remaining=$(printf '%s\n' "$out" | sed -n 's/^greptile: \(-*[0-9][0-9]*\) of .*/\1/p')
+  [ -n "$remaining" ] || fail "status printed no greptile balance to compare the refusals against"
+
+  # The owner path: greptile holds the PR and the pool reads dry.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round on a dry pool must be refused"
+  assert_contains "$out" "the ledger shows $remaining Greptile credits this cycle" \
+    "the release message hid the drift status reports"
+  assert_not_contains "$out" 'the ledger shows 0 Greptile credits' \
+    "the release message reported a zero balance the ledger does not hold"
+
+  # The unowned path: a captain-explicit dispatch on a PR greptile never held.
+  dispatch "$data" choose "$PR_B" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a dispatch into a dry pool must be refused"
+  assert_contains "$out" "the ledger shows $remaining Greptile credits this cycle" \
+    "the refusal hid the drift status reports"
+  assert_not_contains "$out" 'the ledger shows 0 Greptile credits' \
+    "the refusal reported a zero balance the ledger does not hold"
+
+  pass "a balance driven below zero is reported as the figure the ledger holds"
+}
+
+# One ledger per case, so a case cannot inherit another's rows. Each row is
+# "<iso8601-utc>,<service>,<event>" - or "<iso8601-utc>,reconcile,<number>" for
+# a relayed dashboard baseline - and <expected> is the credits the ledger must
+# report remaining when `status` runs at <status-at>.
+charge_case() {  # <name> <expected> <status-at> <row>...
+  local name=$1 expected=$2 at=$3 data row ts field service event
+  shift 3
+  data=$(new_home "charge-$name")
+  for row in "$@"; do
+    IFS=, read -r ts service field <<< "$row"
+    if [ "$service" = reconcile ]; then
+      dispatch_at "$ts" "$data" reconcile greptile "$field"
+    else
+      event=$field
+      dispatch_at "$ts" "$data" record "$PR_A" "$service" "$event"
+    fi
+    expect_code 0 "$DISPATCH_RC" "$name: the ledger rejected the row '$row'"
+  done
+  dispatch_at "$at" "$data" status
+  assert_contains "$DISPATCH_OUT" "greptile: $expected of 30 credits remaining" \
+    "$name: the ledger charged the wrong number of greptile credits"
+}
+
+test_the_greptile_charge_table() {
+  local aug=2026-08-19T10:00:00Z
+
+  # Per PR the ledger walks its rows in order: a review answers the most recent
+  # unanswered standing dispatch or charges a credit of its own, and a refusal
+  # cancels the most recent unanswered standing dispatch. What is charged is
+  # the self-charging reviews plus the dispatches still standing. Every row
+  # below is a case this contract has been ruled on, kept together so the whole
+  # of it reads at a glance.
+  charge_case plain-dispatch 29 "$aug" \
+    "$aug,greptile,requested"
+  charge_case refunded-dispatch 30 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused"
+  charge_case retry-path 29 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested"
+  charge_case true-leak 29 "$aug" \
+    "$aug,greptile,reviewed"
+  charge_case same-pr-re-review 28 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,reviewed"
+  charge_case reviewed-then-refused 29 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" "$aug,greptile,refused"
+  charge_case refused-then-reviewed 29 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,reviewed"
+  charge_case refunded-then-re-reviewed 28 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,refused" "$aug,greptile,requested" \
+    "$aug,greptile,reviewed" "$aug,greptile,reviewed"
+  charge_case two-dispatches-two-reviews 28 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed"
+
+  # A delivered review answers its own dispatch, so the refusal that follows it
+  # has nothing left to refund and the retry after it is a second credit.
+  charge_case reviewed-refused-retried 28 "$aug" \
+    "$aug,greptile,requested" "$aug,greptile,reviewed" \
+    "$aug,greptile,refused" "$aug,greptile,requested"
+
+  # The same rows read from either side of a reset. The allowance resets on the
+  # 26th, so the cycle that holds 2026-07-24 opened on 2026-06-26 and the one
+  # that holds 2026-08-04 opened on 2026-07-26: each charges exactly one
+  # credit, and they are different credits.
+  charge_case reviewed-refused-retried-earlier-cycle 29 2026-07-24T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
+    "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
+  charge_case reviewed-refused-retried-later-cycle 29 2026-08-04T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-21T10:00:00Z,greptile,reviewed" \
+    "2026-07-22T10:00:00Z,greptile,refused" "2026-08-03T10:00:00Z,greptile,requested"
+
+  # A credit is charged to the cycle its own dispatch was recorded in. The
+  # cycle holding the dispatch pays; the next one, where only the review lands,
+  # pays nothing.
+  charge_case cross-cycle-review-earlier 29 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+  charge_case cross-cycle-review-later 30 2026-08-02T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-02T10:00:00Z,greptile,reviewed"
+
+  # A review that arrived before this PR was ever dispatched is a credit of its
+  # own: the later dispatch cannot answer for it.
+  charge_case leaked-then-dispatched 28 "$aug" \
+    "$aug,greptile,reviewed" "$aug,greptile,requested"
+
+  # A refusal answers the dispatch it followed, so the credit stays charged to
+  # the cycle that really spent it - whether the surviving dispatch is the
+  # earlier one or the retry that came after the refund.
+  charge_case cross-cycle-refusal-earlier 29 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+    "2026-08-11T10:00:00Z,greptile,refused"
+  charge_case cross-cycle-refusal-later 30 2026-08-12T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-08-10T10:00:00Z,greptile,requested" \
+    "2026-08-11T10:00:00Z,greptile,refused"
+  charge_case cross-cycle-retry-earlier 30 2026-07-22T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-20T11:00:00Z,greptile,refused" \
+    "2026-08-03T10:00:00Z,greptile,requested"
+  charge_case cross-cycle-retry-later 29 2026-08-04T11:00:00Z \
+    "2026-07-20T10:00:00Z,greptile,requested" "2026-07-20T11:00:00Z,greptile,refused" \
+    "2026-08-03T10:00:00Z,greptile,requested"
+
+  # The cycle is anchored on the reset day, not on the calendar month, and
+  # these two cases are the ones that tell the difference. A dispatch on 30
+  # July is still being paid for on 4 August because both sit in the cycle that
+  # opened on 26 July; a dispatch on 2 August has already been left behind by
+  # 27 August, because the reset on the 26th opened a new cycle inside the same
+  # calendar month. Counting by calendar month would invert both.
+  charge_case charge-outlives-the-month-boundary 29 2026-08-04T11:00:00Z \
+    "2026-07-30T10:00:00Z,greptile,requested"
+  charge_case charge-expires-at-the-reset 30 2026-08-27T11:00:00Z \
+    "2026-08-02T10:00:00Z,greptile,requested"
+
+  # A relayed dashboard number already reflects the dispatches before it, so a
+  # review recorded after the baseline does not count forward a second time.
+  charge_case reconcile-baseline 25 2026-08-07T11:00:00Z \
+    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-06T10:00:00Z,reconcile,25" \
+    "2026-08-07T10:00:00Z,greptile,reviewed"
+  charge_case reconcile-baseline-retry 24 2026-08-08T11:00:00Z \
+    "2026-08-05T10:00:00Z,greptile,requested" "2026-08-05T11:00:00Z,greptile,refused" \
+    "2026-08-06T10:00:00Z,reconcile,25" "2026-08-07T10:00:00Z,greptile,requested"
+
+  # A baseline expires with its own cycle. The relayed 25 was read on 2 August
+  # and the reset on the 26th has since opened a new cycle, so by 27 August the
+  # count starts from the full allowance again rather than from a number that
+  # described the cycle before it.
+  charge_case reconcile-baseline-expires-at-the-reset 29 2026-08-27T11:00:00Z \
+    "2026-08-02T10:00:00Z,reconcile,25" "2026-08-27T10:00:00Z,greptile,requested"
+
+  pass "the greptile ledger charges each credit once, in the cycle that owns it"
+}
+
+test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own() {
+  local data out
+  data=$(new_home leaked-review)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  dispatch "$data" record "$PR_A" greptile reviewed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "recording a leaked review must still succeed"
+  assert_contains "$out" 'recording the leak' \
+    "the leak was not surfaced at the record boundary"
+
+  pass "recording a review from a non-owner surfaces the leak as it is written"
+}
+
+test_every_release_path_names_the_events_the_ledger_could_record() {
+  local data out
+  data=$(new_home release-step)
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" reconcile greptile 0
+
+  # Greptile owns this PR and its pool is dry, so both releases are still
+  # possible: greptile may have declined, or it may never have been dispatched.
+  # Only the operator saw which, so every path that hands the PR on must name
+  # both and let them record the one that happened. A plain fix-round `choose`
+  # is checked alongside the transfer paths because it is the command an
+  # operator reaches for first, and it once named the exhaustion on its own.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round at zero credits must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the fix-round refusal named no release for a credit-starved owner"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the fix-round refusal named no release for a service that declined while the pool was dry"
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the transfer named no release for a credit-starved owner"
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "the transfer named no release for a service that declined while the pool was dry"
+
+  dispatch "$data" choose "$PR_A" --service in-house
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "dispatching a second service must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the explicit-service refusal named no release for a credit-starved owner"
+
+  dispatch "$data" record "$PR_A" in-house requested
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "recording a second owner must be refused"
+  assert_contains "$out" "record $PR_A greptile exhausted" \
+    "the record refusal named no release for a credit-starved owner"
+
+  # With credits on hand no dispatch can have been skipped for want of one, so
+  # only the refusal is possible and the same paths name it alone.
+  dispatch "$data" reconcile greptile 20
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  assert_contains "$out" "record $PR_A greptile refused" \
+    "a pool with credits left was released as exhausted"
+  assert_not_contains "$out" "record $PR_A greptile exhausted" \
+    "a pool with credits left still offered an exhaustion that could not have happened"
+
+  pass "every printed release names each event the ledger could truthfully record"
+}
+
+test_status_reports_a_pending_fix_round_as_awaiting_review() {
+  local data out
+  data=$(new_home open-owners)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit reviewed
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" "$PR_A coderabbit (review recorded)" \
+    "a delivered review was not reported as recorded"
+
+  # A fix round re-dispatches the same owner, and that dispatch is waiting.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" "$PR_A coderabbit (awaiting review)" \
+    "a re-dispatched PR was reported as already reviewed"
+
+  pass "the open-owners list reports the newest dispatch rather than any past review"
+}
+
+test_a_dry_standing_owner_is_offered_both_releases() {
+  local data out
+  data=$(new_home dry-owner)
+  dispatch "$data" reconcile greptile 1
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" status
+  assert_contains "$DISPATCH_OUT" 'greptile: 0 of 30 credits remaining' \
+    "the standing dispatch did not spend the last credit"
+
+  # The ledger reads zero and a dispatch is standing, so either release could
+  # be the true one. The tool states the balance and names both rather than
+  # guessing which event the operator saw.
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "an owned PR must refuse a second dispatch"
+  assert_contains "$out" "record $PR_A greptile refused if greptile declined" \
+    "the release named no refusal for a service that may have declined"
+  assert_contains "$out" "record $PR_A greptile exhausted if no dispatch was made" \
+    "the release named no exhaustion for a pool the ledger shows dry"
+
+  # Recording what really happened returns the credit the cancelled dispatch
+  # never spent - the outcome a guessed `exhausted` row would have forfeited.
+  dispatch "$data" record "$PR_A" greptile refused
+  expect_code 0 "$DISPATCH_RC" "recording the refusal that happened must succeed"
+  dispatch "$data" status
+  assert_contains "$DISPATCH_OUT" 'greptile: 1 of 30 credits remaining' \
+    "the refusal did not return the credit the guessed exhaustion would have kept"
+
+  pass "a dry ledger with a standing owner names both releases instead of guessing"
+}
+
+test_the_plan_facts_are_configurable_and_validated() {
+  local data
+  data=$(new_home plan-facts)
+
+  # The allowance and the reset day describe the captain's Greptile plan, so a
+  # plan change is a configuration change rather than a code change.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_GREPTILE_CREDITS=12)
+  dispatch "$data" status
+  expect_code 0 "$DISPATCH_RC" "a configured allowance must be accepted"
+  assert_contains "$DISPATCH_OUT" 'greptile: 12 of 12 credits remaining' \
+    "the configured allowance was ignored"
+
+  # The clock is pinned at 2026-08-19, which the default 26th anchor puts in
+  # the cycle that opened on 26 July. A 20th anchor has already reset that
+  # month, so the same instant sits in a cycle that opened on 20 July.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_BILLING_DAY=20)
+  dispatch "$data" status
+  expect_code 0 "$DISPATCH_RC" "a configured reset day must be accepted"
+  assert_contains "$DISPATCH_OUT" 'billing cycle: 2026-07-20, next reset 2026-08-20' \
+    "the configured reset day did not move the billing cycle"
+
+  # A reset day that some months do not have would mean different things in
+  # different months, so it is refused rather than quietly reinterpreted.
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_BILLING_DAY=31)
+  dispatch "$data" status
+  expect_code 1 "$DISPATCH_RC" "a reset day no month can honour must be refused"
+  assert_contains "$DISPATCH_OUT" 'must be 1-28' \
+    "the refusal did not say which reset days are accepted"
+
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_GREPTILE_CREDITS=lots)
+  dispatch "$data" status
+  expect_code 1 "$DISPATCH_RC" "a non-numeric allowance must be refused"
+
+  DISPATCH_ENV=()
+  pass "the allowance and the reset day are configurable and refused when impossible"
+}
+
+test_bad_input_is_refused_before_anything_is_written() {
+  local data
+  data=$(new_home input)
+
+  dispatch "$data" choose 'https://example.com/not/a/pr'
+  expect_code 1 "$DISPATCH_RC" "a non-PR URL must be refused"
+  dispatch "$data" record "$PR_A" macroscope requested
+  expect_code 1 "$DISPATCH_RC" "an unknown service must be refused"
+  dispatch "$data" record "$PR_A" coderabbit merged
+  expect_code 1 "$DISPATCH_RC" "an unknown event must be refused"
+  dispatch "$data" reconcile greptile twelve
+  expect_code 1 "$DISPATCH_RC" "a non-numeric relayed count must be refused"
+  assert_absent "$data/review-dispatch/ledger.tsv" \
+    "a refused request still wrote to the ledger"
+
+  pass "invalid input is refused before any ledger row is written"
+}
+
+test_the_retry_after_a_refusal_is_an_executable_path() {
+  local data out
+  data=$(new_home retry)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused --note 'retry in 12 minutes'
+
+  # The wait-beats-switch refusal must name a command that actually works.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a plain choose after a refusal must still decline to switch"
+  assert_contains "$out" "choose $PR_A --service coderabbit" \
+    "the refusal did not name the re-trigger command it recommends"
+
+  dispatch "$data" choose "$PR_A" --service coderabbit
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "re-triggering the refusing service must be a supported choice"
+  assert_contains "$out" 'service: coderabbit' \
+    "the retry path did not name the service being re-triggered"
+  assert_contains "$out" "record $PR_A coderabbit requested" \
+    "the retry path did not print the ledger step that restores ownership"
+
+  # Following that printed step must put ownership back, so the depletable
+  # pools stay shut while the re-triggered review is in flight.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  expect_code 0 "$DISPATCH_RC" "the printed record step must be accepted"
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a re-triggered owner must block a second dispatch"
+  assert_contains "$out" 'still owned by coderabbit' \
+    "the re-trigger did not re-establish ownership of the PR"
+
+  pass "the re-trigger the refusal recommends is a supported choose that restores ownership"
+}
+
+test_check_accepts_the_comment_a_refusal_left_behind() {
+  local data out fakebin
+  data=$(new_home check-refused)
+  fakebin=$(fm_fakebin "$TMP_ROOT/check-refused")
+
+  # The design's own fallback path: coderabbit refuses (in a PR comment) and
+  # greptile takes the PR over.
+  dispatch "$data" record "$PR_A" coderabbit requested
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\n'
+SH
+  chmod +x "$fakebin/gh"
+  DISPATCH_FAKEBIN=$fakebin
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "the refused predecessor's own comment must not read as a leak"
+  assert_contains "$out" 'verdict: consistent' \
+    "the check refused the fallback path the ledger is designed to record"
+
+  # A service that neither owns the PR nor refused it is still a leak.
+  cat > "$fakebin/gh" <<'SH'
+#!/usr/bin/env bash
+printf 'coderabbitai\ngreptile-apps\ndevin-ai-integration\n'
+SH
+  chmod +x "$fakebin/gh"
+  dispatch "$data" check "$PR_A"
+  out=$DISPATCH_OUT
+  DISPATCH_FAKEBIN=
+  expect_code 2 "$DISPATCH_RC" "an unexplained third service must still fail the check"
+  assert_contains "$out" 'leak: devin' \
+    "the check did not name the service with no recorded reason to be here"
+
+  pass "a recorded refusal explains that service's comment while other leaks still fail"
+}
+
+test_the_ledger_directory_is_private() {
+  local data perms
+  data=$(new_home ledger-dir)
+  dispatch "$data" record "$PR_A" coderabbit requested
+
+  assert_present "$data/review-dispatch" "the ledger directory was not created"
+  perms=$(path_mode "$data/review-dispatch")
+  [ "$perms" = 700 ] || fail "the ledger directory must stay captain-private (mode $perms)"
+
+  pass "the ledger directory is created captain-private"
+}
+
+# A writer that died mid-write leaves its lock directory behind. Breaking it
+# reads the lock's age, so the mtime probe has to work on the host running the
+# helper rather than writing filesystem statistics where a number belongs.
+test_an_abandoned_lock_is_broken_so_the_write_still_lands() {
+  local data ledger
+  data=$(new_home stale-lock)
+  dispatch "$data" record "$PR_A" coderabbit requested
+  expect_code 0 "$DISPATCH_RC" "the first dispatch must be recorded"
+  ledger="$data/review-dispatch/ledger.tsv"
+
+  mkdir "$ledger.lock" || fail "the abandoned lock could not be staged"
+  DISPATCH_ENV=(FM_REVIEW_DISPATCH_LOCK_STALE_SECS=0)
+  dispatch "$data" record "$PR_A" coderabbit reviewed
+  DISPATCH_ENV=()
+
+  expect_code 0 "$DISPATCH_RC" \
+    "an abandoned lock must be broken rather than fail the write: $DISPATCH_OUT"
+  assert_grep "$PR_A"$'\t'"coderabbit"$'\t'"reviewed" "$ledger" \
+    "the row written after breaking the lock is missing from the ledger"
+  [ ! -d "$ledger.lock" ] || fail "the lock was not released after the write"
+
+  pass "an abandoned lock is broken so the row still lands"
+}
+
+test_coderabbit_is_the_default_and_owns_the_pr
+test_an_abandoned_lock_is_broken_so_the_write_still_lands
+test_exactly_one_owner_survives_a_second_dispatch_attempt
+test_fallback_needs_a_recorded_refusal_and_prefers_waiting
+test_reserve_floor_stops_auto_picks_but_not_the_captain
+test_zero_credits_refuses_even_an_explicit_greptile_dispatch
+test_devin_stays_in_reserve_until_quota_is_confirmed
+test_ledger_is_private_and_records_every_event
+test_check_flags_a_review_from_a_non_owner
+test_check_accepts_the_comment_a_refusal_left_behind
+test_the_retry_after_a_refusal_is_an_executable_path
+test_the_ledger_directory_is_private
+test_the_greptile_charge_table
+test_record_warns_when_a_review_lands_on_a_pr_it_does_not_own
+test_a_fix_round_carries_the_same_credit_rules_as_any_dispatch
+test_a_fix_round_cannot_dispatch_greptile_at_zero_credits
+test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
+test_an_exhausted_pool_refunds_nothing
+test_check_accepts_the_comment_a_released_owner_left_behind
+test_the_in_house_reason_states_only_what_the_ledger_records
+test_the_terminal_in_house_reason_separates_a_floor_hold_from_a_release
+test_the_devin_reason_names_the_state_the_ledger_holds
+test_a_negative_balance_is_reported_as_the_number_the_ledger_holds
+test_every_release_path_names_the_events_the_ledger_could_record
+test_status_reports_a_pending_fix_round_as_awaiting_review
+test_a_dry_standing_owner_is_offered_both_releases
+test_the_plan_facts_are_configurable_and_validated
+test_bad_input_is_refused_before_anything_is_written
