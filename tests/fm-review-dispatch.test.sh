@@ -475,6 +475,116 @@ test_the_in_house_reason_states_only_what_the_ledger_records() {
   pass "the in-house choice reports the ledger's own state and nothing more"
 }
 
+# The reserve floor is not a release. A pool the floor is holding back is still
+# there to spend, and the reason for passing it over has to say which of the two
+# it is, because the operator's next move differs: a released service is gone
+# for this PR, a reserved one is one --service greptile away.
+test_the_terminal_in_house_reason_separates_a_floor_hold_from_a_release() {
+  local data out
+  data=$(new_home in-house-floor)
+  # Exactly on the floor: auto-picks stop, but nothing about greptile is
+  # recorded for this PR and devin has no row at all.
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  dispatch "$data" choose "$PR_A" --after-refusal
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a fleet with nothing auto-pickable must still get a reviewer"
+  assert_contains "$out" 'service: in-house' \
+    "the terminal fallback did not take over when the floor stopped the auto-pick"
+  assert_contains "$out" 'coderabbit is recorded as refused or exhausted for this PR' \
+    "the reason did not name the one release the ledger really holds"
+  assert_contains "$out" 'greptile is held back by the reserve floor at 10 credits' \
+    "the reason did not name the floor hold that actually excluded greptile"
+  assert_contains "$out" 'devin is unreachable without --devin-quota-confirmed' \
+    "the reason did not name why the unrecorded reserve was skipped"
+  assert_not_contains "$out" 'greptile is recorded as refused or exhausted' \
+    "the reason claimed a greptile release the ledger never recorded"
+  assert_not_contains "$out" 'every third-party service is recorded' \
+    "the reason claimed events for services the ledger never recorded"
+
+  # The claim the reason makes about the reserve has to be true: a floor-held
+  # pool is still spendable on an explicit captain choice.
+  dispatch "$data" choose "$PR_A" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "the reason promised a spendable pool the tool then refused"
+  assert_contains "$out" 'service: greptile' \
+    "a pool the reason called spendable could not be dispatched"
+
+  pass "the terminal in-house reason names a floor hold as a hold, not a release"
+}
+
+test_the_devin_reason_names_the_state_the_ledger_holds() {
+  local data out
+  data=$(new_home devin-reason)
+  dispatch "$data" reconcile greptile 10
+  dispatch "$data" record "$PR_A" coderabbit refused
+
+  # Devin opens on a confirmed quota while greptile sits on the floor, so the
+  # reserve is picked over a pool that was never released.
+  dispatch "$data" choose "$PR_A" --after-refusal --devin-quota-confirmed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a confirmed devin quota must open the reserve"
+  assert_contains "$out" 'service: devin' \
+    "the confirmed reserve was not reached"
+  assert_contains "$out" 'coderabbit is recorded as refused or exhausted for this PR' \
+    "the devin reason did not name the release the ledger holds"
+  assert_contains "$out" 'greptile is held back by the reserve floor at 10 credits' \
+    "the devin reason did not name the floor hold that actually excluded greptile"
+  assert_not_contains "$out" 'greptile is recorded as refused or exhausted' \
+    "the devin reason claimed a greptile release the ledger never recorded"
+
+  # With a real greptile release on the ledger the same path says so instead.
+  dispatch "$data" record "$PR_A" greptile refused
+  dispatch "$data" choose "$PR_A" --after-refusal --devin-quota-confirmed
+  out=$DISPATCH_OUT
+  expect_code 0 "$DISPATCH_RC" "a released greptile must still hand on to the reserve"
+  assert_contains "$out" 'coderabbit and greptile are recorded as refused or exhausted for this PR' \
+    "the devin reason did not report the releases the ledger now holds"
+
+  pass "the devin choice reports the ledger's own state and nothing more"
+}
+
+# Dispatches recorded past a reconciled zero drive the balance below zero, and
+# the size of that drift is exactly what makes "reconcile against the dashboard"
+# actionable. The refusals must print the number `status` reports, not a zero.
+test_a_negative_balance_is_reported_as_the_number_the_ledger_holds() {
+  local data out remaining
+  data=$(new_home negative-balance)
+  dispatch "$data" reconcile greptile 0
+  dispatch "$data" record "$PR_A" coderabbit refused
+  dispatch "$data" record "$PR_A" greptile requested
+  dispatch "$data" record "$PR_A" greptile reviewed
+  dispatch "$data" record "$PR_A" greptile requested
+
+  dispatch "$data" status
+  out=$DISPATCH_OUT
+  assert_contains "$out" 'greptile: -2 of 30 credits remaining' \
+    "two dispatches past a reconciled zero did not read as a negative balance"
+  remaining=$(printf '%s\n' "$out" | sed -n 's/^greptile: \(-*[0-9][0-9]*\) of .*/\1/p')
+  [ -n "$remaining" ] || fail "status printed no greptile balance to compare the refusals against"
+
+  # The owner path: greptile holds the PR and the pool reads dry.
+  dispatch "$data" choose "$PR_A"
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a fix round on a dry pool must be refused"
+  assert_contains "$out" "the ledger shows $remaining Greptile credits this cycle" \
+    "the release message hid the drift status reports"
+  assert_not_contains "$out" 'the ledger shows 0 Greptile credits' \
+    "the release message reported a zero balance the ledger does not hold"
+
+  # The unowned path: a captain-explicit dispatch on a PR greptile never held.
+  dispatch "$data" choose "$PR_B" --service greptile
+  out=$DISPATCH_OUT
+  expect_code 2 "$DISPATCH_RC" "a dispatch into a dry pool must be refused"
+  assert_contains "$out" "the ledger shows $remaining Greptile credits this cycle" \
+    "the refusal hid the drift status reports"
+  assert_not_contains "$out" 'the ledger shows 0 Greptile credits' \
+    "the refusal reported a zero balance the ledger does not hold"
+
+  pass "a balance driven below zero is reported as the figure the ledger holds"
+}
+
 # One ledger per case, so a case cannot inherit another's rows. Each row is
 # "<iso8601-utc>,<service>,<event>" - or "<iso8601-utc>,reconcile,<number>" for
 # a relayed dashboard baseline - and <expected> is the credits the ledger must
@@ -883,6 +993,9 @@ test_an_exhausted_pool_releases_the_pr_to_the_in_house_review
 test_an_exhausted_pool_refunds_nothing
 test_check_accepts_the_comment_a_released_owner_left_behind
 test_the_in_house_reason_states_only_what_the_ledger_records
+test_the_terminal_in_house_reason_separates_a_floor_hold_from_a_release
+test_the_devin_reason_names_the_state_the_ledger_holds
+test_a_negative_balance_is_reported_as_the_number_the_ledger_holds
 test_every_release_path_names_the_events_the_ledger_could_record
 test_status_reports_a_pending_fix_round_as_awaiting_review
 test_a_dry_standing_owner_is_offered_both_releases

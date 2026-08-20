@@ -84,7 +84,15 @@
 # coderabbit and greptile are both recorded as refused or exhausted for the PR
 # and devin is either recorded the same way or unreachable because
 # --devin-quota-confirmed was not passed: the flag guards moves to a paid pool,
-# and the in-house review costs nothing.
+# and the in-house review costs nothing. Whichever service is named, the
+# printed reason states only what the ledger holds: for every service passed
+# over it names the condition that actually excluded it - recorded as refused
+# or exhausted for this PR, held back by the reserve floor and so still
+# spendable on an explicit --service greptile, dry enough that the $0 cap would
+# skip the review, or devin out of reach without --devin-quota-confirmed. A
+# floor hold is never reported as a release the ledger does not carry.
+# passed_over_reason builds every such reason; no other path composes one, so
+# the wording cannot drift apart.
 #
 # The ledger is $FM_HOME/data/review-dispatch/ledger.tsv, captain-private and
 # gitignored with the rest of data/. One tab-separated row per event:
@@ -536,11 +544,14 @@ service_logins() {  # <service>
 # that needs release wording calls this rather than composing its own, so the
 # two cannot drift apart.
 release_step() {  # <pr-url> <owner>
-  local url=$1 owner=$2
-  if [ "$owner" = greptile ] && [ "$(greptile_remaining)" -le 0 ]; then
-    printf 'the ledger shows 0 Greptile credits this cycle, so record what happened - bin/fm-review-dispatch.sh record %s greptile refused if greptile declined, or bin/fm-review-dispatch.sh record %s greptile exhausted if no dispatch was made\n' \
-      "$url" "$url"
-    return 0
+  local url=$1 owner=$2 remaining
+  if [ "$owner" = greptile ]; then
+    remaining=$(greptile_remaining)
+    if [ "$remaining" -le 0 ]; then
+      printf 'the ledger shows %s Greptile credits this cycle, so record what happened - bin/fm-review-dispatch.sh record %s greptile refused if greptile declined, or bin/fm-review-dispatch.sh record %s greptile exhausted if no dispatch was made\n' \
+        "$remaining" "$url" "$url"
+      return 0
+    fi
   fi
   printf 'bin/fm-review-dispatch.sh record %s %s refused\n' "$url" "$owner"
 }
@@ -559,12 +570,69 @@ greptile_guard() {  # <pr-url> owner|unowned
     if [ "$held" = owner ]; then
       refuse "the flex cap is \$0, so a Greptile review would be skipped; $(release_step "$url" greptile) - or reconcile against the dashboard if it disagrees"
     fi
-    refuse "the ledger shows 0 Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
+    refuse "the ledger shows $remaining Greptile credits this cycle and the flex cap is \$0, so the review would be skipped; nothing was dispatched, so $url has nothing to release; reconcile against the dashboard if it disagrees"
   fi
   if [ "$remaining" -le "$GREPTILE_RESERVE_FLOOR" ]; then
     printf 'warning: %s credits remain, at or below the reserve floor of %s; below the floor greptile is captain-explicit only\n' \
       "$remaining" "$GREPTILE_RESERVE_FLOOR" >&2
   fi
+}
+
+# Why the services named here were passed over, in the order given. Each clause
+# is derived from the condition that actually excluded that service, never
+# assumed: a refusal or exhaustion the ledger records, a reserve-floor hold that
+# an explicit --service greptile can still spend, a pool dry enough that the $0
+# cap would skip the review, or Devin held out of reach until the captain
+# confirms its quota. Services sharing the recorded state are named together,
+# and the whole fleet being recorded is said once. Every reason a passed-over
+# service appears in is built here, so no caller can restate the rule and drift.
+passed_over_reason() {  # <service>...
+  local service remaining recorded='' recorded_n=0 total=0 reason=''
+  local -a clauses=()
+  for service in "$@"; do
+    total=$((total + 1))
+    if list_has "$PR_UNAVAILABLE" "$service"; then
+      recorded_n=$((recorded_n + 1))
+      recorded="${recorded:+$recorded and }$service"
+      continue
+    fi
+    case "$service" in
+      greptile)
+        remaining=$(greptile_remaining)
+        if [ "$remaining" -le 0 ]; then
+          clauses+=("greptile has $remaining credits this cycle, so the \$0 flex cap would skip the review")
+        else
+          clauses+=("greptile is held back by the reserve floor at $remaining credits and stays spendable on an explicit --service greptile")
+        fi
+        ;;
+      devin)
+        clauses+=("devin is unreachable without --devin-quota-confirmed")
+        ;;
+    esac
+  done
+  if [ "$recorded_n" = "$total" ] && [ "$total" -ge 3 ]; then
+    printf 'every third-party service is recorded as refused or exhausted for this PR\n'
+    return 0
+  fi
+  if [ "$recorded_n" -gt 0 ]; then
+    if [ "$recorded_n" -eq 1 ]; then
+      clauses=("$recorded is recorded as refused or exhausted for this PR" ${clauses[@]+"${clauses[@]}"})
+    else
+      clauses=("$recorded are recorded as refused or exhausted for this PR" ${clauses[@]+"${clauses[@]}"})
+    fi
+  fi
+  # Read the clauses as one list, so the last of several carries the "and".
+  local i n=${#clauses[@]}
+  for ((i = 0; i < n; i++)); do
+    if [ "$i" -eq 0 ]; then
+      reason=${clauses[i]}
+    elif [ "$i" -eq "$((n - 1))" ]; then
+      reason="$reason, and ${clauses[i]}"
+    else
+      reason="$reason, ${clauses[i]}"
+    fi
+  done
+  printf '%s\n' "$reason"
 }
 
 print_choice() {  # <pr-url> <service> <reason>
@@ -651,12 +719,7 @@ cmd_choose() {
   # unconfirmed reserve is as unavailable as a recorded one.
   if list_has "$PR_UNAVAILABLE" greptile &&
     { [ "$devin_confirmed" = 0 ] || list_has "$PR_UNAVAILABLE" devin; }; then
-    if list_has "$PR_UNAVAILABLE" devin; then
-      reason="every third-party service is recorded as refused or exhausted for this PR"
-    else
-      reason="coderabbit and greptile are recorded as refused or exhausted for this PR, and devin is unreachable without --devin-quota-confirmed"
-    fi
-    print_choice "$url" in-house "$reason"
+    print_choice "$url" in-house "$(passed_over_reason coderabbit greptile devin)"
     return 0
   fi
 
@@ -675,11 +738,11 @@ cmd_choose() {
   fi
 
   if [ "$devin_confirmed" = 1 ] && ! list_has "$PR_UNAVAILABLE" devin; then
-    print_choice "$url" devin "coderabbit refused, greptile unavailable, and the captain confirmed Devin quota"
+    print_choice "$url" devin "$(passed_over_reason coderabbit greptile); the captain confirmed Devin quota"
     return 0
   fi
 
-  print_choice "$url" in-house "every third-party pool is unavailable for this PR"
+  print_choice "$url" in-house "$(passed_over_reason coderabbit greptile devin)"
 }
 
 cmd_record() {
