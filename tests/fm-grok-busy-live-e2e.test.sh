@@ -62,7 +62,7 @@ WAITING_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
 ')
 STOP_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
   /Waiting for response…/ {
-    sub(/Waiting for response…[^[]*/, "")
+    sub(/Waiting for response…[[:space:]]*/, "")
     print
     exit
   }
