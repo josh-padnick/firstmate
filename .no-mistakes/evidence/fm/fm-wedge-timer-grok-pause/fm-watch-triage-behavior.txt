@@ -1,0 +1,45 @@
+ok - signal_reason_is_actionable: benign absorbed, captain verbs and coalesced batches surfaced
+ok - stale_is_terminal: terminal status surfaces, non-terminal and no-status are benign
+ok - scan_captain_relevant_statuses lists only captain-relevant statuses
+ok - classifier primitives: keyed decisions and activity phases, captain relevance, window-to-task, and overrides
+ok - crew_is_provably_working: only working+run-step/pane is provable; idle/finished/parked/failed/unknown surface
+ok - status_is_paused: only the leading paused verb matches, and paused is not captain-relevant
+ok - crew_absorb_class: working/paused/none from one read; crew_is_paused and crew_is_provably_working agree
+ok - signal_crew_provably_working: benign only when every referenced crew is provably working
+ok - a secondmate's status signal is never absorbed as provably working; crewmates are unaffected
+ok - a no-verb signal whose crew is provably working is absorbed (no exit, no queue, suppressor advanced, beacon present)
+ok - a bare turn-end whose crew is provably working (busy pane) is absorbed
+ok - a bare turn-end whose crew is not provably working is surfaced (the swallowed-finish fix)
+ok - a no-verb working: note whose crew is idle with no running pipeline is surfaced
+ok - a secondmate's status note surfaces even while its own agent is busy
+ok - a self-announced close never wakes its own home, and the next real note still does
+ok - captain-relevant signal is surfaced (queue + exit) and marked surfaced
+ok - a stale pane sitting on a terminal status is surfaced (queue + exit)
+ok - a stale terminal-looking status is overridden and absorbed while a run is actively working, then wedge-escalated
+ok - provably-working non-terminal stale is absorbed on first sight, then wedge-escalated past the threshold
+ok - consecutive wedge escalations on the same pane accumulate and demand deep inspection at the threshold
+ok - a pane becoming active again resets the consecutive wedge-escalation counter
+ok - a not-provably-working non-terminal stale is surfaced immediately (never left to wait out the timer)
+ok - a declared pause is absorbed on first sight, then re-surfaced as a recheck past the threshold, never wedge-escalated
+ok - rendered Grok and semantic Claude active turns clear the wedge ladder
+ok - a declared pause uses the long cadence even while the Grok process remains alive
+ok - an exited captain-held worker retains its bounded recheck cadence
+ok - a declared paused secondmate re-surfaces on the bounded normal-mode cadence
+ok - a non-paused secondmate retains normal stale suppression
+ok - a resumed secondmate clears pause and stale tracking before stale exemption
+ok - unchanged stale hashes reclassify when a crew enters or leaves pause
+ok - a declared pause is periodically rechecked against authoritative active-run state
+ok - a paused status overridden by authoritative working preserves its wedge timer and escalates
+ok - matching non-terminal stale suppressors repair missing or corrupt stale-since timers
+ok - triage log capping handles wc byte counts with leading spaces
+ok - a captured process-event result wakes a healthy watcher proactively, with no manual drain
+ok - an unacknowledged process-event result re-drains until handling is acknowledged
+ok - complete process-event queue keys map to distinct seen markers
+ok - queue revalidation, proactive output, and marker commit serialize with drain
+ok - surfacing failures replay until post-handling acknowledgement
+ok - marker failure exits through the shared wake owner, releases its lock, and replays later
+ok - a heartbeat with no captain-relevant change is absorbed and backs off the cadence
+ok - heartbeat backstop fail-safe surfaces a captain-relevant status the per-wake path missed
+ok - the liveness beacon stays fresh while the watcher absorbs benign wakes (fm-guard never false-alarms)
+ok - with .afk present the watcher reverts to one-shot so the daemon owns triage (no double-triage)
+ok - AFK changed paused panes hand off plain stale identities for daemon-owned pause triage
