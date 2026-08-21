@@ -91,7 +91,7 @@ FM_BUSY_LIB_VERSION=v1
 # Grok's independently observed active-turn signals.
 # This remains isolated to the Grok arm below because Grok has no verified
 # structured lifecycle source.
-FM_BUSY_GROK_REGEX_DEFAULT='Ctrl\+c:cancel|Waiting for response(…|\.\.\.)[^[:cntrl:]]*⇣[0-9]|\[stop\][[:space:]]*$'
+FM_BUSY_GROK_REGEX_DEFAULT='Ctrl\+c:cancel|^[[:space:]]*│[^│]*Waiting for response(…|\.\.\.)[^│]*⇣[0-9][^│]*│[[:space:]]*$|^[[:space:]]*│[^│]*\[stop\][^│]*│[[:space:]]*$'
 
 # Standalone-Kimi verification gate. Empty means no installed Kimi version
 # has passed live verification, so every standalone Kimi task classifies

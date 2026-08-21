@@ -232,7 +232,7 @@ Ctrl+c:cancel'
 }
 
 test_grok_regex_isolated() {
-  local state out fixture waiting_only stop_only
+  local state out fixture waiting_only stop_only copied_footer
   state=$(new_state_dir grok-arm)
   out=$(fm_busy_classify tmux w1 grok t1 "$state" 'thinking hard
 Ctrl+c:cancel')
@@ -244,12 +244,15 @@ Ctrl+c:cancel')
     || fail "realistic Grok fixture lost its independent stop signal"
   out=$(fm_busy_classify tmux w1 grok t1 "$state" "$fixture")
   [ "$out" = "busy grok-regex" ] || fail "Grok's waiting-response fixture must classify busy, got '$out'"
-  waiting_only='Waiting for response… 12m 07s ⇣33.4k'
-  stop_only='12m 07s ⇣33.4k [stop]'
+  waiting_only='│ ⠴ Waiting for response… 12m 07s ⇣33.4k                      │'
+  stop_only='│ ⠴ 12m 07s ⇣33.4k [stop]                                      │'
   out=$(fm_busy_classify tmux w1 grok t1 "$state" "$waiting_only")
   [ "$out" = "busy grok-regex" ] || fail "Grok waiting-response signal alone must classify busy, got '$out'"
   out=$(fm_busy_classify tmux w1 grok t1 "$state" "$stop_only")
   [ "$out" = "busy grok-regex" ] || fail "Grok stop signal alone must classify busy, got '$out'"
+  copied_footer='Recent completed output quoted Waiting for response… 12m 07s ⇣33.4k [stop]'
+  out=$(fm_busy_classify tmux w1 grok t1 "$state" "$copied_footer")
+  [ "$out" = "idle grok-regex" ] || fail "copied Grok footer text must remain idle, got '$out'"
   out=$(fm_busy_classify tmux w1 grok t1 "$state" 'Task text mentions Waiting for response… without a live token meter')
   [ "$out" = "idle grok-regex" ] || fail "prose-only waiting text must remain idle, got '$out'"
   out=$(fm_busy_classify tmux w1 grok t1 "$state" 'Task text mentions [stop] before more prose')

@@ -23,6 +23,8 @@ SOCKET="fm-grok-busy-live-$$"
 SESSION=grokbusy
 VERSION=$(grok --version 2>/dev/null | head -1)
 CAPTURE=
+WAITING_CAPTURE=
+STOP_CAPTURE=
 
 cleanup() {
   tmux -L "$SOCKET" kill-server 2>/dev/null || true
@@ -51,8 +53,28 @@ printf '%s' "$CAPTURE" | grep -F 'Waiting for response…' >/dev/null \
   || { echo "not ok - Grok ($VERSION): live turn never rendered Waiting for response…" >&2; exit 1; }
 printf '%s' "$CAPTURE" | grep -F '[stop]' >/dev/null \
   || { echo "not ok - Grok ($VERSION): live turn never rendered its independent [stop] signal" >&2; exit 1; }
-[ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$CAPTURE")" = "busy grok-regex" ] \
-  || { echo "not ok - Grok ($VERSION): production classifier missed the live active turn" >&2; exit 1; }
+WAITING_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
+  /Waiting for response…/ {
+    sub(/[[:space:]]*\[stop\]/, " ")
+    print
+    exit
+  }
+')
+STOP_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
+  /Waiting for response…/ {
+    sub(/Waiting for response…[^[]*/, "")
+    print
+    exit
+  }
+')
+printf '%s' "$WAITING_CAPTURE" | grep -F '[stop]' >/dev/null \
+  && { echo "not ok - Grok ($VERSION): waiting-response probe still contains [stop]" >&2; exit 1; }
+printf '%s' "$STOP_CAPTURE" | grep -F 'Waiting for response…' >/dev/null \
+  && { echo "not ok - Grok ($VERSION): stop probe still contains Waiting for response…" >&2; exit 1; }
+[ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$WAITING_CAPTURE")" = "busy grok-regex" ] \
+  || { echo "not ok - Grok ($VERSION): production classifier missed the isolated waiting-response signal" >&2; exit 1; }
+[ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$STOP_CAPTURE")" = "busy grok-regex" ] \
+  || { echo "not ok - Grok ($VERSION): production classifier missed the isolated stop signal" >&2; exit 1; }
 
 i=0
 while [ "$i" -lt 600 ]; do
@@ -70,4 +92,4 @@ printf '%s' "$CAPTURE" | grep -F 'DONE' >/dev/null \
 [ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$CAPTURE")" = "idle grok-regex" ] \
   || { echo "not ok - Grok ($VERSION): settled pane still classified busy" >&2; exit 1; }
 
-echo "ok - Grok ($VERSION): live waiting-response and stop signals classify busy, then settle idle"
+echo "ok - Grok ($VERSION): each live signal independently classifies busy, then settles idle"
