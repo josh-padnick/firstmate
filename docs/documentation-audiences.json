@@ -387,6 +387,14 @@
     {
       "path": "skills/stow/SKILL.md",
       "audience": "public-product"
+    },
+    {
+      "path": "tests/fixtures/panes/claude-thinking-tokens.txt",
+      "audience": "maintainer-verification"
+    },
+    {
+      "path": "tests/fixtures/panes/grok-waiting-response.txt",
+      "audience": "maintainer-verification"
     }
   ]
 }

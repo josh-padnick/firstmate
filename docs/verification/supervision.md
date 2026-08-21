@@ -183,7 +183,7 @@ Each pass polled `state/<id>.busy-state` while a real turn ran.
 | Claude | 2.1.220 (Claude Code) | Hooks `UserPromptSubmit`, `Stop`, `StopFailure`, `SessionEnd` | `UserPromptSubmit` fired for the argv launch prompt and each steer, and `Stop` closed every completed turn. A mid-stream Escape interrupt fired no closing hook, which is why the firstmate-controlled clear exists. `StopFailure` and `SessionEnd` are wired from the four hook names present in the installed binary; only the abnormal paths they cover were not reproduced live. |
 | Codex | codex-cli 0.145.0 | None usable | See below; classifies `unknown codex-unverified`. |
 | Kimi (standalone) | not installed | None usable | No binary on `PATH`, so the gate stays closed and it classifies `unknown kimi-unverified`. |
-| Grok | 0.2.112 | Isolated rendered-tail fallback | Retained unconverted; the approved audit could not credit a live structured-lifecycle run. |
+| Grok | 1.0.5 | Isolated rendered-tail fallback | A real turn rendered an unbordered spinner status row immediately above the composer with both `Waiting for response…` and `[stop]`; either signal independently classified busy and the completed turn classified idle, while the adapter remains unconverted because no structured lifecycle source is verified. |
 
 Codex was probed two ways, both refused:
 
@@ -203,6 +203,18 @@ Deterministic entry points:
 tests/fm-busy-state.test.sh
 tests/fm-busy-adapter-wiring.test.sh
 tests/fm-crew-state.test.sh
+```
+
+Live drift guard, verified on 2026-08-21 with Grok 1.0.5:
+
+```sh
+FM_GROK_BUSY_LIVE_E2E=1 tests/fm-grok-busy-live-e2e.test.sh
+```
+
+The output was:
+
+```text
+ok - Grok (grok 1.0.5 (5115b46bc909) [stable]): each live signal independently classifies busy, then settles idle
 ```
 
 ## Turn-end guard
