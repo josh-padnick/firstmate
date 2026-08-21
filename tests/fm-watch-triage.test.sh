@@ -143,13 +143,10 @@ seen_sig() {
   if [ "$(uname)" = Darwin ]; then stat -f '%z:%Fm' "$1" 2>/dev/null; else stat -c '%s:%Y' "$1" 2>/dev/null; fi
 }
 
-# Prime <file>'s .seen-* suppressor to its CURRENT signature, so the per-poll
-# no-verb signal scan (which watches every *.turn-ended for a size:mtime change)
-# treats a just-created or just-backdated turn-ended marker as already seen.
-# Active-turn regression fixtures create/backdate turn-ended directly (there is
-# no real harness touching it), so without this the marker's own first sighting
-# would fire an unrelated "signal:" wake and mask the stale-ladder assertion.
-# Call again after any further touch/set_mtime on the same file.
+# Prime <file>'s .seen-* suppressor to its current signature, so the per-poll
+# no-verb signal scan treats a fixture-created or backdated turn-ended marker as
+# already seen instead of emitting an unrelated signal wake.
+# Call again after any further touch or set_mtime on the same file.
 prime_turnend_seen() {  # <file>
   local f=$1 base
   base=$(basename "$f" | tr '.' '_')
