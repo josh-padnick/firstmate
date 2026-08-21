@@ -54,23 +54,21 @@ printf '%s' "$CAPTURE" | grep -F 'Waiting for response…' >/dev/null \
 printf '%s' "$CAPTURE" | grep -F '[stop]' >/dev/null \
   || { echo "not ok - Grok ($VERSION): live turn never rendered its independent [stop] signal" >&2; exit 1; }
 WAITING_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
-  /Waiting for response…/ {
-    sub(/[[:space:]]*\[stop\]/, " ")
-    print
-    exit
-  }
+  /Waiting for response…/ { sub(/[[:space:]]*\[stop\]/, "") }
+  { print }
 ')
 STOP_CAPTURE=$(printf '%s\n' "$CAPTURE" | awk '
-  /Waiting for response…/ {
-    sub(/Waiting for response…[[:space:]]*/, "")
-    print
-    exit
-  }
+  /Waiting for response…/ { sub(/Waiting for response…[[:space:]]*/, "") }
+  { print }
 ')
 printf '%s' "$WAITING_CAPTURE" | grep -F '[stop]' >/dev/null \
   && { echo "not ok - Grok ($VERSION): waiting-response probe still contains [stop]" >&2; exit 1; }
 printf '%s' "$STOP_CAPTURE" | grep -F 'Waiting for response…' >/dev/null \
   && { echo "not ok - Grok ($VERSION): stop probe still contains Waiting for response…" >&2; exit 1; }
+printf '%s' "$WAITING_CAPTURE" | grep -F 'Waiting for response…' >/dev/null \
+  || { echo "not ok - Grok ($VERSION): waiting-response probe lost its intended signal" >&2; exit 1; }
+printf '%s' "$STOP_CAPTURE" | grep -F '[stop]' >/dev/null \
+  || { echo "not ok - Grok ($VERSION): stop probe lost its intended signal" >&2; exit 1; }
 [ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$WAITING_CAPTURE")" = "busy grok-regex" ] \
   || { echo "not ok - Grok ($VERSION): production classifier missed the isolated waiting-response signal" >&2; exit 1; }
 [ "$(fm_busy_classify tmux live:grok grok live-grok /nonexistent "$STOP_CAPTURE")" = "busy grok-regex" ] \

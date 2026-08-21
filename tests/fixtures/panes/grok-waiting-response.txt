@@ -1,3 +1,7 @@
-│ Working on the requested repository change.                          │
-│                                                                     │
-│ ⠴ Waiting for response… 12m 07s ⇣33.4k [stop]                      │
+Working on the requested repository change.
+
+ ⠋ Waiting for response… 0.0s ... 0.0s ⇣9.28k [stop]
+
+  ╭──────────────────────────────────────╮
+  │ ❯ Type a message...                  │
+  ╰──────────────────── Grok 4.5 (high) ─╯

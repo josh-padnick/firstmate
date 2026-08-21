@@ -91,7 +91,7 @@ FM_BUSY_LIB_VERSION=v1
 # Grok's independently observed active-turn signals.
 # This remains isolated to the Grok arm below because Grok has no verified
 # structured lifecycle source.
-FM_BUSY_GROK_REGEX_DEFAULT='Ctrl\+c:cancel|^[[:space:]]*│[^│]*Waiting for response(…|\.\.\.)[^│]*⇣[0-9][^│]*│[[:space:]]*$|^[[:space:]]*│[^│]*⇣[0-9]+(\.[0-9]+)?[kKmM]?[[:space:]]+\[stop\][[:space:]]*│[[:space:]]*$'
+FM_BUSY_GROK_REGEX_DEFAULT='Ctrl\+c:cancel|^[[:space:]]*(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[[:space:]]+Waiting for response(…|\.\.\.)[^[:cntrl:]]*⇣[0-9]+(\.[0-9]+)?[kKmM]?[[:space:]]*(\[stop\])?[[:space:]]*$|^[[:space:]]*(⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏)[[:space:]]+[^[:cntrl:]]*⇣[0-9]+(\.[0-9]+)?[kKmM]?[[:space:]]+\[stop\][[:space:]]*$'
 
 # Standalone-Kimi verification gate. Empty means no installed Kimi version
 # has passed live verification, so every standalone Kimi task classifies
@@ -832,8 +832,33 @@ fm_busy_cursor_turn_state() {  # <transcript>
 # FM_BUSY_REGEX still globally overrides the signature, mirroring the
 # historical operator escape hatch.
 fm_busy_grok_tail_busy() {
-  grep -v '^[[:space:]]*$' | tail -12 \
-    | grep -qiE "${FM_BUSY_REGEX:-$FM_BUSY_GROK_REGEX_DEFAULT}"
+  local tail
+  tail=$(grep -v '^[[:space:]]*$' | tail -12)
+  if [ -n "${FM_BUSY_REGEX:-}" ]; then
+    printf '%s\n' "$tail" | grep -qiE "$FM_BUSY_REGEX"
+    return
+  fi
+  printf '%s\n' "$tail" | awk '
+    { line[NR] = $0 }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (index(line[i], "Ctrl+c:cancel")) {
+          print line[i]
+          continue
+        }
+        if (i == NR || line[i + 1] !~ /^[[:space:]]*╭.*╮[[:space:]]*$/) continue
+        prompt = 0
+        for (j = i + 2; j <= NR; j++) {
+          if (line[j] ~ /^[[:space:]]*│.*❯.*│[[:space:]]*$/) prompt = 1
+          if (prompt && line[j] ~ /^[[:space:]]*╰.*Grok.*╯[[:space:]]*$/) {
+            print line[i]
+            break
+          }
+          if (line[j] ~ /^[[:space:]]*╭/) break
+        }
+      }
+    }
+  ' | grep -qiE "$FM_BUSY_GROK_REGEX_DEFAULT"
 }
 
 # fm_busy_classify: semantic classification for a task whose endpoint the
