@@ -3,7 +3,7 @@
 # status-phrase matrix (a product contract), escalation batching/dedupe, afk
 # presence-gating, and the injection-hardening units that an e2e cannot
 # deterministically reach (persistent-Enter-swallow, max-defer wedge alarms,
-# fm-send swallow reporting, composer-pending ANSI parsing). The operator-visible
+# fm-send typed-plane swallow reporting, composer-pending ANSI parsing). The operator-visible
 # inject flow lives in fm-afk-inject-e2e and fm-wake-daemon-lifecycle-e2e.
 set -u
 
@@ -173,22 +173,112 @@ test_stale_diagnostic_wedge_survives_busy_housekeeping() {
       PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
         FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 housekeeping "$state"
     )
-    [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" = 1 ] \
-      || fail "$case_name enriched wedge did not produce exactly one escalation"
-    grep -F "${reason#stale: }" "$state/.subsuper-escalations" >/dev/null \
-      || fail "$case_name enriched wedge lost its demand-deep-inspection detail"
+    case "$case_name" in
+      paused)
+        # A current declared wait owns the cadence: the enriched wedge routes to the
+        # bounded PAUSE_RESURFACE_SECS recheck instead of escalating on the wedge
+        # cadence. test_enriched_wedge_under_declared_wait_uses_pause_cadence pins
+        # the full cadence, including the one recheck that still re-surfaces it.
+        [ ! -s "$state/.subsuper-escalations" ] \
+          || fail "paused enriched wedge escalated instead of routing to the pause cadence: $(cat "$state/.subsuper-escalations")"
+        [ -e "$state/.subsuper-paused-$key" ] \
+          || fail "paused enriched wedge erased ordinary pause tracking" ;;
+      *)
+        [ "$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')" = 1 ] \
+          || fail "$case_name enriched wedge did not produce exactly one escalation"
+        grep -F "${reason#stale: }" "$state/.subsuper-escalations" >/dev/null \
+          || fail "$case_name enriched wedge lost its demand-deep-inspection detail"
+        [ ! -e "$state/.subsuper-paused-$key" ] \
+          || fail "$case_name enriched wedge created pause tracking" ;;
+    esac
     [ ! -e "$state/.subsuper-stale-$key" ] \
       || fail "$case_name enriched wedge retained ordinary stale tracking"
-    case "$case_name" in
-      paused) [ -e "$state/.subsuper-paused-$key" ] \
-        || fail "paused enriched wedge erased ordinary pause tracking" ;;
-      *) [ ! -e "$state/.subsuper-paused-$key" ] \
-        || fail "$case_name enriched wedge created pause tracking" ;;
-    esac
     [ ! -s "$action_log" ] \
       || fail "$case_name enriched wedge interrupted or killed the busy worker"
   done
-  pass "enriched stale wedges bypass status absorption without disturbing busy workers"
+  pass "enriched stale wedges bypass status absorption except under a declared wait, without disturbing busy workers"
+}
+
+# The second half of issue #3149. The watcher's wedge timer emits an enriched
+# "idle Ns, possible wedge, escalation N" reason for any pane it reads as frozen -
+# including one whose crew has a CURRENT declared wait, because the watcher's own
+# provably-working classification and the crew's status line can disagree (a crew
+# that declares `paused:` while its no-mistakes run is still attributed to its code
+# reads `working` to pause_state_class and takes the wedge timer). handle_wake's
+# enriched-wedge override force-escalated every such reason, discarding the `pause`
+# verdict classify_stale had already returned for the same pane, so a healthy
+# declared wait was escalated once per STALE_ESCALATE_SECS for as long as it lasted.
+# A declaration is categorically stronger than the run-step/pane state the enriched
+# reason tells the supervisor not to re-absorb on, so it routes the pane to the long
+# PAUSE_RESURFACE_SECS recheck instead. This drives repeated enriched wedges through
+# the real handle_wake/housekeeping pair and asserts the cadence, not just one wake.
+test_enriched_wedge_under_declared_wait_uses_pause_cadence() {
+  local dir state fakebin task win pane key reason i escalations
+  dir=$(make_supercase enriched-wedge-declared-wait)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  task=paused-wedge-w1; win="sess:fm-$task"; pane="$dir/pane.txt"
+  key=$(printf '%s' "$task" | tr ':/.' '___')
+  fm_write_meta "$state/$task.meta" "window=$win" "backend=tmux"
+  printf 'working: dispatching the long audit\npaused: the audit engine is running to completion\n' \
+    > "$state/$task.status"
+  printf 'idle prompt $\n' > "$pane"
+  case "$(FM_STATE_OVERRIDE="$state" classify_stale "$win" "$state")" in
+    pause\|*) ;;
+    *) fail "the fixture's own classifier verdict is not a pause, so this case pins nothing about the override" ;;
+  esac
+
+  # Four consecutive wedge-cadence deliveries, exactly as the watcher emits them once
+  # a pane crosses STALE_ESCALATE_SECS repeatedly.
+  for i in 2 3 4 5; do
+    if [ "$i" -ge 3 ]; then
+      # Past FM_WEDGE_DEMAND_INSPECT_COUNT the watcher enriches the same reason with
+      # its demand-deep-inspection marker; a declaration outranks both forms.
+      reason="stale: $win (idle 250s, possible wedge, escalation $i, demand-deep-inspection: same pane has wedge-escalated $i times in a row - do not re-absorb on the run-step/pane state alone)"
+    else
+      reason="stale: $win (idle 250s, possible wedge, escalation $i)"
+    fi
+    LOG="$dir/daemon.log" FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 \
+      FM_STALE_ESCALATE_SECS=240 FM_PAUSE_RESURFACE_SECS=3600 housekeeping "$state"
+  done
+
+  [ ! -s "$state/.subsuper-escalations" ] \
+    || fail "a declared wait escalated inside one PAUSE_RESURFACE_SECS window: $(cat "$state/.subsuper-escalations")"
+  [ -e "$state/.subsuper-paused-$key" ] \
+    || fail "an enriched wedge under a declared wait did not record pause tracking"
+  [ ! -e "$state/.subsuper-stale-$key" ] \
+    || fail "an enriched wedge under a declared wait left wedge aging in place"
+
+  # Past PAUSE_RESURFACE_SECS the wait must re-surface exactly once as an
+  # awaiting-external recheck (never a wedge) and reset its window.
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 FM_PAUSE_RESURFACE_SECS=3600 \
+    housekeeping "$state"
+  escalations=0
+  [ -s "$state/.subsuper-escalations" ] \
+    && escalations=$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')
+  [ "$escalations" = 1 ] || fail "the pause window produced $escalations escalations, expected exactly one recheck"
+  grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null \
+    || fail "the one pause-window escalation was not an awaiting-external recheck"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null \
+    && fail "the pause-window recheck was mislabeled a possible wedge"
+
+  # A later status append that stops declaring the wait ends the routing: the same
+  # enriched wedge escalates again, unchanged.
+  : > "$state/.subsuper-escalations"
+  printf 'working: the audit finished, resuming\n' >> "$state/$task.status"
+  reason="stale: $win (idle 250s, possible wedge, escalation 6)"
+  LOG="$dir/daemon.log" FM_STATE_OVERRIDE="$state" handle_wake "$reason" "$state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 FM_PAUSE_RESURFACE_SECS=3600 \
+    housekeeping "$state"
+  grep -F "${reason#stale: }" "$state/.subsuper-escalations" >/dev/null \
+    || fail "wedge escalation was not restored after the crew left its declared wait"
+  [ ! -e "$state/.subsuper-paused-$key" ] \
+    || fail "pause tracking survived a status append that no longer declares the wait"
+  pass "an enriched wedge under a declared wait uses the pause cadence and restores wedge detection on resume"
 }
 
 test_stale_terminal_escalates() {
@@ -218,6 +308,21 @@ test_stale_paused_classifies_pause() {
   out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-held-w9" "$state")
   case "$out" in pause\|*) ;; *) fail "declared pause did not classify as pause: $out" ;; esac
   pass "paused reasons with captain phrases remain pause-classified"
+}
+
+# A verified captain-held transfer is the other declaration that leaves an idle pane
+# EXPECTED, so it earns the same pause action as paused: rather than being aged as a
+# wedge. The wait itself is already durable in the captain-held backlog task.
+test_stale_captain_held_classifies_pause() {
+  local dir state out held_reason
+  dir=$(make_supercase stale-captain-held)
+  state="$dir/state"
+  held_reason='captain-held [key=route]: tracked by task-decision-route'
+  status_is_captain_relevant "$held_reason" && fail "a captain-held transfer line was treated as captain-relevant"
+  printf '%s\n' "$held_reason" > "$state/held-w9h.status"
+  out=$(FM_STATE_OVERRIDE="$state" classify_stale "sess:fm-held-w9h" "$state")
+  case "$out" in pause\|*) ;; *) fail "captain-held transfer did not classify as pause: $out" ;; esac
+  pass "a captain-held transfer classifies as pause, not as a wedge candidate"
 }
 
 # handle_wake on a paused stale records a pause marker, drops any pre-existing wedge
@@ -342,6 +447,7 @@ test_housekeeping_paused_resurfaces_and_resets() {
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
   grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "declared pause was not re-surfaced as an awaiting-external recheck"
+  grep -F "awaiting the captain" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "declared pause named the captain instead of its external dependency"
   grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "declared pause was mislabeled a possible wedge"
   [ -e "$state/.subsuper-paused-$key" ] || fail "pause marker cleared instead of reset for the next window"
   age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
@@ -349,14 +455,49 @@ test_housekeeping_paused_resurfaces_and_resets() {
   pass "housekeeping re-surfaces a stale declared pause on the long cadence and resets its window"
 }
 
-# A pause whose pane became busy again (the crew resumed) drops its marker without
-# escalating, exactly like a resumed wedge.
+# The other half of quieting a captain-held task: it must NOT be silenced outright.
+# fm-classify-lib.sh's cadence comment is explicit that a forgotten hold cannot rot
+# invisibly, so a held task re-surfaces on the same bounded window as a pause, with
+# its marker reset so the window repeats instead of firing once. The digest the
+# captain reads must also name the captain rather than an external dependency: the
+# hold is waiting on the one person reading the digest, so borrowing the pause verb's
+# awaiting-external wording would point them away from being the blocker.
+test_housekeeping_captain_held_resurfaces_and_resets() {
+  local dir state fakebin win pane key age
+  dir=$(make_supercase captain-held-resurface)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-w11h"; pane="$dir/pane.txt"
+  printf 'captain-held [key=route]: tracked by task-decision-route\n' > "$state/held-w11h.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w11h" | tr ':/.' '___')
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  grep -F "awaiting the captain" "$state/.subsuper-escalations" >/dev/null 2>&1 || fail "a captain hold was silenced entirely instead of re-surfacing as a captain-owned recheck: $(cat "$state/.subsuper-escalations" 2>/dev/null || true)"
+  grep -F "awaiting external" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "a captain hold was re-surfaced as an external wait, hiding that the captain is the blocker"
+  grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null 2>&1 && fail "a captain hold was re-surfaced as a possible wedge"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "captain-held marker cleared instead of reset for the next window"
+  age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
+  [ "$age" -lt 60 ] || fail "captain-held marker was not reset to now on re-surface (age ${age}s)"
+  pass "housekeeping re-surfaces a forgotten captain hold on the long cadence and resets its window"
+}
+
+# A crew that RESUMED - whose latest status line no longer declares the wait - drops
+# its pause tracking without escalating. The dimension pinned here is that pane busy
+# state does not GATE that clear: the status append alone ends the wait, on the
+# reconcile path the loop head runs before the pause recheck ever reads a pane, so a
+# crew that resumed into a genuinely busy pane cannot hold a stale window open. The
+# fixture asserts its own busy verdict first, so it cannot silently decay into an
+# idle-pane case (already covered by test_housekeeping_paused_unpaused_cleared) and
+# keep claiming that dimension. The inverse - a busy pane that is STILL declaring the
+# wait - is test_housekeeping_busy_declared_wait_matures_its_window.
 test_housekeeping_paused_resumed_cleared() {
   local dir state fakebin win pane key
   dir=$(make_supercase paused-resumed)
   state="$dir/state"; fakebin="$dir/fakebin"
   win="sess:fm-held-w12"; pane="$dir/pane.txt"
-  printf 'paused: holding for the upstream tool release\n' > "$state/held-w12.status"
+  printf 'paused: holding for the upstream tool release\nworking: upstream landed, resuming\n' \
+    > "$state/held-w12.status"
   printf 'Working...\n' > "$pane"
   fm_write_meta "$state/held-w12.meta" "window=$win" "worktree=$dir/wt" "kind=ship" "harness=pi"
   local gen; gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" held-w12)
@@ -365,10 +506,94 @@ test_housekeeping_paused_resumed_cleared() {
   key=$(printf '%s' "held-w12" | tr ':/.' '___')
   echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
   PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" stale_window_is_busy "$win" "$state" \
+    || fail "the resumed-pause fixture does not actually read busy, so it pins nothing about busy state"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
     FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
-  [ -e "$state/.subsuper-paused-$key" ] && fail "resumed (busy) pause marker was not cleared"
+  [ -e "$state/.subsuper-paused-$key" ] && fail "resumed (busy, no longer declaring) pause marker was not cleared"
   [ ! -s "$state/.subsuper-escalations" ] || fail "a resumed pause was escalated"
-  pass "housekeeping clears a paused marker whose pane became busy again, without escalating"
+  pass "a busy pane cannot gate the pause clear once its crew's status no longer declares the wait"
+}
+
+# The inverse of test_housekeeping_paused_resumed_cleared, and the first half of
+# issue #3149. A declared wait can legitimately hold a pane BUSY - a worker parked on
+# a long foreground call it keeps live for as long as the wait lasts - so a busy
+# verdict is not evidence that the crew resumed. Reading it as one dropped the marker
+# un-escalated, and migrate_watcher_pause_markers recreated it with a fresh timestamp
+# on the very next tick, so the window restarted forever and the wait never matured
+# into its one recheck. Away mode makes that terminal: the watcher hands a busy
+# declared wait to the daemon exactly once per declaration (bin/fm-watch.sh's
+# busy_turn_bound_check), so this recheck is the only thing left that can re-surface
+# the pane at all. Both declaration forms take the same 2b arm, so both are pinned.
+test_housekeeping_busy_declared_wait_matures_its_window() {
+  local case_name dir state fakebin task win pane key gen tick age escalations digest
+  for case_name in paused captain-held; do
+    dir=$(make_supercase "busy-declared-wait-$case_name")
+    state="$dir/state"; fakebin="$dir/fakebin"
+    task="held-w12b-$case_name"; win="sess:fm-$task"; pane="$dir/pane.txt"
+    case "$case_name" in
+      paused) printf 'paused: the audit engine is running to completion\n' > "$state/$task.status"
+              digest="awaiting external" ;;
+      captain-held) printf 'captain-held [key=route]: tracked by task-decision-route\n' > "$state/$task.status"
+              digest="awaiting the captain" ;;
+    esac
+    printf 'Working...\n' > "$pane"
+    fm_write_meta "$state/$task.meta" "window=$win" "worktree=$dir/wt" "kind=ship" "harness=pi"
+    gen=$("$ROOT/bin/fm-busy-event.sh" arm "$state" "$task")
+    "$ROOT/bin/fm-busy-event.sh" apply "$state" "$task" busy --gen "$gen" \
+      --source pi-ext --event agent-start
+    key=$(printf '%s' "$task" | tr ':/.' '___')
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" stale_window_is_busy "$win" "$state" \
+      || fail "the $case_name fixture does not actually read busy, so it pins nothing about busy state"
+
+    # Immature window: ticks inside PAUSE_RESURFACE_SECS neither escalate nor let the
+    # marker the window ages against be recreated with a fresh timestamp.
+    echo $(( $(date +%s) - 100 )) > "$state/.subsuper-paused-$key"
+    for tick in 1 2 3; do
+      PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+        FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 FM_PAUSE_RESURFACE_SECS=3600 \
+        housekeeping "$state"
+      [ -e "$state/.subsuper-paused-$key" ] \
+        || fail "$case_name busy declared wait lost its marker on tick $tick inside the window"
+      age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
+      [ "$age" -ge 100 ] \
+        || fail "$case_name tick $tick restarted the maturing window (age fell to ${age}s)"
+    done
+    [ ! -s "$state/.subsuper-escalations" ] \
+      || fail "$case_name busy declared wait escalated inside its PAUSE_RESURFACE_SECS window"
+
+    # Matured window: exactly one recheck, named for the right human, never a wedge,
+    # and the window reset so the next one repeats rather than firing once.
+    echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 FM_PAUSE_RESURFACE_SECS=3600 \
+      housekeeping "$state"
+    escalations=0
+    [ -s "$state/.subsuper-escalations" ] \
+      && escalations=$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')
+    [ "$escalations" = 1 ] \
+      || fail "$case_name busy declared wait produced $escalations escalations past its window, expected exactly one"
+    grep -F "$digest" "$state/.subsuper-escalations" >/dev/null \
+      || fail "$case_name busy declared wait was not re-surfaced as a '$digest' recheck: $(cat "$state/.subsuper-escalations")"
+    grep -F "possible wedge" "$state/.subsuper-escalations" >/dev/null \
+      && fail "$case_name busy declared wait was mislabeled a possible wedge"
+    [ -e "$state/.subsuper-paused-$key" ] \
+      || fail "$case_name busy declared wait cleared its marker instead of resetting the window"
+    age=$(( $(date +%s) - $(cat "$state/.subsuper-paused-$key" 2>/dev/null || echo 0) ))
+    [ "$age" -lt 60 ] || fail "$case_name busy declared wait did not reset its window to now (age ${age}s)"
+
+    # The next tick, still inside the fresh window, stays silent: one recheck per window.
+    PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+      FM_STATE_OVERRIDE="$state" FM_ESCALATE_BATCH_SECS=999999 FM_PAUSE_RESURFACE_SECS=3600 \
+      housekeeping "$state"
+    escalations=0
+    [ -s "$state/.subsuper-escalations" ] \
+      && escalations=$(wc -l < "$state/.subsuper-escalations" | tr -d ' ')
+    [ "$escalations" = 1 ] \
+      || fail "$case_name busy declared wait re-surfaced again inside its reset window ($escalations escalations)"
+  done
+  pass "housekeeping matures a busy pane's declared-wait window into exactly one recheck per window"
 }
 
 # A pane still idle but whose status is no longer a pause (the crew changed state
@@ -390,6 +615,25 @@ test_housekeeping_paused_unpaused_cleared() {
   pass "housekeeping clears a paused marker once the crew is no longer declaring the pause"
 }
 
+# Once the captain answers, the hold is no longer a declared wait: the resolved line
+# takes over the last-line read, so the pause cadence must stop claiming the task
+# rather than keep re-surfacing a settled decision.
+test_housekeeping_captain_held_resolved_cleared() {
+  local dir state fakebin win pane key
+  dir=$(make_supercase captain-held-resolved)
+  state="$dir/state"; fakebin="$dir/fakebin"
+  win="sess:fm-held-w13h"; pane="$dir/pane.txt"
+  printf 'captain-held [key=route]: tracked by task-decision-route\nresolved [key=route]: captain chose the direct path\n' > "$state/held-w13h.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w13h" | tr ':/.' '___')
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-paused-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_PAUSE_RESURFACE_SECS=240 housekeeping "$state"
+  [ -e "$state/.subsuper-paused-$key" ] && fail "an answered captain hold kept its pause marker"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "an answered captain hold was re-surfaced as a declared wait"
+  pass "housekeeping clears the pause marker once a captain hold is answered"
+}
+
 test_housekeeping_stale_marker_transitions_to_pause() {
   local dir state fakebin win pane key
   dir=$(make_supercase stale-to-paused)
@@ -404,6 +648,25 @@ test_housekeeping_stale_marker_transitions_to_pause() {
   [ ! -e "$state/.subsuper-stale-$key" ] || fail "existing stale marker remained wedge-aged after pause"
   [ ! -s "$state/.subsuper-escalations" ] || fail "a newly declared pause was escalated as a possible wedge"
   pass "housekeeping moves an existing stale marker to pause before wedge escalation"
+}
+
+# The quieting half for a captain hold. A finished task marked captain-held is idle by
+# design, so an already-aged wedge marker converts to pause tracking on the next sweep
+# instead of firing the possible-wedge escalation.
+test_housekeeping_captain_held_stale_marker_transitions_to_pause() {
+  local dir state fakebin win pane key
+  dir=$(make_supercase stale-to-captain-held)
+  state="$dir/state"; fakebin="$dir/fakebin"; win="sess:fm-held-w14h"; pane="$dir/pane.txt"
+  printf 'captain-held [key=route]: tracked by task-decision-route\n' > "$state/held-w14h.status"
+  printf 'idle prompt $\n' > "$pane"
+  key=$(printf '%s' "held-w14h" | tr ':/.' '___')
+  echo $(( $(date +%s) - 5000 )) > "$state/.subsuper-stale-$key"
+  PATH="$fakebin:$PATH" FM_FAKE_TMUX_WINDOW="$win" FM_FAKE_TMUX_CAPTURE="$pane" \
+    FM_STATE_OVERRIDE="$state" FM_STALE_ESCALATE_SECS=240 housekeeping "$state"
+  [ -e "$state/.subsuper-paused-$key" ] || fail "a captain hold did not move its stale marker to pause tracking"
+  [ ! -e "$state/.subsuper-stale-$key" ] || fail "a captain hold remained wedge-aged"
+  [ ! -s "$state/.subsuper-escalations" ] || fail "a captain hold was escalated as a possible wedge"
+  pass "housekeeping moves a captain hold's existing stale marker to pause before wedge escalation"
 }
 
 test_housekeeping_pause_marker_transitions_to_clear() {
@@ -1570,8 +1833,8 @@ test_inject_wedge_alarm_throttles_when_marker_cannot_be_written() {
 }
 
 test_fm_send_reports_delivered_unconfirmed_submit() {
-  # When text was typed and Enter sent but the submit read-back remains pending,
-  # fm-send must return its documented delivered-unconfirmed status and prevent
+  # When typed-plane text was typed and Enter sent but the submit read-back
+  # remains pending, fm-send must return its documented delivered-unconfirmed status and prevent
   # a duplicate resend reflex. A synchronously confirmed submit remains zero.
   local dir fakebin err rc
   dir=$(make_bordered_case send-swallow)
@@ -1851,8 +2114,10 @@ test_classify_terminal_signal_escalates
 test_classify_check_and_unknown_escalate
 test_stale_transient_self_records_marker
 test_stale_diagnostic_wedge_survives_busy_housekeeping
+test_enriched_wedge_under_declared_wait_uses_pause_cadence
 test_stale_terminal_escalates
 test_stale_paused_classifies_pause
+test_stale_captain_held_classifies_pause
 test_handle_wake_paused_records_pause_marker
 test_handle_wake_paused_signal_records_pause_marker
 test_handle_wake_terminal_signal_clears_pause_tracking
@@ -1862,9 +2127,13 @@ test_housekeeping_seeds_pause_marker_from_status
 test_housekeeping_persistent_stale_escalates
 test_housekeeping_resumed_stale_cleared
 test_housekeeping_paused_resurfaces_and_resets
+test_housekeeping_captain_held_resurfaces_and_resets
 test_housekeeping_paused_resumed_cleared
+test_housekeeping_busy_declared_wait_matures_its_window
 test_housekeeping_paused_unpaused_cleared
+test_housekeeping_captain_held_resolved_cleared
 test_housekeeping_stale_marker_transitions_to_pause
+test_housekeeping_captain_held_stale_marker_transitions_to_pause
 test_housekeeping_pause_marker_transitions_to_clear
 test_housekeeping_herdr_persistent_stale_resolves_meta
 test_housekeeping_herdr_idle_busy_record_clears_stale
