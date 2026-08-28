@@ -992,6 +992,51 @@ test_open_generation_claim_defers_without_any_lock() {
   pass "auto-arm: a live open generation claim defers concurrent firings with no lock held"
 }
 
+# The 2026-08-27 primary lapse left a stale generation owned by a dead hook
+# process at outcome=rewake. A concurrent short ledger section must not turn
+# that recoverable terminal claim into another whole Stop firing with no arm:
+# the claimant waits within the guard's synchronization window, rechecks the
+# generation under the mutex, and either supersedes it or loses to the one
+# firing that did. Exercise every recorded outcome because owner death, not the
+# predecessor's last outcome, is what makes the generation reclaimable.
+test_dead_generation_reclaims_after_transient_mutex_contention() {
+  local outcome dir out status dead holder i
+  for outcome in rewake arming clean afk failed failed-suppressed; do
+    dir=$(make_primary_dir "$TMP_ROOT/v2-dead-$outcome-contended")
+    : > "$dir/state/task1.meta"
+    write_arm_fixture "$dir" actionable
+    true &
+    dead=$!
+    wait "$dead"
+    printf 'epoch=8850 owner_pid=%s outcome=%s updated_at=1787894191\nstale-owner-identity\n' \
+      "$dead" "$outcome" > "$dir/state/.claude-autoarm-epoch"
+    touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+    (
+      FM_HOME="$dir" bash -c '
+        . "$FM_HOME/bin/fm-wake-lib.sh"
+        fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+        : > "$FM_HOME/state/mutex-ready"
+        sleep 0.6
+        fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+      '
+    ) &
+    holder=$!
+    i=0
+    while [ ! -e "$dir/state/mutex-ready" ]; do
+      [ "$i" -lt 50 ] || fail "transient mutex holder never became ready for outcome=$outcome"
+      sleep 0.02
+      i=$((i + 1))
+    done
+    out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+    wait "$holder"
+    expect_code 2 "$status" "a dead outcome=$outcome generation must reclaim within the same Stop firing after transient mutex contention"
+    [ -e "$dir/state/arm-ran" ] || fail "dead outcome=$outcome generation left the home unarmed after contention"
+    assert_contains "$out" "firstmate watcher wake" "dead outcome=$outcome reclaim did not translate its wake"
+    [ "$(epoch_field "$dir" epoch)" -gt 8850 ] || fail "dead outcome=$outcome generation was not superseded"
+  done
+  pass "auto-arm: dead generation claims in every outcome reclaim within one contended Stop firing"
+}
+
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
 # owner whose ledger entry and watcher beacon are both older than grace is
 # stuck, and the next firing supersedes it by taking the next generation.
@@ -1180,6 +1225,7 @@ test_terminal_check_claim_is_never_reclaimed
 test_stuck_live_legacy_owner_is_retired_and_reclaimed
 test_stopped_legacy_owner_is_reclaimed_with_term_pending
 test_open_generation_claim_defers_without_any_lock
+test_dead_generation_reclaims_after_transient_mutex_contention
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm

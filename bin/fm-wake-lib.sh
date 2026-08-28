@@ -1123,10 +1123,12 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
 # Atomically publish this process as the owner of generation N+1, under one
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
 # when a competing claimant won the race (the ledger holds an open claim), and
-# 1 when the micro-mutex is contended, the mandatory identity cannot be
-# computed, or the write failed.
+# 1 when bounded micro-mutex retries are exhausted, the mandatory identity
+# cannot be computed, or the write failed. A contender rechecks for an open
+# winner between retries, so concurrent Stop firings still converge on exactly
+# one generation without making a recoverable dead claim wait for another Stop.
 fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp role i
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -1136,7 +1138,21 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   pid=${BASHPID:-$$}
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
-  fm_lock_try_acquire "$lock" || return 1
+  i=0
+  while ! fm_lock_try_acquire "$lock"; do
+    # A concurrent firing that published while this one waited owns the cycle.
+    # Observe it directly instead of spending the rest of the bounded retry
+    # window or racing it after its short ledger section releases the mutex.
+    fm_autoarm_claim_open "$state" "$grace" && return 2
+    # Role-carrying holds are long-lived legacy claims or the guard's terminal
+    # check, not a current generation's short ledger section. The caller owns
+    # their separate defer-or-reclaim path.
+    role=$(fm_lock_role "$lock" 2>/dev/null || true)
+    [ -z "$role" ] || return 1
+    [ "$i" -lt 30 ] || return 1
+    sleep 0.02
+    i=$((i + 1))
+  done
   if fm_autoarm_claim_open "$state" "$grace"; then
     fm_lock_release "$lock"
     return 2
