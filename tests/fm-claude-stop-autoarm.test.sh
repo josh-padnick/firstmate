@@ -1016,7 +1016,7 @@ test_dead_generation_reclaims_after_transient_mutex_contention() {
         . "$FM_HOME/bin/fm-wake-lib.sh"
         fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
         : > "$FM_HOME/state/mutex-ready"
-        sleep 0.6
+        sleep 0.2
         fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
       '
     ) &
