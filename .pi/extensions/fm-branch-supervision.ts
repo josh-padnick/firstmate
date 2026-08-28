@@ -6,8 +6,9 @@
 // real tools and reports through the fm_branch_report custom tool, which
 // writes the durable outcome store FIRST (bin/fm-branch-outcome.sh) and then
 // merges an append-only note to main's tail. Main's captain/assistant dialog
-// is mirrored into the branch as read-only fm-main-mirror context at main's
-// turn_end. Pi-only by construction: this file lives in .pi/extensions, so no
+// is mirrored into the branch as read-only fm-main-mirror context from Pi's
+// before_agent_start prompt and at main's turn_end. Pi-only by construction: this
+// file lives in .pi/extensions, so no
 // other harness ever loads it. Supervision is default-on for every task once
 // this Pi session owns the fleet lock: no captain grant file is required.
 // Away mode (or a broken branch) keeps today's wake-to-main behavior
@@ -95,7 +96,10 @@ import {
   FOLLOW_MAIN_VALUE,
   type BranchPickerItem,
 } from "./lib/fm-branch-model-picker.ts";
-import { encodeFirstmateOperationalInput } from "./lib/fm-operational-input.ts";
+import {
+  classifyFirstmateOperationalText,
+  encodeFirstmateOperationalInput,
+} from "./lib/fm-operational-input.ts";
 
 const extensionFile = fileURLToPath(import.meta.url);
 const extensionDir = dirname(extensionFile);
@@ -129,11 +133,18 @@ const MIRROR_MESSAGE_CAP = 4000;
 const MERGE_NOTE_BOAT = "⛵";
 // Carried inside the captain note's own text because that text is the only
 // part of a custom message Pi gives the model (see mergeIntoMain).
+//
+// The note still needs to identify itself so main cannot mistake an incoming
+// outcome for its own earlier answer and silently lose the outcome. Event
+// ownership forbids a second fleet operation, while the captain-facing verdict
+// requires a visible response and leaves its wording to main.
 const CAPTAIN_OUTCOME_INSTRUCTION =
   "This is a supervision outcome delivered automatically by the supervision branch. " +
-  "It was not typed by the captain and it is not your own earlier output. " +
-  "Relay only this outcome to the captain now, in one short message, in captain outcome language. " +
-  "Do not restate or repeat any earlier answer.";
+  "It was not typed by the captain. " +
+  "The fleet event is already handled: do not re-drain, re-run, or acknowledge it. " +
+  "This outcome is captain-facing: give the captain a visible response now. " +
+  "Use your judgment over the wording and how to incorporate it, not whether to surface it. " +
+  "An outcome that directly answers an explicit captain request is captain-facing, regardless of whether it is healthy, routine, measured, actionable, or requires a decision.";
 type MirrorItem = { tag: "captain" | "main"; text: string };
 type MirrorCursor = { file: string; index: number };
 type Verdict = "routine" | "captain";
@@ -294,15 +305,17 @@ function textOfContent(content: unknown): string {
 // Operational injections (watcher wakes, away-supervisor escalations, launch
 // briefs) are fleet machinery, not captain dialog; the report's volume
 // analysis counts them apart from dialog, and mirroring them would feed the
-// branch its own supervision traffic back. Current injections start with the
-// U+2063 operational prefix; the plain legacy form starts with FIRSTMATE.
+// branch its own supervision traffic back.
 function isOperationalUserText(text: string): boolean {
-  return text.startsWith("⁣") || /^FIRSTMATE[ _]/.test(text);
+  return classifyFirstmateOperationalText(text) !== undefined;
 }
 
 function capMirrorText(text: string): string {
   if (text.length <= MIRROR_MESSAGE_CAP) return text;
-  return `${text.slice(0, MIRROR_MESSAGE_CAP)}\n[mirror truncated at ${MIRROR_MESSAGE_CAP} characters]`;
+  const headLength = Math.ceil(MIRROR_MESSAGE_CAP / 2);
+  const tailLength = MIRROR_MESSAGE_CAP - headLength;
+  const omitted = text.length - MIRROR_MESSAGE_CAP;
+  return `${text.slice(0, headLength)}\n[mirror truncated: ${omitted} characters omitted]\n${text.slice(-tailLength)}`;
 }
 
 function readMirrorCursor(): MirrorCursor {
@@ -336,6 +349,10 @@ type ReadonlyEntries = {
 type MirrorCollectionState = {
   collectAnchor: MirrorCursor | null;
   pendingCursor: MirrorCursor | null;
+  // Pi emits before_agent_start before it appends that turn's user message to
+  // SessionManager. The prompt is mirrored from the event immediately, then
+  // this marker suppresses the same persisted entry when turn_end collects it.
+  stagedCaptain: { file: string; index: number; text: string } | null;
 };
 
 function collectMainDialog(sessionManager: ReadonlyEntries, collection: MirrorCollectionState): MirrorItem[] {
@@ -343,8 +360,20 @@ function collectMainDialog(sessionManager: ReadonlyEntries, collection: MirrorCo
   const entries = sessionManager.getEntries();
   const anchor = collection.collectAnchor ?? readMirrorCursor();
   const start = anchor.file === file ? Math.min(anchor.index, entries.length) : 0;
+  let currentCaptainIndex = -1;
+  for (let index = entries.length - 1; index >= start; index -= 1) {
+    const entry = entries[index];
+    if (entry.type !== "message") continue;
+    const message = (entry as { message?: { role?: string; content?: unknown } }).message;
+    if (message?.role !== "user") continue;
+    const text = textOfContent(message.content).trim();
+    if (!text || isOperationalUserText(text)) continue;
+    currentCaptainIndex = index;
+    break;
+  }
   const items: MirrorItem[] = [];
-  for (const entry of entries.slice(start)) {
+  for (let index = start; index < entries.length; index += 1) {
+    const entry = entries[index];
     if (entry.type !== "message") continue;
     const message = (entry as { message?: { role?: string; content?: unknown } }).message;
     if (!message) continue;
@@ -352,7 +381,20 @@ function collectMainDialog(sessionManager: ReadonlyEntries, collection: MirrorCo
     const text = textOfContent(message.content).trim();
     if (!text) continue;
     if (message.role === "user" && isOperationalUserText(text)) continue;
-    items.push({ tag: message.role === "user" ? "captain" : "main", text: capMirrorText(text) });
+    const staged = collection.stagedCaptain;
+    if (
+      message.role === "user" &&
+      staged?.file === file &&
+      staged.index === index &&
+      staged.text === text
+    ) {
+      collection.stagedCaptain = null;
+      continue;
+    }
+    items.push({
+      tag: message.role === "user" ? "captain" : "main",
+      text: index === currentCaptainIndex ? text : capMirrorText(text),
+    });
   }
   collection.collectAnchor = { file, index: entries.length };
   collection.pendingCursor = collection.collectAnchor;
@@ -375,7 +417,12 @@ export default function (pi: ExtensionAPI) {
   // serially by design).
   let branchChain: Promise<void> = Promise.resolve();
   const pendingMirror: MirrorItem[] = [];
-  const mirrorCollection: MirrorCollectionState = { collectAnchor: null, pendingCursor: null };
+  const mirrorCollection: MirrorCollectionState = {
+    collectAnchor: null,
+    pendingCursor: null,
+    stagedCaptain: null,
+  };
+  let currentMainSession: ReadonlyEntries | null = null;
   // One revision for BOTH selections: a model or effort change invalidates an
   // in-flight branch build exactly the same way.
   let branchSelectionRevision = 0;
@@ -562,10 +609,11 @@ export default function (pi: ExtensionAPI) {
   // therefore has to carry its own identity inside `content`, or main receives
   // an unattributed user message written in main's own captain-facing voice
   // and cannot tell an incoming outcome from its own earlier answer. When that
-  // happens main re-emits its previous answer instead of relaying the outcome,
-  // and the outcome is lost. The typed operational envelope is what makes the
-  // note self-describing; it stays invisible to the captain because the note
-  // is never rendered.
+  // happens main can lose the outcome while deciding how to handle it. The
+  // typed operational envelope is what makes the note self-describing; it stays
+  // invisible to the captain because the note is never rendered. The
+  // instruction preserves the event-ownership boundary while requiring the
+  // captain-facing response and leaving its wording to main.
   //
   // Encoding shells out, so it can fail on a broken checkout. This file's
   // failure direction applies: an outcome that cannot be typed is still
@@ -621,7 +669,8 @@ export default function (pi: ExtensionAPI) {
       parameters: Type.Object({
         task: Type.String({ description: "The task id the event belongs to (or 'fleet' for fleet-wide events)" }),
         verdict: Type.Union([Type.Literal("routine"), Type.Literal("captain")], {
-          description: "captain only for what a human must see; routine otherwise",
+          description:
+            "Use captain unconditionally for an outcome that directly answers an explicit captain request, regardless of whether it is healthy, routine, measured, actionable, or requires a decision. Also use captain for work ready for review, captain-only decisions, blockers or failures after recovery is exhausted, needed credentials, and destructive, irreversible, or security-sensitive actions; use routine otherwise.",
         }),
         summary: Type.String({
           description:
@@ -930,6 +979,16 @@ ${context.command}
       });
   }
 
+  function collectCurrentMainDialog(): boolean {
+    if (!currentMainSession) return true;
+    try {
+      pendingMirror.push(...collectMainDialog(currentMainSession, mirrorCollection));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function enqueueMirrorFlush(): void {
     if (!branch || pendingMirror.length === 0) return;
     const flushGeneration = generation;
@@ -955,8 +1014,27 @@ ${context.command}
     if (!actingAsOwner()) return; // cold start pre-lock, secondary session, or shutdown
     if (afkActive()) return; // the away daemon owns supervision while afk
     if (branchBroken) return; // fail back to today's wake-to-main path
+    if (!collectCurrentMainDialog()) return;
     offer.accept();
     enqueueWake(offer.message, generation);
+  });
+
+  pi.on?.("before_agent_start", (event, ctx) => {
+    rememberMainModel(ctx);
+    currentMainSession = ctx?.sessionManager ?? null;
+    if (!actingAsOwner() || !currentMainSession || !collectCurrentMainDialog()) return;
+
+    // This event is Pi's authoritative complete current prompt. At this point
+    // SessionManager still contains only the preceding dialog, so relying on
+    // getEntries() here loses the captain request that the next wake may answer.
+    // Stage it verbatim and remember the future persisted index for turn_end's
+    // duplicate suppression. Operational extension injections are not dialog.
+    const prompt = event.prompt.trim();
+    if (!prompt || isOperationalUserText(prompt)) return;
+    const file = currentMainSession.getSessionFile() ?? "";
+    const index = mirrorCollection.collectAnchor?.index ?? currentMainSession.getEntries().length;
+    pendingMirror.push({ tag: "captain", text: prompt });
+    mirrorCollection.stagedCaptain = { file, index, text: prompt };
   });
 
   pi.on?.("agent_start", () => {
@@ -969,18 +1047,16 @@ ${context.command}
     mainStreaming = false;
   });
 
-  // Mirror at main's turn_end: collect the new captain/assistant dialog into
-  // the volatile queue, then deliver it through the serialized chain so it
-  // lands before any later wake. The durable cursor advances only in
+  // before_agent_start stages Pi's authoritative in-flight prompt before
+  // SessionManager persists it. The dispatch handler then collects any newly
+  // persisted dialog immediately before accepting a wake, so all context joins
+  // the serialized chain before that wake's branch prompt. turn_end remains
+  // the idle-path mirror flush. The durable cursor advances only in
   // flushMirror after the complete pending batch reaches the branch.
   pi.on?.("turn_end", (_event, ctx) => {
     rememberMainModel(ctx);
-    if (!actingAsOwner()) return;
-    try {
-      pendingMirror.push(...collectMainDialog(ctx.sessionManager, mirrorCollection));
-    } catch {
-      return;
-    }
+    currentMainSession = ctx.sessionManager;
+    if (!actingAsOwner() || !collectCurrentMainDialog()) return;
     enqueueMirrorFlush();
   });
 
@@ -993,6 +1069,7 @@ ${context.command}
   // recorded pointer. Terminal quit simply never fires another session_start.
   pi.on?.("session_start", (_event, ctx) => {
     rememberMainModel(ctx);
+    currentMainSession = ctx?.sessionManager ?? null;
     shuttingDown = false;
     branchBroken = "";
     generation += 1;
@@ -1030,8 +1107,10 @@ ${context.command}
     shuttingDown = true;
     generation += 1;
     pendingMirror.length = 0;
+    currentMainSession = null;
     mirrorCollection.collectAnchor = null;
     mirrorCollection.pendingCursor = null;
+    mirrorCollection.stagedCaptain = null;
     if (branch) {
       try {
         branch.dispose();
