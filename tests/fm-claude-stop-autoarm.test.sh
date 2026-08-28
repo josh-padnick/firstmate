@@ -1008,6 +1008,7 @@ test_dead_generation_reclaims_after_transient_mutex_contention() {
     true &
     dead=$!
     wait "$dead"
+    kill -0 "$dead" 2>/dev/null && fail "stale outcome=$outcome fixture owner is unexpectedly still alive"
     printf 'epoch=8850 owner_pid=%s outcome=%s updated_at=1787894191\nstale-owner-identity\n' \
       "$dead" "$outcome" > "$dir/state/.claude-autoarm-epoch"
     touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
