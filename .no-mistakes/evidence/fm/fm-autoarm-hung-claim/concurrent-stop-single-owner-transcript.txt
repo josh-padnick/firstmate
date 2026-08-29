@@ -1,0 +1,8 @@
+CONCURRENT STOP RESULTS
+firing_1_exit=0
+firing_2_exit=2
+arm_invocations=1
+FINAL LEDGER
+epoch=1 owner_pid=54200 outcome=rewake updated_at=1787964129
+Fri Aug 28 17:42:06 2026     bash /var/folders/45/kt1b_k8j7ns1s2lgk_kx0w900000gp/T//fm-claude-stop-autoarm.cf5mmv/evidence-concurrent/bin/fm-claude-stop-autoarm.sh
+winner_output_count=1
