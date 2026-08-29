@@ -1122,29 +1122,30 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
 
 # Atomically publish this process as the owner of generation N+1, under one
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
-# when a competing claimant won the race (the observed ledger claim changed), and
+# when the current claim is open or a competing claimant won the race, and
 # 1 when bounded micro-mutex retries are exhausted, the mandatory identity
 # cannot be computed, or the write failed. A contender preserves the complete
-# predecessor claim it first observed and loses if that claim changes during any
-# retry, including a same-generation terminal commit by a resumed owner.
+# predecessor claim before deciding whether it is open and loses if that claim
+# changes during any retry, including a terminal commit by a resumed owner.
 fm_autoarm_claim_next() {  # <state-dir> [grace]
   local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp role i
   local predecessor predecessor_exists current current_exists
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
-  # Resolve the pid into a variable FIRST: expanding ${BASHPID:-$$} inside a
-  # command substitution would resolve it in that subshell, recording the
-  # identity of a process that exits immediately.
-  pid=${BASHPID:-$$}
-  identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
-  [ -n "$identity" ] || return 1
   predecessor=
   predecessor_exists=0
   if [ -e "$epoch" ]; then
     predecessor=$(cat "$epoch" 2>/dev/null) || return 1
     predecessor_exists=1
   fi
+  fm_autoarm_claim_open "$state" "$grace" && return 2
+  # Resolve the pid into a variable FIRST: expanding ${BASHPID:-$$} inside a
+  # command substitution would resolve it in that subshell, recording the
+  # identity of a process that exits immediately.
+  pid=${BASHPID:-$$}
+  identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
+  [ -n "$identity" ] || return 1
   i=0
   while ! fm_lock_try_acquire "$lock"; do
     current=

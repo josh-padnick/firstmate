@@ -148,14 +148,13 @@ fi
 # Claude runs one background process per firing with no dedupe. Exactly one
 # generation owner arms and translates per event epoch: every firing defers to
 # a live open claim, and a stuck, dead, identity-mismatched, or finished claim
-# is superseded by taking the next generation (fm_autoarm_claim_open and
-# fm_autoarm_claim_next in bin/fm-wake-lib.sh own the contract). No mutex is
+# is superseded by taking the next generation (fm_autoarm_claim_next in
+# bin/fm-wake-lib.sh owns the atomic defer-or-claim boundary). No mutex is
 # held past this point. A micro-mutex contention with a bare hold gets bounded
 # same-firing retries, while a role-carrying hold is a legacy lock-holding claim
 # from a pre-generation build (or the guard's own terminal-check), which the
 # legacy shim defers to while genuinely deciding and reclaims once when proven
 # abandoned.
-fm_autoarm_claim_open "$STATE" "$GRACE" && exit 0
 fm_autoarm_claim_next "$STATE" "$GRACE"
 CLAIM_RC=$?
 if [ "$CLAIM_RC" -ne 0 ]; then

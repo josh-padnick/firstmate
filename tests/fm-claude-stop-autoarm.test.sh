@@ -1345,6 +1345,109 @@ SH
   pass "auto-arm: same-generation terminal commit before reacquire admits one owner"
 }
 
+# A contender's initial eligibility decision and claim snapshot must be one
+# boundary.
+# The identity wrapper pauses the contender after it has rejected the owner's
+# stuck claim but before the former separate snapshot, then resumes the owner
+# long enough to commit terminal rewake.
+test_terminal_commit_in_eligibility_snapshot_gap_admits_one_owner() {
+  local dir dead rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-terminal-in-eligibility-snapshot-gap")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" released-actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8849 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+
+  mkdir -p "$dir/state/gap-bin" "$dir/state/winner-bin"
+  cat > "$dir/state/identity-boundary" <<'SH'
+#!/usr/bin/env bash
+if mkdir "$FM_RACE_STATE/identity-first" 2>/dev/null; then
+  exit 0
+fi
+: > "$FM_RACE_STATE/loser-in-gap"
+i=0
+while [ ! -e "$FM_RACE_STATE/terminal-committed" ]; do
+  [ "$i" -lt 200 ] || exit 1
+  /bin/sleep 0.01
+  i=$((i + 1))
+done
+SH
+  cat > "$dir/state/gap-bin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */[0-9]*/stat) "$FM_RACE_STATE/identity-boundary" || exit $? ;;
+esac
+exec /bin/cat "$@"
+SH
+  cat > "$dir/state/gap-bin/ps" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' -o lstart= -o command= '*) "$FM_RACE_STATE/identity-boundary" || exit $? ;;
+esac
+exec /bin/ps "$@"
+SH
+  cat > "$dir/state/winner-bin/mv" <<'SH'
+#!/usr/bin/env bash
+/bin/mv "$@" || exit $?
+for destination in "$@"; do :; done
+if [ "$destination" = "$FM_RACE_STATE/.claude-autoarm-epoch" ] \
+  && grep -q ' outcome=rewake ' "$destination"; then
+  : > "$FM_RACE_STATE/terminal-committed"
+fi
+SH
+  chmod +x "$dir/state/identity-boundary" "$dir/state/gap-bin/cat" \
+    "$dir/state/gap-bin/ps" "$dir/state/winner-bin/mv"
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/winner-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/owner-arm-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    touch -t 202001010000 "$FM_HOME/state/.claude-autoarm-epoch"
+    touch -t 202001010000 "$FM_HOME/state/.last-watcher-beat"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/gap-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/loser-in-gap" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    : > "$FM_HOME/state/owner-arm-release"
+    wait "$p1"
+    wait "$p2"
+  '
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "terminal commit in eligibility-snapshot gap must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 0 ]; } \
+    || fail "terminal commit in eligibility-snapshot gap must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8850 ] \
+    || fail "terminal commit in eligibility-snapshot gap published an unexpected N+1 claim"
+  pass "auto-arm: eligibility and claim snapshot form one election boundary"
+}
+
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
 # owner whose ledger entry and watcher beacon are both older than grace is
 # stuck, and the next firing supersedes it by taking the next generation.
@@ -1537,6 +1640,7 @@ test_dead_generation_reclaims_after_transient_mutex_contention
 test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner
 test_terminal_commit_before_loser_reacquires_admits_one_owner
 test_same_generation_terminal_commit_before_reacquire_admits_one_owner
+test_terminal_commit_in_eligibility_snapshot_gap_admits_one_owner
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
