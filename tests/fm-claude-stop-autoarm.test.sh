@@ -1346,6 +1346,8 @@ SH
     || fail "same-generation terminal commit must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
   [ "$(epoch_field "$dir" epoch)" = 8850 ] \
     || fail "same-generation terminal commit published an unexpected N+1 claim"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "same-generation terminal commit left the election mutex held"
   pass "auto-arm: same-generation terminal commit before reacquire admits one owner"
 }
 
