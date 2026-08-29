@@ -20,12 +20,14 @@
 #     translation time so a mid-cycle AFK transition is honored).
 #   - Need: arms only while work is in flight (state/*.meta) or X mode has a
 #     relay poll to run (state/x-watch.check.sh); an idle home exits 0.
-#   - Single-flight: Claude does not dedupe async hooks, so exactly one
-#     GENERATION owner arms per event epoch: the epoch ledger's monotonic
-#     sequence is the claim generation, every firing defers (exit 0) to a live
-#     open claim, and a stuck, dead, identity-mismatched, or finished claim is
-#     superseded by taking the next generation instead of being unlocked or
-#     revoked. No mutex is ever held across arming or output - the owner lock
+#   - Single-flight: Claude does not expose an occurrence identity that
+#     distinguishes sequential identical Stop payloads. The epoch ledger's
+#     monotonic sequence is the claim generation, concurrent claimants converge
+#     through the generation compare-and-swap boundary, and open healthy claims
+#     attach to the existing cycle. A duplicate firing delayed until after its
+#     peer commits may make one additional restart attempt; for one duplicated
+#     delivery that is the containment bound. No mutex is ever held across
+#     arming or output - the owner lock
 #     survives only as the micro-mutex serializing individual ledger writes -
 #     and a superseded owner goes completely silent: ownership is re-verified
 #     before every arm invocation, episode-state mutation, ledger write, and
@@ -55,8 +57,8 @@
 # The epoch ledger state/.claude-autoarm-epoch records the latest claim
 # generation and outcome so the synchronous Stop guard
 # (bin/fm-turnend-guard.sh --claude) can allow a stop whose recovery this hook
-# already owns, instead of forcing a duplicate continuation for the same event
-# epoch. The failure marker
+# already owns, instead of forcing a duplicate continuation for the same claim
+# generation. The failure marker
 # state/.claude-autoarm-failure-notified deduplicates the last-resort notice,
 # and state/.claude-autoarm-failure-alarmed bounds the attended fail-open and
 # suppresses any later automatic continuation in that unresolved episode.
@@ -145,18 +147,16 @@ if [ "$RECOVER_SESSION_LOCK" -eq 1 ]; then
 fi
 
 # --- single-flight generation claim --------------------------------------------
-# Claude runs one background process per firing with no dedupe. Exactly one
-# generation owner arms and translates per event epoch: every firing defers to
-# a live open claim, and a stuck, dead, identity-mismatched, or finished claim
-# is superseded by taking the next generation (fm_autoarm_claim_open and
-# fm_autoarm_claim_next in bin/fm-wake-lib.sh own the contract). No mutex is
-# held past this point. A micro-mutex contention with a bare hold is another
-# participant's short ledger section and the next Stop firing simply retries,
-# while a role-carrying hold is a legacy lock-holding claim from a
-# pre-generation build (or the guard's own terminal-check), which the legacy
-# shim defers to while genuinely deciding and reclaims once when proven
+# Claude runs one background process per firing with no dedupe. Claimants that
+# overlap the election admit exactly one generation owner: every firing defers
+# to a live open claim, and a stuck, dead, identity-mismatched, or finished claim
+# is superseded by taking the next generation (fm_autoarm_claim_next in
+# bin/fm-wake-lib.sh owns the atomic defer-or-claim boundary). No mutex is
+# held past this point. A micro-mutex contention with a bare hold gets bounded
+# same-firing retries, while a role-carrying hold is a legacy lock-holding claim
+# from a pre-generation build (or the guard's own terminal-check), which the
+# legacy shim defers to while genuinely deciding and reclaims once when proven
 # abandoned.
-fm_autoarm_claim_open "$STATE" "$GRACE" && exit 0
 fm_autoarm_claim_next "$STATE" "$GRACE"
 CLAIM_RC=$?
 if [ "$CLAIM_RC" -ne 0 ]; then

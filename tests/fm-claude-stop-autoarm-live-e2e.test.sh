@@ -76,6 +76,11 @@ printf 'project=fixture\nwindow=fixture\nbackend=tmux\n' > "$HOME_DIR/state/task
 # A numeric pid above the supported OS pid range is a demonstrably dead prior
 # harness owner under fm_harness_pid_alive, matching the reproduced incident.
 printf '9999999\n' > "$HOME_DIR/state/.lock"
+# The exact 2026-08-27 auto-arm lapse shape: a stale terminal generation owned
+# by a dead prior Stop hook. The first real Stop firing must supersede it.
+printf 'epoch=8850 owner_pid=9999999 outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+  > "$HOME_DIR/state/.claude-autoarm-epoch"
+touch -t 202608272200 "$HOME_DIR/state/.claude-autoarm-epoch"
 
 # Rapid-death arm fixture: started plus an immediate actionable reason, the
 # exact spent-Stop edge shape. Runs 1-2 close actionable; run 3 closes clean so
@@ -93,9 +98,10 @@ printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
 printf 'stale: fixture-rapid-%s\n' "$N"
 exit 0
 SH
-# Drain fixture: session start invokes it once, then the model invokes it once
-# per rewake. The third total drain ends the in-flight need after two complete
-# Stop-owned cycles.
+# Drain fixture: the native SessionStart hook invokes it once, then the model
+# invokes it once per rewake. The explicit first model tool repeats the
+# idempotent session-start command without draining a second time, so the third
+# total drain ends the in-flight need after two complete Stop-owned cycles.
 cat > "$PROJECT/bin/fm-wake-drain.sh" <<'SH'
 #!/usr/bin/env bash
 N=$(cat "$FM_HOME/state/drain-count" 2>/dev/null || echo 0); N=$((N+1)); echo "$N" > "$FM_HOME/state/drain-count"
@@ -118,7 +124,7 @@ PROMPT='Run exactly `bin/fm-session-start.sh` with Bash as your first tool call.
 ARM_RUNS=$(wc -l < "$HOME_DIR/state/arm-ran" 2>/dev/null | tr -d ' ')
 [ "$ARM_RUNS" = 2 ] || fail "expected exactly 2 hook-owned arm cycles, got $ARM_RUNS: $(cat "$HOME_DIR/state/arm-ran" 2>/dev/null)"
 DRAIN_RUNS=$(wc -l < "$HOME_DIR/state/drain-ran" 2>/dev/null | tr -d ' ')
-[ "$DRAIN_RUNS" = 3 ] || fail "expected one session-start drain plus two model wake drains, got $DRAIN_RUNS drains"
+[ "$DRAIN_RUNS" = 3 ] || fail "expected one native session-start drain plus two model wake drains, got $DRAIN_RUNS drains"
 REWAKES=$(grep -c 'Stop hook feedback' "$TRANSCRIPT" 2>/dev/null || true)
 [ "$REWAKES" -ge 2 ] || fail "expected at least 2 exit-2 rewake deliveries, got $REWAKES"
 grep -q 'stale: fixture-rapid-1' "$TRANSCRIPT" || fail "first rapid rewake reason missing from the transcript"
@@ -137,6 +143,8 @@ fi
   || fail "cooperative guard consumed a forced continuation while the auto-arm launch was healthy"
 [ "$(sed -n 's/^.*outcome=\([a-z][a-z]*\) .*$/\1/p' "$HOME_DIR/state/.claude-autoarm-epoch" 2>/dev/null)" = rewake ] \
   || fail "auto-arm epoch ledger must record the rewake outcome"
+[ "$(sed -n 's/^epoch=\([0-9][0-9]*\) .*/\1/p' "$HOME_DIR/state/.claude-autoarm-epoch" 2>/dev/null)" -gt 8850 ] \
+  || fail "next Stop firing did not supersede the stale dead-owner generation"
 [ ! -e "$HOME_DIR/state/.claude-autoarm.lock" ] || fail "auto-arm owner lock was left behind"
 
 # Live-owner negative control: a separate supported-harness process owns a

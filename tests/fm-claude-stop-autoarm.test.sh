@@ -70,7 +70,7 @@ make_crewmate_worktree_dir() {
 # before invocation. Captures stdout+stderr; exit code on stdout of the caller.
 run_autoarm() {
   local dir=$1 rc=0
-  printf '%s\n' '{"session_id":"sess-autoarm","stop_hook_active":false}' \
+  printf '%s\n' '{"session_id":"sess-autoarm","prompt_id":"prompt-autoarm","hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"done"}' \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
@@ -136,6 +136,17 @@ printf 'signal: task.status done: slow fixture\n'
 exit 0
 SH
       ;;
+    released-actionable)
+      cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
+#!/usr/bin/env bash
+echo "$$" >> "$FM_HOME/state/arm-ran"
+: > "$FM_HOME/state/owner-arm-waiting"
+while [ ! -e "$FM_HOME/state/owner-arm-release" ]; do sleep 0.01; done
+printf 'watcher: started pid=%s (beacon fresh)\n' "$$"
+printf 'signal: task.status done: released fixture\n'
+exit 0
+SH
+      ;;
     blocking-actionable)
       cat > "$dir/bin/fm-watch-arm.sh" <<'SH'
 #!/usr/bin/env bash
@@ -194,7 +205,7 @@ epoch_outcome() {
 RUN_AUTOARM_BG_PID=
 run_autoarm_bg() {
   local dir=$1 out=$2
-  printf '%s\n' '{"session_id":"sess-autoarm","stop_hook_active":false}' \
+  printf '%s\n' '{"session_id":"sess-autoarm","prompt_id":"prompt-autoarm","hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"done"}' \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
@@ -992,6 +1003,558 @@ test_open_generation_claim_defers_without_any_lock() {
   pass "auto-arm: a live open generation claim defers concurrent firings with no lock held"
 }
 
+# The 2026-08-27 primary lapse left a stale generation owned by a dead hook
+# process at outcome=rewake. A concurrent short ledger section must not turn
+# that recoverable terminal claim into another whole Stop firing with no arm:
+# the claimant waits within the guard's synchronization window, rechecks the
+# generation under the mutex, and either supersedes it or loses to the one
+# firing that did. Exercise every recorded outcome because owner death, not the
+# predecessor's last outcome, is what makes the generation reclaimable.
+test_dead_generation_reclaims_after_transient_mutex_contention() {
+  local outcome dir out status dead holder i
+  for outcome in rewake arming clean afk failed failed-suppressed; do
+    dir=$(make_primary_dir "$TMP_ROOT/v2-dead-$outcome-contended")
+    : > "$dir/state/task1.meta"
+    write_arm_fixture "$dir" actionable
+    true &
+    dead=$!
+    wait "$dead"
+    kill -0 "$dead" 2>/dev/null && fail "stale outcome=$outcome fixture owner is unexpectedly still alive"
+    printf 'epoch=8850 owner_pid=%s outcome=%s updated_at=1787894191\nstale-owner-identity\n' \
+      "$dead" "$outcome" > "$dir/state/.claude-autoarm-epoch"
+    touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+    (
+      FM_HOME="$dir" bash -c '
+        . "$FM_HOME/bin/fm-wake-lib.sh"
+        fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+        : > "$FM_HOME/state/mutex-ready"
+        # Keep the mutex beyond normal hook startup so the pre-fix one-shot
+        # claimant deterministically encounters contention, while still
+        # releasing inside the fixed 600 ms bounded retry window.
+        sleep 0.4
+        fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+      '
+    ) &
+    holder=$!
+    i=0
+    while [ ! -e "$dir/state/mutex-ready" ]; do
+      [ "$i" -lt 50 ] || fail "transient mutex holder never became ready for outcome=$outcome"
+      sleep 0.02
+      i=$((i + 1))
+    done
+    out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+    wait "$holder"
+    expect_code 2 "$status" "a dead outcome=$outcome generation must reclaim within the same Stop firing after transient mutex contention"
+    [ -e "$dir/state/arm-ran" ] || fail "dead outcome=$outcome generation left the home unarmed after contention"
+    assert_contains "$out" "firstmate watcher wake" "dead outcome=$outcome reclaim did not translate its wake"
+    [ "$(epoch_field "$dir" epoch)" -gt 8850 ] || fail "dead outcome=$outcome generation was not superseded"
+  done
+  pass "auto-arm: dead generation claims in every outcome reclaim within one contended Stop firing"
+}
+
+# Two Stop firings that both encounter the incident's contended stale ledger
+# must converge after the mutex releases: one supersedes epoch 8850 and arms,
+# while the other observes that open winning generation and exits quietly.
+test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
+  local dir dead holder i rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-dead-rewake-contended-concurrent")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" slow-actionable
+  true &
+  dead=$!
+  wait "$dead"
+  kill -0 "$dead" 2>/dev/null && fail "concurrent stale fixture owner is unexpectedly still alive"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+  touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+  (
+    FM_HOME="$dir" bash -c '
+      . "$FM_HOME/bin/fm-wake-lib.sh"
+      fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+      : > "$FM_HOME/state/mutex-ready"
+      j=0
+      while [ ! -e "$FM_HOME/state/caller1-ready" ] \
+        || [ ! -e "$FM_HOME/state/caller2-ready" ]; do
+        if [ "$j" -ge 200 ]; then
+          fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+          exit 1
+        fi
+        sleep 0.01
+        j=$((j + 1))
+      done
+      : > "$FM_HOME/state/callers-go"
+      sleep 0.4
+      fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+    '
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$dir/state/mutex-ready" ]; do
+    [ "$i" -lt 50 ] || fail "concurrent transient mutex holder never became ready"
+    sleep 0.02
+    i=$((i + 1))
+  done
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      : > "$FM_HOME/state/caller1-ready"
+      while [ ! -e "$FM_HOME/state/callers-go" ]; do sleep 0.01; done
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"contender-1\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    (
+      : > "$FM_HOME/state/caller2-ready"
+      while [ ! -e "$FM_HOME/state/callers-go" ]; do sleep 0.01; done
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"contender-2\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    wait "$p1"
+    wait "$p2"
+  '
+  wait "$holder" || fail "concurrent transient mutex holder did not stage both callers"
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "contended concurrent reclaim must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 0 ]; } || { [ "$rc1" = 0 ] && [ "$rc2" = 2 ]; } \
+    || fail "contended concurrent reclaim must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8851 ] \
+    || fail "contended concurrent reclaim did not advance exactly once from epoch 8850"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "contended concurrent reclaim left the election mutex held"
+  pass "auto-arm: contended concurrent stale-generation reclaim admits one owner"
+}
+
+# A losing claimant must remember the stale generation it first observed.
+# This stages the winner's terminal rewake commit while the loser remains in
+# its first mutex retry, then lets the loser reacquire only after that commit.
+# The terminal outcome must still represent an intervening winning generation,
+# so the loser exits quietly instead of publishing another generation and arm.
+test_terminal_commit_before_loser_reacquires_admits_one_owner() {
+  local dir dead holder i rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-terminal-before-loser-reacquires")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" actionable
+  true &
+  dead=$!
+  wait "$dead"
+  kill -0 "$dead" 2>/dev/null && fail "terminal-race stale fixture owner is unexpectedly still alive"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+  touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+
+  mkdir -p "$dir/state/loser-bin" "$dir/state/winner-bin"
+  cat > "$dir/state/loser-bin/sleep" <<'SH'
+#!/usr/bin/env bash
+if mkdir "$FM_RACE_STATE/loser-first-retry" 2>/dev/null; then
+  : > "$FM_RACE_STATE/loser-waiting"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/terminal-committed" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+  : > "$FM_RACE_STATE/loser-observed-terminal"
+fi
+exec /bin/sleep "$@"
+SH
+  cat > "$dir/state/winner-bin/mv" <<'SH'
+#!/usr/bin/env bash
+/bin/mv "$@" || exit $?
+for destination in "$@"; do :; done
+if [ "$destination" = "$FM_RACE_STATE/.claude-autoarm-epoch" ] \
+  && grep -q ' outcome=rewake ' "$destination"; then
+  : > "$FM_RACE_STATE/terminal-committed"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/loser-observed-terminal" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+fi
+SH
+  chmod +x "$dir/state/loser-bin/sleep" "$dir/state/winner-bin/mv"
+
+  (
+    FM_HOME="$dir" bash -c '
+      . "$FM_HOME/bin/fm-wake-lib.sh"
+      fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+      : > "$FM_HOME/state/mutex-ready"
+      while [ ! -e "$FM_HOME/state/release-initial-mutex" ]; do sleep 0.01; done
+      fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+    '
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$dir/state/mutex-ready" ]; do
+    [ "$i" -lt 50 ] || fail "terminal-race initial mutex holder never became ready"
+    sleep 0.02
+    i=$((i + 1))
+  done
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"terminal-loser\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/loser-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/loser-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"terminal-winner\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/winner-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    : > "$FM_HOME/state/release-initial-mutex"
+    wait "$p1"
+    wait "$p2"
+  '
+  wait "$holder" || fail "terminal-race initial mutex holder did not release cleanly"
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "terminal commit before loser reacquire must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 0 ] && [ "$rc2" = 2 ]; } \
+    || fail "terminal commit before loser reacquire must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8851 ] \
+    || fail "terminal commit before loser reacquire advanced beyond epoch 8851"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "terminal commit before loser reacquire left the election mutex held"
+  pass "auto-arm: terminal commit before loser reacquire still admits one owner"
+}
+
+# A contender must also remember the complete claim it rejected as stuck.
+# This starts a real generation owner, ages its arming claim past grace, then
+# resumes that owner so it commits terminal rewake before the contender can
+# reacquire the mutex.
+# The unchanged epoch must not hide the owner's completed election.
+test_same_generation_terminal_commit_before_reacquire_admits_one_owner() {
+  local dir dead rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-same-generation-terminal-before-reacquire")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" released-actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8849 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+
+  mkdir -p "$dir/state/loser-bin" "$dir/state/winner-bin"
+  cat > "$dir/state/loser-bin/sleep" <<'SH'
+#!/usr/bin/env bash
+if mkdir "$FM_RACE_STATE/loser-first-retry" 2>/dev/null; then
+  : > "$FM_RACE_STATE/loser-waiting"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/terminal-committed" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+  : > "$FM_RACE_STATE/loser-observed-terminal"
+fi
+exec /bin/sleep "$@"
+SH
+  cat > "$dir/state/winner-bin/mv" <<'SH'
+#!/usr/bin/env bash
+/bin/mv "$@" || exit $?
+for destination in "$@"; do :; done
+if [ "$destination" = "$FM_RACE_STATE/.claude-autoarm-epoch" ] \
+  && grep -q ' outcome=rewake ' "$destination"; then
+  : > "$FM_RACE_STATE/terminal-committed"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/loser-observed-terminal" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+fi
+SH
+  chmod +x "$dir/state/loser-bin/sleep" "$dir/state/winner-bin/mv"
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"same-generation-owner\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/winner-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/owner-arm-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    touch -t 202001010000 "$FM_HOME/state/.claude-autoarm-epoch"
+    touch -t 202001010000 "$FM_HOME/state/.last-watcher-beat"
+    (
+      . "$FM_HOME/bin/fm-wake-lib.sh"
+      fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+      : > "$FM_HOME/state/mutex-ready"
+      while [ ! -e "$FM_HOME/state/release-initial-mutex" ]; do sleep 0.01; done
+      fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+    ) &
+    holder=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/mutex-ready" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"same-generation-contender\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/loser-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/loser-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    : > "$FM_HOME/state/owner-arm-release"
+    : > "$FM_HOME/state/release-initial-mutex"
+    wait "$holder"
+    wait "$p1"
+    wait "$p2"
+  '
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "same-generation terminal commit must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 0 ]; } \
+    || fail "same-generation terminal commit must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8850 ] \
+    || fail "same-generation terminal commit published an unexpected N+1 claim"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "same-generation terminal commit left the election mutex held"
+  pass "auto-arm: same-generation terminal commit before reacquire admits one owner"
+}
+
+# A contender's initial eligibility decision and claim snapshot must be one
+# boundary.
+# The identity wrapper pauses the contender after it has rejected the owner's
+# stuck claim but before the former separate snapshot, then resumes the owner
+# long enough to commit terminal rewake.
+test_terminal_commit_in_eligibility_snapshot_gap_admits_one_owner() {
+  local dir dead rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-terminal-in-eligibility-snapshot-gap")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" released-actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8849 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+
+  mkdir -p "$dir/state/gap-bin" "$dir/state/winner-bin"
+  cat > "$dir/state/identity-boundary" <<'SH'
+#!/usr/bin/env bash
+if mkdir "$FM_RACE_STATE/identity-first" 2>/dev/null; then
+  exit 0
+fi
+: > "$FM_RACE_STATE/loser-in-gap"
+i=0
+while [ ! -e "$FM_RACE_STATE/terminal-committed" ]; do
+  [ "$i" -lt 200 ] || exit 1
+  /bin/sleep 0.01
+  i=$((i + 1))
+done
+SH
+  cat > "$dir/state/gap-bin/cat" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  */[0-9]*/stat) "$FM_RACE_STATE/identity-boundary" || exit $? ;;
+esac
+exec /bin/cat "$@"
+SH
+  cat > "$dir/state/gap-bin/ps" <<'SH'
+#!/usr/bin/env bash
+case " $* " in
+  *' -o lstart= -o command= '*) "$FM_RACE_STATE/identity-boundary" || exit $? ;;
+esac
+exec /bin/ps "$@"
+SH
+  cat > "$dir/state/winner-bin/mv" <<'SH'
+#!/usr/bin/env bash
+/bin/mv "$@" || exit $?
+for destination in "$@"; do :; done
+if [ "$destination" = "$FM_RACE_STATE/.claude-autoarm-epoch" ] \
+  && grep -q ' outcome=rewake ' "$destination"; then
+  : > "$FM_RACE_STATE/terminal-committed"
+fi
+SH
+  chmod +x "$dir/state/identity-boundary" "$dir/state/gap-bin/cat" \
+    "$dir/state/gap-bin/ps" "$dir/state/winner-bin/mv"
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"gap-owner\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/winner-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/owner-arm-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    touch -t 202001010000 "$FM_HOME/state/.claude-autoarm-epoch"
+    touch -t 202001010000 "$FM_HOME/state/.last-watcher-beat"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\",\"prompt_id\":\"gap-contender\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/gap-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/loser-in-gap" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    : > "$FM_HOME/state/owner-arm-release"
+    wait "$p1"
+    wait "$p2"
+  '
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "terminal commit in eligibility-snapshot gap must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 0 ]; } \
+    || fail "terminal commit in eligibility-snapshot gap must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8850 ] \
+    || fail "terminal commit in eligibility-snapshot gap published an unexpected N+1 claim"
+  pass "auto-arm: eligibility and claim snapshot form one election boundary"
+}
+
+# Claude can emit sequential identical Stop payloads, so payload content must
+# never suppress a later legitimate firing.
+test_sequential_identical_stop_payloads_each_rearm() {
+  local dir dead out status count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-sequential-identical-stops")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the first identical Stop payload must rearm"
+  assert_contains "$out" "firstmate watcher wake" "the first identical Stop did not translate"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the second identical Stop payload must not be suppressed"
+  assert_contains "$out" "firstmate watcher wake" "the second identical Stop did not translate"
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 2 ] || fail "two sequential identical Stops must run two arms, saw $count"
+  [ "$(epoch_field "$dir" epoch)" = 8852 ] \
+    || fail "two sequential identical Stops must publish two monotonic generations"
+  pass "auto-arm: sequential identical Stop payloads each rearm"
+}
+
+# A duplicate firing can be descheduled after its session gate until its peer
+# has committed. Without a harness occurrence token it may then take one more
+# generation, but one duplicated delivery is bounded to one additional arm.
+test_delayed_duplicate_is_bounded_to_one_extra_restart() {
+  local dir dead rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-delayed-prefunction-event")
+  : > "$dir/state/task1.meta"
+  : > "$dir/state/.last-watcher-beat"
+  write_arm_fixture "$dir" actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+  mkdir -p "$dir/state/gate-bin"
+  cat > "$dir/state/gate-bin/date" <<'SH'
+#!/usr/bin/env bash
+out=$(/bin/date "$@")
+rc=$?
+printf '%s\n' "$out"
+if [ "$*" = '+%s' ] && mkdir "$FM_RACE_STATE/gate-date-first" 2>/dev/null; then
+  printf '%s\n' "$PPID" > "$FM_RACE_STATE/stopped-gate-pid"
+  : > "$FM_RACE_STATE/gate-stopping"
+  kill -STOP "$PPID"
+fi
+exit "$rc"
+SH
+  chmod +x "$dir/state/gate-bin/date"
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    payload="{\"session_id\":\"s\",\"prompt_id\":\"prompt-autoarm\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":true,\"last_assistant_message\":\"done\"}"
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "$payload" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/gate-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/gate-stopping" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    stopped=$(cat "$FM_HOME/state/stopped-gate-pid")
+    i=0
+    while ! /bin/ps -o state= -p "$stopped" 2>/dev/null | grep -q T; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    (
+      rc=0
+      printf "%s\n" "$payload" \
+        | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    wait "$p2"
+    kill -CONT "$stopped"
+    wait "$p1"
+  '
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 2 ] || fail "one delayed duplicate must be bounded to two total arms, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 2 ]; } \
+    || fail "the delayed duplicate containment path must translate both arms, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8852 ] \
+    || fail "one delayed duplicate must advance exactly twice from epoch 8850"
+  pass "auto-arm: delayed duplicate is bounded to one extra restart"
+}
+
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
 # owner whose ledger entry and watcher beacon are both older than grace is
 # stuck, and the next firing supersedes it by taking the next generation.
@@ -1180,6 +1743,13 @@ test_terminal_check_claim_is_never_reclaimed
 test_stuck_live_legacy_owner_is_retired_and_reclaimed
 test_stopped_legacy_owner_is_reclaimed_with_term_pending
 test_open_generation_claim_defers_without_any_lock
+test_dead_generation_reclaims_after_transient_mutex_contention
+test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner
+test_terminal_commit_before_loser_reacquires_admits_one_owner
+test_same_generation_terminal_commit_before_reacquire_admits_one_owner
+test_terminal_commit_in_eligibility_snapshot_gap_admits_one_owner
+test_sequential_identical_stop_payloads_each_rearm
+test_delayed_duplicate_is_bounded_to_one_extra_restart
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm

@@ -1034,13 +1034,15 @@ fm_failure_episode_reset() {
 # same unreclaimable-live-owner shape, and a reclaimed-but-alive owner racing
 # its replacement to translate one close twice.
 #
-# Two bounded residuals are ACCEPTED INTENT, because closing them absolutely
+# Three bounded residuals are ACCEPTED INTENT, because closing them absolutely
 # would require a mutex held across output or steady-state revocation, both
 # deliberately rejected: (1) an owner that dies between its owned terminal
 # write and its own process exit leaves a committed outcome whose banner was
 # never delivered (process-death territory; the durable wake queue retains the
 # underlying event), and (2) a hung old-build owner that resumes during the
-# one legacy upgrade window may add one duplicate continuation. Each residual
+# one legacy upgrade window may add one duplicate continuation, and (3) one
+# duplicated Stop delivery delayed until its peer commits may make one extra
+# restart because Claude exposes no occurrence identity. Each residual
 # costs at most one extra exit-2 continuation turn absorbed by the durable
 # idempotent wake queue. A claim misread as stuck in a pathological race
 # (e.g. a beacon read right at system wake) likewise yields at most one extra
@@ -1122,22 +1124,61 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
 
 # Atomically publish this process as the owner of generation N+1, under one
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
-# when a competing claimant won the race (the ledger holds an open claim), and
-# 1 when the micro-mutex is contended, the mandatory identity cannot be
-# computed, or the write failed.
+# when the current claim is open or a competing claimant won the race, and
+# 1 when bounded micro-mutex retries are exhausted, the mandatory identity
+# cannot be computed, or the write failed. A contender preserves the complete
+# predecessor claim before deciding whether it is open and loses if that claim
+# changes during any retry, including a terminal commit by a resumed owner.
 fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp role i
+  local predecessor predecessor_exists current current_exists
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
+  predecessor=
+  predecessor_exists=0
+  if [ -e "$epoch" ]; then
+    predecessor=$(cat "$epoch" 2>/dev/null) || return 1
+    predecessor_exists=1
+  fi
+  fm_autoarm_claim_open "$state" "$grace" && return 2
   # Resolve the pid into a variable FIRST: expanding ${BASHPID:-$$} inside a
   # command substitution would resolve it in that subshell, recording the
   # identity of a process that exits immediately.
   pid=${BASHPID:-$$}
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
-  fm_lock_try_acquire "$lock" || return 1
-  if fm_autoarm_claim_open "$state" "$grace"; then
+  i=0
+  while ! fm_lock_try_acquire "$lock"; do
+    current=
+    current_exists=0
+    if [ -e "$epoch" ]; then
+      current=$(cat "$epoch" 2>/dev/null) || return 1
+      current_exists=1
+    fi
+    [ "$current_exists" = "$predecessor_exists" ] || return 2
+    [ "$current" = "$predecessor" ] || return 2
+    fm_autoarm_claim_open "$state" "$grace" && return 2
+    # Role-carrying holds are long-lived legacy claims or the guard's terminal
+    # check, not a current generation's short ledger section. The caller owns
+    # their separate defer-or-reclaim path.
+    role=$(fm_lock_role "$lock" 2>/dev/null || true)
+    [ -z "$role" ] || return 1
+    [ "$i" -lt 30 ] || return 1
+    sleep 0.02
+    i=$((i + 1))
+  done
+  current=
+  current_exists=0
+  if [ -e "$epoch" ]; then
+    if ! current=$(cat "$epoch" 2>/dev/null); then
+      fm_lock_release "$lock"
+      return 1
+    fi
+    current_exists=1
+  fi
+  if [ "$current_exists" != "$predecessor_exists" ] \
+    || [ "$current" != "$predecessor" ]; then
     fm_lock_release "$lock"
     return 2
   fi
@@ -1145,6 +1186,10 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   case "$gen" in
     ''|*[!0-9]*) gen=0 ;;
   esac
+  if fm_autoarm_claim_open "$state" "$grace"; then
+    fm_lock_release "$lock"
+    return 2
+  fi
   gen=$((gen + 1))
   tmp="$epoch.tmp.$pid"
   if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s\n%s\n' \
