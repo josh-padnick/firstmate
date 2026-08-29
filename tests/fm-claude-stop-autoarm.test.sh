@@ -1061,6 +1061,17 @@ test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
       . "$FM_HOME/bin/fm-wake-lib.sh"
       fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
       : > "$FM_HOME/state/mutex-ready"
+      j=0
+      while [ ! -e "$FM_HOME/state/caller1-ready" ] \
+        || [ ! -e "$FM_HOME/state/caller2-ready" ]; do
+        if [ "$j" -ge 200 ]; then
+          fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+          exit 1
+        fi
+        sleep 0.01
+        j=$((j + 1))
+      done
+      : > "$FM_HOME/state/callers-go"
       sleep 0.4
       fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
     '
@@ -1074,14 +1085,26 @@ test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
   done
   FM_HOME="$dir" "$FAKE_CLAUDE" -c '
     printf "%s\n" "$$" > "$FM_HOME/state/.lock"
-    printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" &
+    (
+      : > "$FM_HOME/state/caller1-ready"
+      while [ ! -e "$FM_HOME/state/callers-go" ]; do sleep 0.01; done
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
     p1=$!
-    printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" &
+    (
+      : > "$FM_HOME/state/caller2-ready"
+      while [ ! -e "$FM_HOME/state/callers-go" ]; do sleep 0.01; done
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
     p2=$!
-    wait "$p1"; echo $? > "$FM_HOME/state/rc1"
-    wait "$p2"; echo $? > "$FM_HOME/state/rc2"
+    wait "$p1"
+    wait "$p2"
   '
-  wait "$holder"
+  wait "$holder" || fail "concurrent transient mutex holder did not stage both callers"
   rc1=$(cat "$dir/state/rc1")
   rc2=$(cat "$dir/state/rc2")
   count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
