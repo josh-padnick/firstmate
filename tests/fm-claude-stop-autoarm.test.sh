@@ -1124,6 +1124,8 @@ test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
     || fail "contended concurrent reclaim must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
   [ "$(epoch_field "$dir" epoch)" = 8851 ] \
     || fail "contended concurrent reclaim did not advance exactly once from epoch 8850"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "contended concurrent reclaim left the election mutex held"
   pass "auto-arm: contended concurrent stale-generation reclaim admits one owner"
 }
 
