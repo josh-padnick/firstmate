@@ -1233,6 +1233,8 @@ SH
     || fail "terminal commit before loser reacquire must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
   [ "$(epoch_field "$dir" epoch)" = 8851 ] \
     || fail "terminal commit before loser reacquire advanced beyond epoch 8851"
+  assert_absent "$dir/state/.claude-autoarm.lock" \
+    "terminal commit before loser reacquire left the election mutex held"
   pass "auto-arm: terminal commit before loser reacquire still admits one owner"
 }
 
