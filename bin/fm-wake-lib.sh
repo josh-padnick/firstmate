@@ -995,7 +995,8 @@ fm_failure_episode_reset() {
 #     identity is MANDATORY: a claimant that cannot record it does not claim
 #     (continuity falls to the synchronous guard), and the identity is read
 #     from the ledger entry alone - never substituted from any lock - so a
-#     reused pid can never authenticate someone else's stale entry.
+#     reused pid can never authenticate someone else's stale entry. Line 3 is
+#     the stable Stop event identity whose duplicate firings share one claim.
 #   - A claim is OPEN (fm_autoarm_claim_open) while its outcome is "arming",
 #     its owner pid is alive, its recorded identity successfully recomputes
 #     and matches that pid, and it is not STUCK - stuck meaning both the
@@ -1071,9 +1072,8 @@ _fm_autoarm_epoch_field() {  # <epoch-file> <field>
 }
 
 # Parse the current ledger claim. Sets FM_AUTOARM_GEN, FM_AUTOARM_OWNER,
-# FM_AUTOARM_OUTCOME, and FM_AUTOARM_IDENTITY (line 2 of the entry, and ONLY
-# line 2 - identity is never substituted from a lock, so a transient
-# micro-mutex hold or a reused pid can never authenticate a stale entry).
+# FM_AUTOARM_OUTCOME, FM_AUTOARM_IDENTITY (line 2 of the entry, and ONLY line 2),
+# and FM_AUTOARM_EVENT (line 3 without its event_id= prefix).
 fm_autoarm_ledger_read() {  # <state-dir>
   local state=$1 epoch
   epoch="$state/.claude-autoarm-epoch"
@@ -1081,6 +1081,7 @@ fm_autoarm_ledger_read() {  # <state-dir>
   FM_AUTOARM_OWNER=
   FM_AUTOARM_OUTCOME=
   FM_AUTOARM_IDENTITY=
+  FM_AUTOARM_EVENT=
   FM_AUTOARM_GEN=$(_fm_autoarm_epoch_field "$epoch" epoch) || return 1
   FM_AUTOARM_OWNER=$(_fm_autoarm_epoch_field "$epoch" owner_pid) || return 1
   FM_AUTOARM_OUTCOME=$(_fm_autoarm_epoch_field "$epoch" outcome) || return 1
@@ -1088,6 +1089,7 @@ fm_autoarm_ledger_read() {  # <state-dir>
     ''|*[!0-9]*) return 1 ;;
   esac
   FM_AUTOARM_IDENTITY=$(sed -n '2p' "$epoch" 2>/dev/null || true)
+  FM_AUTOARM_EVENT=$(sed -n '3s/^event_id=//p' "$epoch" 2>/dev/null || true)
   return 0
 }
 
@@ -1127,17 +1129,23 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
 # cannot be computed, or the write failed. A contender preserves the complete
 # predecessor claim before deciding whether it is open and loses if that claim
 # changes during any retry, including a terminal commit by a resumed owner.
-fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp role i
+fm_autoarm_claim_next() {  # <state-dir> [grace] <event-id>
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} event=${3:-} lock epoch pid gen identity tmp role i
   local predecessor predecessor_exists current current_exists
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
+  case "$event" in
+    ''|*[!0-9A-Za-z:._-]*) return 1 ;;
+  esac
   predecessor=
   predecessor_exists=0
   if [ -e "$epoch" ]; then
     predecessor=$(cat "$epoch" 2>/dev/null) || return 1
     predecessor_exists=1
+  fi
+  if fm_autoarm_ledger_read "$state" && [ "$FM_AUTOARM_EVENT" = "$event" ]; then
+    return 2
   fi
   fm_autoarm_claim_open "$state" "$grace" && return 2
   # Resolve the pid into a variable FIRST: expanding ${BASHPID:-$$} inside a
@@ -1190,8 +1198,8 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   fi
   gen=$((gen + 1))
   tmp="$epoch.tmp.$pid"
-  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s\n%s\n' \
-      "$gen" "$pid" "$(date +%s)" "$identity" > "$tmp" 2>/dev/null \
+  if ! printf 'epoch=%s owner_pid=%s outcome=arming updated_at=%s\n%s\nevent_id=%s\n' \
+      "$gen" "$pid" "$(date +%s)" "$identity" "$event" > "$tmp" 2>/dev/null \
     || ! mv -f "$tmp" "$epoch" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     fm_lock_release "$lock"
@@ -1212,7 +1220,7 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
 # Returns 0 committed, 2 refused (superseded or required-marker failure), and 1
 # unable (bounded contention or ledger-write failure).
 fm_autoarm_write_owned() {  # <state-dir> <gen> <outcome> [marker-file]
-  local state=$1 gen=$2 outcome=$3 marker=${4:-} lock epoch pid identity tmp i
+  local state=$1 gen=$2 outcome=$3 marker=${4:-} lock epoch pid identity event tmp i
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   pid=${BASHPID:-$$}
@@ -1228,11 +1236,13 @@ fm_autoarm_write_owned() {  # <state-dir> <gen> <outcome> [marker-file]
     return 2
   fi
   identity=$FM_AUTOARM_IDENTITY
+  event=$FM_AUTOARM_EVENT
   tmp="$epoch.tmp.$pid"
   if ! {
       printf 'epoch=%s owner_pid=%s outcome=%s updated_at=%s\n' \
         "$gen" "$pid" "$outcome" "$(date +%s)"
       [ -z "$identity" ] || printf '%s\n' "$identity"
+      [ -z "$event" ] || printf 'event_id=%s\n' "$event"
     } > "$tmp" 2>/dev/null || ! mv -f "$tmp" "$epoch" 2>/dev/null; then
     rm -f "$tmp" 2>/dev/null || true
     fm_lock_release "$lock"

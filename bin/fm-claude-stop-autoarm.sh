@@ -21,11 +21,12 @@
 #   - Need: arms only while work is in flight (state/*.meta) or X mode has a
 #     relay poll to run (state/x-watch.check.sh); an idle home exits 0.
 #   - Single-flight: Claude does not dedupe async hooks, so exactly one
-#     GENERATION owner arms per event epoch: the epoch ledger's monotonic
-#     sequence is the claim generation, every firing defers (exit 0) to a live
-#     open claim, and a stuck, dead, identity-mismatched, or finished claim is
-#     superseded by taking the next generation instead of being unlocked or
-#     revoked. No mutex is ever held across arming or output - the owner lock
+#     GENERATION owner arms per Stop event: a canonical digest of Claude's Stop
+#     payload is the stable event identity, the epoch ledger's monotonic sequence
+#     is the claim generation, every duplicate firing defers even after its peer
+#     commits, and a stuck, dead, identity-mismatched, or finished claim from a
+#     different event is superseded by taking the next generation. No mutex is
+#     ever held across arming or output - the owner lock
 #     survives only as the micro-mutex serializing individual ledger writes -
 #     and a superseded owner goes completely silent: ownership is re-verified
 #     before every arm invocation, episode-state mutation, ledger write, and
@@ -107,6 +108,26 @@ PAYLOAD=$(cat 2>/dev/null || true)
 # its turn boundary, so stand down on a Cursor-delivered payload.
 fm_hook_payload_is_foreign_host "$PAYLOAD" && exit 0
 
+autoarm_stop_event_id() {
+  local payload=$1 canonical digest
+  canonical=$(printf '%s' "$payload" | jq -ceS \
+    'if type == "object" then . else error("Stop payload must be an object") end' \
+    2>/dev/null) || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$canonical" | sha256sum 2>/dev/null | awk '{print $1}') || return 1
+  elif command -v shasum >/dev/null 2>&1; then
+    digest=$(printf '%s' "$canonical" | shasum -a 256 2>/dev/null | awk '{print $1}') || return 1
+  else
+    return 1
+  fi
+  case "$digest" in
+    ''|*[!0-9a-f]*) return 1 ;;
+  esac
+  printf 'sha256:%s\n' "$digest"
+}
+
+STOP_EVENT_ID=$(autoarm_stop_event_id "$PAYLOAD") || exit 0
+
 # --- scope: genuine primary checkout only -----------------------------------
 fm_primary_scope_matches "$FM_ROOT" "$STATE" || exit 0
 
@@ -155,14 +176,14 @@ fi
 # from a pre-generation build (or the guard's own terminal-check), which the
 # legacy shim defers to while genuinely deciding and reclaims once when proven
 # abandoned.
-fm_autoarm_claim_next "$STATE" "$GRACE"
+fm_autoarm_claim_next "$STATE" "$GRACE" "$STOP_EVENT_ID"
 CLAIM_RC=$?
 if [ "$CLAIM_RC" -ne 0 ]; then
   [ "$CLAIM_RC" -eq 2 ] && exit 0
   ROLE=$(fm_lock_role "$OWNER_LOCK" 2>/dev/null || true)
   [ -n "$ROLE" ] || exit 0
   fm_autoarm_release_abandoned "$STATE" "$GRACE" || exit 0
-  fm_autoarm_claim_next "$STATE" "$GRACE" || exit 0
+  fm_autoarm_claim_next "$STATE" "$GRACE" "$STOP_EVENT_ID" || exit 0
 fi
 MY_GEN=$FM_AUTOARM_MY_GEN
 [ -n "$MY_GEN" ] || exit 0
