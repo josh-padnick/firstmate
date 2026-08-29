@@ -1116,6 +1116,113 @@ test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
   pass "auto-arm: contended concurrent stale-generation reclaim admits one owner"
 }
 
+# A losing claimant must remember the stale generation it first observed.
+# This stages the winner's terminal rewake commit while the loser remains in
+# its first mutex retry, then lets the loser reacquire only after that commit.
+# The terminal outcome must still represent an intervening winning generation,
+# so the loser exits quietly instead of publishing another generation and arm.
+test_terminal_commit_before_loser_reacquires_admits_one_owner() {
+  local dir dead holder i rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-terminal-before-loser-reacquires")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" actionable
+  true &
+  dead=$!
+  wait "$dead"
+  kill -0 "$dead" 2>/dev/null && fail "terminal-race stale fixture owner is unexpectedly still alive"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+  touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+
+  mkdir -p "$dir/state/loser-bin" "$dir/state/winner-bin"
+  cat > "$dir/state/loser-bin/sleep" <<'SH'
+#!/usr/bin/env bash
+if mkdir "$FM_RACE_STATE/loser-first-retry" 2>/dev/null; then
+  : > "$FM_RACE_STATE/loser-waiting"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/terminal-committed" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+  : > "$FM_RACE_STATE/loser-observed-terminal"
+fi
+exec /bin/sleep "$@"
+SH
+  cat > "$dir/state/winner-bin/mv" <<'SH'
+#!/usr/bin/env bash
+/bin/mv "$@" || exit $?
+for destination in "$@"; do :; done
+if [ "$destination" = "$FM_RACE_STATE/.claude-autoarm-epoch" ] \
+  && grep -q ' outcome=rewake ' "$destination"; then
+  : > "$FM_RACE_STATE/terminal-committed"
+  i=0
+  while [ ! -e "$FM_RACE_STATE/loser-observed-terminal" ]; do
+    [ "$i" -lt 200 ] || exit 1
+    /bin/sleep 0.01
+    i=$((i + 1))
+  done
+fi
+SH
+  chmod +x "$dir/state/loser-bin/sleep" "$dir/state/winner-bin/mv"
+
+  (
+    FM_HOME="$dir" bash -c '
+      . "$FM_HOME/bin/fm-wake-lib.sh"
+      fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+      : > "$FM_HOME/state/mutex-ready"
+      while [ ! -e "$FM_HOME/state/release-initial-mutex" ]; do sleep 0.01; done
+      fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+    '
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$dir/state/mutex-ready" ]; do
+    [ "$i" -lt 50 ] || fail "terminal-race initial mutex holder never became ready"
+    sleep 0.02
+    i=$((i + 1))
+  done
+
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/loser-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc1"
+    ) &
+    p1=$!
+    i=0
+    while [ ! -e "$FM_HOME/state/loser-waiting" ]; do
+      [ "$i" -lt 200 ] || exit 1
+      sleep 0.01
+      i=$((i + 1))
+    done
+    (
+      rc=0
+      printf "%s\n" "{\"session_id\":\"s\"}" \
+        | FM_RACE_STATE="$FM_HOME/state" PATH="$FM_HOME/state/winner-bin:$PATH" \
+          "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" || rc=$?
+      printf "%s\n" "$rc" > "$FM_HOME/state/rc2"
+    ) &
+    p2=$!
+    : > "$FM_HOME/state/release-initial-mutex"
+    wait "$p1"
+    wait "$p2"
+  '
+  wait "$holder" || fail "terminal-race initial mutex holder did not release cleanly"
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "terminal commit before loser reacquire must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 0 ] && [ "$rc2" = 2 ]; } \
+    || fail "terminal commit before loser reacquire must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8851 ] \
+    || fail "terminal commit before loser reacquire advanced beyond epoch 8851"
+  pass "auto-arm: terminal commit before loser reacquire still admits one owner"
+}
+
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
 # owner whose ledger entry and watcher beacon are both older than grace is
 # stuck, and the next firing supersedes it by taking the next generation.
@@ -1306,6 +1413,7 @@ test_stopped_legacy_owner_is_reclaimed_with_term_pending
 test_open_generation_claim_defers_without_any_lock
 test_dead_generation_reclaims_after_transient_mutex_contention
 test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner
+test_terminal_commit_before_loser_reacquires_admits_one_owner
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
