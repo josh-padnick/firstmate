@@ -1122,13 +1122,14 @@ fm_autoarm_claim_open() {  # <state-dir> [grace]
 
 # Atomically publish this process as the owner of generation N+1, under one
 # short micro-mutex hold. Returns 0 with FM_AUTOARM_MY_GEN set on success, 2
-# when a competing claimant won the race (the ledger generation advanced), and
+# when a competing claimant won the race (the observed ledger claim changed), and
 # 1 when bounded micro-mutex retries are exhausted, the mandatory identity
-# cannot be computed, or the write failed. A contender preserves the predecessor
-# generation it first observed and loses if that generation changes during any
-# retry, even when the winner has already committed a terminal outcome.
+# cannot be computed, or the write failed. A contender preserves the complete
+# predecessor claim it first observed and loses if that claim changes during any
+# retry, including a same-generation terminal commit by a resumed owner.
 fm_autoarm_claim_next() {  # <state-dir> [grace]
-  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen predecessor identity tmp role i
+  local state=$1 grace=${2:-${FM_GUARD_GRACE:-300}} lock epoch pid gen identity tmp role i
+  local predecessor predecessor_exists current current_exists
   lock="$state/.claude-autoarm.lock"
   epoch="$state/.claude-autoarm-epoch"
   FM_AUTOARM_MY_GEN=
@@ -1138,17 +1139,22 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
   pid=${BASHPID:-$$}
   identity=$(fm_pid_identity "$pid" 2>/dev/null) || return 1
   [ -n "$identity" ] || return 1
-  predecessor=$(_fm_autoarm_epoch_field "$epoch" epoch 2>/dev/null || true)
-  case "$predecessor" in
-    ''|*[!0-9]*) predecessor=0 ;;
-  esac
+  predecessor=
+  predecessor_exists=0
+  if [ -e "$epoch" ]; then
+    predecessor=$(cat "$epoch" 2>/dev/null) || return 1
+    predecessor_exists=1
+  fi
   i=0
   while ! fm_lock_try_acquire "$lock"; do
-    gen=$(_fm_autoarm_epoch_field "$epoch" epoch 2>/dev/null || true)
-    case "$gen" in
-      ''|*[!0-9]*) gen=0 ;;
-    esac
-    [ "$gen" = "$predecessor" ] || return 2
+    current=
+    current_exists=0
+    if [ -e "$epoch" ]; then
+      current=$(cat "$epoch" 2>/dev/null) || return 1
+      current_exists=1
+    fi
+    [ "$current_exists" = "$predecessor_exists" ] || return 2
+    [ "$current" = "$predecessor" ] || return 2
     fm_autoarm_claim_open "$state" "$grace" && return 2
     # Role-carrying holds are long-lived legacy claims or the guard's terminal
     # check, not a current generation's short ledger section. The caller owns
@@ -1159,11 +1165,25 @@ fm_autoarm_claim_next() {  # <state-dir> [grace]
     sleep 0.02
     i=$((i + 1))
   done
+  current=
+  current_exists=0
+  if [ -e "$epoch" ]; then
+    if ! current=$(cat "$epoch" 2>/dev/null); then
+      fm_lock_release "$lock"
+      return 1
+    fi
+    current_exists=1
+  fi
+  if [ "$current_exists" != "$predecessor_exists" ] \
+    || [ "$current" != "$predecessor" ]; then
+    fm_lock_release "$lock"
+    return 2
+  fi
   gen=$(_fm_autoarm_epoch_field "$epoch" epoch 2>/dev/null || true)
   case "$gen" in
     ''|*[!0-9]*) gen=0 ;;
   esac
-  if [ "$gen" != "$predecessor" ] || fm_autoarm_claim_open "$state" "$grace"; then
+  if fm_autoarm_claim_open "$state" "$grace"; then
     fm_lock_release "$lock"
     return 2
   fi
