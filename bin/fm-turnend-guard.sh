@@ -48,15 +48,16 @@
 # would re-open the exact blind window this guard exists to close
 # (docs/turnend-guard.md records the 2026-07-21 incident). In --claude mode this
 # guard ignores stop_hook_active and instead cooperates with the Stop-owned
-# auto-arm (bin/fm-claude-stop-autoarm.sh), which fires on the same Stop event:
+# auto-arm (bin/fm-claude-stop-autoarm.sh), which normally fires at the same
+# Stop boundary:
 #   1. a live identity-matched watcher with a fresh beacon allows immediately;
 #   2. otherwise wait briefly (FM_CLAUDE_AUTOARM_SYNC_WAIT_MS, default 800ms)
 #      for the auto-arm to claim this home (a live OPEN generation claim in the
 #      state/.claude-autoarm-epoch ledger - fm_autoarm_claim_open - or a legacy
 #      build's lock-holding claim under the legacy abandonment proof) or to
 #      record a fresh actionable exit-2 outcome
-#      (state/.claude-autoarm-epoch) for this event epoch - either proof allows
-#      without consuming a continuation, so one event epoch yields exactly one recovery turn;
+#      (state/.claude-autoarm-epoch) - either proof allows without consuming a
+#      guard continuation;
 #      the first fresh exhausted-failure epoch preserves the bounded progression,
 #      while later fresh failed epochs consume it instead of resetting it;
 #   3. only when neither materializes is the auto-arm genuinely absent: re-block
@@ -204,9 +205,9 @@ if [ "$CLAUDE_MODE" -eq 0 ]; then
 fi
 
 # --- --claude cooperative path -----------------------------------------------
-# The Stop-owned auto-arm fires on the same Stop event. Give it a brief bounded
-# window to prove it owns recovery for this event epoch before consuming one of
-# Claude's bounded continuations.
+# The Stop-owned auto-arm normally fires at the same Stop boundary. Give it a
+# brief bounded window to publish recovery before consuming one of Claude's
+# bounded continuations.
 budget_account_current_epoch() {
   local current_epoch outcome old_session old_count old_epoch tmp initialized
   fm_lock_try_acquire "$BUDGET_LOCK" || return 1
