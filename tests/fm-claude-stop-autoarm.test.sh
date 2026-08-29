@@ -69,11 +69,8 @@ make_crewmate_worktree_dir() {
 # session lock. $1 = fixture dir. Any extra env assignments must be exported
 # before invocation. Captures stdout+stderr; exit code on stdout of the caller.
 run_autoarm() {
-  local dir=$1 rc=0 seq
-  seq=$(cat "$dir/state/.test-stop-seq" 2>/dev/null || echo 0)
-  seq=$((seq + 1))
-  printf '%s\n' "$seq" > "$dir/state/.test-stop-seq"
-  printf '{"session_id":"sess-autoarm","prompt_id":"event-%s","stop_hook_active":false}\n' "$seq" \
+  local dir=$1 rc=0
+  printf '%s\n' '{"session_id":"sess-autoarm","prompt_id":"prompt-autoarm","hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"done"}' \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
@@ -207,11 +204,8 @@ epoch_outcome() {
 # caller can `wait` on it for the hook's exit status).
 RUN_AUTOARM_BG_PID=
 run_autoarm_bg() {
-  local dir=$1 out=$2 seq
-  seq=$(cat "$dir/state/.test-stop-seq" 2>/dev/null || echo 0)
-  seq=$((seq + 1))
-  printf '%s\n' "$seq" > "$dir/state/.test-stop-seq"
-  printf '{"session_id":"sess-autoarm","prompt_id":"event-%s","stop_hook_active":false}\n' "$seq" \
+  local dir=$1 out=$2
+  printf '%s\n' '{"session_id":"sess-autoarm","prompt_id":"prompt-autoarm","hook_event_name":"Stop","stop_hook_active":true,"last_assistant_message":"done"}' \
     | FM_HOME="$dir" "$FAKE_CLAUDE" -c '
         printf "%s\n" "$$" > "$FM_HOME/state/.lock"
         "$FM_HOME/bin/fm-claude-stop-autoarm.sh"
@@ -1454,11 +1448,36 @@ SH
   pass "auto-arm: eligibility and claim snapshot form one election boundary"
 }
 
-# A Stop firing can be descheduled after its session gate but before it reaches
-# the generation claim.
-# Both hook processes receive the same stable Stop payload, so the delayed
-# firing must recognize the event already completed by its concurrent peer.
-test_delayed_prefunction_firing_deduplicates_by_stop_event() {
+# Claude can emit sequential identical Stop payloads, so payload content must
+# never suppress a later legitimate firing.
+test_sequential_identical_stop_payloads_each_rearm() {
+  local dir dead out status count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-sequential-identical-stops")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" actionable
+  true &
+  dead=$!
+  wait "$dead"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the first identical Stop payload must rearm"
+  assert_contains "$out" "firstmate watcher wake" "the first identical Stop did not translate"
+  out=$(run_autoarm "$dir" 2>/dev/null); status=$?
+  expect_code 2 "$status" "the second identical Stop payload must not be suppressed"
+  assert_contains "$out" "firstmate watcher wake" "the second identical Stop did not translate"
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 2 ] || fail "two sequential identical Stops must run two arms, saw $count"
+  [ "$(epoch_field "$dir" epoch)" = 8852 ] \
+    || fail "two sequential identical Stops must publish two monotonic generations"
+  pass "auto-arm: sequential identical Stop payloads each rearm"
+}
+
+# A duplicate firing can be descheduled after its session gate until its peer
+# has committed. Without a harness occurrence token it may then take one more
+# generation, but one duplicated delivery is bounded to one additional arm.
+test_delayed_duplicate_is_bounded_to_one_extra_restart() {
   local dir dead rc1 rc2 count stopped
   dir=$(make_primary_dir "$TMP_ROOT/v2-delayed-prefunction-event")
   : > "$dir/state/task1.meta"
@@ -1485,7 +1504,7 @@ SH
   chmod +x "$dir/state/gate-bin/date"
 
   FM_HOME="$dir" "$FAKE_CLAUDE" -c '
-    payload="{\"session_id\":\"s\",\"prompt_id\":\"stable-stop-event\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":false,\"last_assistant_message\":\"done\"}"
+    payload="{\"session_id\":\"s\",\"prompt_id\":\"prompt-autoarm\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":true,\"last_assistant_message\":\"done\"}"
     printf "%s\n" "$$" > "$FM_HOME/state/.lock"
     (
       rc=0
@@ -1522,12 +1541,12 @@ SH
   rc1=$(cat "$dir/state/rc1")
   rc2=$(cat "$dir/state/rc2")
   count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
-  [ "$count" -eq 1 ] || fail "delayed same-event firing must foreground exactly one arm, saw $count"
-  { [ "$rc1" = 0 ] && [ "$rc2" = 2 ]; } \
-    || fail "delayed same-event firing must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
-  [ "$(epoch_field "$dir" epoch)" = 8851 ] \
-    || fail "delayed same-event firing published a second generation"
-  pass "auto-arm: delayed pre-function firing deduplicates by stable Stop event"
+  [ "$count" -eq 2 ] || fail "one delayed duplicate must be bounded to two total arms, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 2 ]; } \
+    || fail "the delayed duplicate containment path must translate both arms, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8852 ] \
+    || fail "one delayed duplicate must advance exactly twice from epoch 8850"
+  pass "auto-arm: delayed duplicate is bounded to one extra restart"
 }
 
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
@@ -1723,7 +1742,8 @@ test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner
 test_terminal_commit_before_loser_reacquires_admits_one_owner
 test_same_generation_terminal_commit_before_reacquire_admits_one_owner
 test_terminal_commit_in_eligibility_snapshot_gap_admits_one_owner
-test_delayed_prefunction_firing_deduplicates_by_stop_event
+test_sequential_identical_stop_payloads_each_rearm
+test_delayed_duplicate_is_bounded_to_one_extra_restart
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
