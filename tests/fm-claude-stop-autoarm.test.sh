@@ -1041,6 +1041,58 @@ test_dead_generation_reclaims_after_transient_mutex_contention() {
   pass "auto-arm: dead generation claims in every outcome reclaim within one contended Stop firing"
 }
 
+# Two Stop firings that both encounter the incident's contended stale ledger
+# must converge after the mutex releases: one supersedes epoch 8850 and arms,
+# while the other observes that open winning generation and exits quietly.
+test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner() {
+  local dir dead holder i rc1 rc2 count
+  dir=$(make_primary_dir "$TMP_ROOT/v2-dead-rewake-contended-concurrent")
+  : > "$dir/state/task1.meta"
+  write_arm_fixture "$dir" slow-actionable
+  true &
+  dead=$!
+  wait "$dead"
+  kill -0 "$dead" 2>/dev/null && fail "concurrent stale fixture owner is unexpectedly still alive"
+  printf 'epoch=8850 owner_pid=%s outcome=rewake updated_at=1787894191\nstale-owner-identity\n' \
+    "$dead" > "$dir/state/.claude-autoarm-epoch"
+  touch -t 202608272200 "$dir/state/.claude-autoarm-epoch"
+  (
+    FM_HOME="$dir" bash -c '
+      . "$FM_HOME/bin/fm-wake-lib.sh"
+      fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
+      : > "$FM_HOME/state/mutex-ready"
+      sleep 0.4
+      fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
+    '
+  ) &
+  holder=$!
+  i=0
+  while [ ! -e "$dir/state/mutex-ready" ]; do
+    [ "$i" -lt 50 ] || fail "concurrent transient mutex holder never became ready"
+    sleep 0.02
+    i=$((i + 1))
+  done
+  FM_HOME="$dir" "$FAKE_CLAUDE" -c '
+    printf "%s\n" "$$" > "$FM_HOME/state/.lock"
+    printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err1" &
+    p1=$!
+    printf "%s\n" "{\"session_id\":\"s\"}" | "$FM_HOME/bin/fm-claude-stop-autoarm.sh" >/dev/null 2>"$FM_HOME/state/err2" &
+    p2=$!
+    wait "$p1"; echo $? > "$FM_HOME/state/rc1"
+    wait "$p2"; echo $? > "$FM_HOME/state/rc2"
+  '
+  wait "$holder"
+  rc1=$(cat "$dir/state/rc1")
+  rc2=$(cat "$dir/state/rc2")
+  count=$(wc -l < "$dir/state/arm-ran" | tr -d ' ')
+  [ "$count" -eq 1 ] || fail "contended concurrent reclaim must foreground exactly one arm, saw $count"
+  { [ "$rc1" = 2 ] && [ "$rc2" = 0 ]; } || { [ "$rc1" = 0 ] && [ "$rc2" = 2 ]; } \
+    || fail "contended concurrent reclaim must yield one rewake and one no-op, got rc1=$rc1 rc2=$rc2"
+  [ "$(epoch_field "$dir" epoch)" = 8851 ] \
+    || fail "contended concurrent reclaim did not advance exactly once from epoch 8850"
+  pass "auto-arm: contended concurrent stale-generation reclaim admits one owner"
+}
+
 # The 2026-08-26 watcher flap in the generation model: a live, identity-matched
 # owner whose ledger entry and watcher beacon are both older than grace is
 # stuck, and the next firing supersedes it by taking the next generation.
@@ -1230,6 +1282,7 @@ test_stuck_live_legacy_owner_is_retired_and_reclaimed
 test_stopped_legacy_owner_is_reclaimed_with_term_pending
 test_open_generation_claim_defers_without_any_lock
 test_dead_generation_reclaims_after_transient_mutex_contention
+test_concurrent_reclaim_after_transient_mutex_contention_admits_one_owner
 test_stuck_generation_claim_is_superseded_and_rearms
 test_identityless_ledger_never_defers
 test_superseded_owner_never_reinvokes_the_arm
