@@ -1478,7 +1478,7 @@ test_sequential_identical_stop_payloads_each_rearm() {
 # has committed. Without a harness occurrence token it may then take one more
 # generation, but one duplicated delivery is bounded to one additional arm.
 test_delayed_duplicate_is_bounded_to_one_extra_restart() {
-  local dir dead rc1 rc2 count stopped
+  local dir dead rc1 rc2 count
   dir=$(make_primary_dir "$TMP_ROOT/v2-delayed-prefunction-event")
   : > "$dir/state/task1.meta"
   : > "$dir/state/.last-watcher-beat"
