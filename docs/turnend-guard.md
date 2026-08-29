@@ -170,4 +170,4 @@ It also covers true-reason banner wording and reason-keyed episode dedup survivi
 `tests/fm-supervision-instructions.test.sh` covers recovery-line ownership and pi-signed's identity-preserving reuse of Pi's protocol.
 `tests/fm-claude-stop-autoarm.test.sh` covers same-firing reclaim of a dead generation in every recorded outcome after transient bare micro-mutex contention, plus the concurrent-winner single-flight boundary.
 `FM_PI_LIVE_E2E=1 tests/fm-pi-primary-live-e2e.test.sh` is the opt-in isolated Pi path.
-[`verification/supervision.md`](verification/supervision.md#turn-end-guard) records the active cross-harness empirical evidence, including the 2026-07-24 Claude `asyncRewake` revalidation.
+[`verification/supervision.md`](verification/supervision.md#turn-end-guard) records the active cross-harness empirical evidence, including the 2026-08-27 Claude `asyncRewake` revalidation.

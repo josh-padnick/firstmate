@@ -1017,7 +1017,10 @@ test_dead_generation_reclaims_after_transient_mutex_contention() {
         . "$FM_HOME/bin/fm-wake-lib.sh"
         fm_lock_try_acquire "$FM_HOME/state/.claude-autoarm.lock" || exit 1
         : > "$FM_HOME/state/mutex-ready"
-        sleep 0.2
+        # Keep the mutex beyond normal hook startup so the pre-fix one-shot
+        # claimant deterministically encounters contention, while still
+        # releasing inside the fixed 600 ms bounded retry window.
+        sleep 0.4
         fm_lock_release "$FM_HOME/state/.claude-autoarm.lock"
       '
     ) &
