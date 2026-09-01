@@ -207,6 +207,7 @@ family_for_basename() {
     fm-lint-workflows.test.sh|\
     fm-operational-input.test.sh|fm-pi-primary-types.test.sh|\
     fm-review-dispatch.test.sh|\
+    fm-harness-adapter-references.test.sh|\
     fm-send-popup-settle.test.sh|fm-send-settle.test.sh|\
     fm-subagent-pretool-check.test.sh|\
     fm-supervision-instructions.test.sh|fm-task-delivery.test.sh|\
@@ -246,6 +247,7 @@ family_for_basename() {
     fm-send-secondmate-marker.test.sh|fm-shared-captain-inheritance.test.sh)
       printf '%s\n' secondmate
       ;;
+    fm-backlog-atomicity.test.sh|\
     fm-bootstrap.test.sh|fm-bootstrap-network-parallel.test.sh|fm-fleet-sync.test.sh|fm-gate-refuse.test.sh|fm-gotmp.test.sh|\
     fm-session-start.test.sh|fm-sessionstart-nudge.test.sh|fm-startup-network.test.sh|\
     fm-tangle-guard.test.sh|fm-update.test.sh)
@@ -256,7 +258,8 @@ family_for_basename() {
     fm-composer-matrix-live-e2e.test.sh|\
     fm-codex-continuity-live-e2e.test.sh|fm-grok-continuity-live-e2e.test.sh|\
     fm-cursor-primary-live-e2e.test.sh|\
-    fm-grok-stop-live-e2e.test.sh|fm-harness-liveness-drift-live-e2e.test.sh|\
+    fm-grok-stop-live-e2e.test.sh|fm-harness-adapter-instructions-live-e2e.test.sh|\
+    fm-harness-liveness-drift-live-e2e.test.sh|\
     fm-muse-signals-live-e2e.test.sh|\
     fm-herdr-version-floor-live-e2e.test.sh|\
     fm-opencode-primary-live-e2e.test.sh|fm-pi-branch-live-e2e.test.sh|\
@@ -277,15 +280,15 @@ family_for_basename() {
     fm-teardown-endpoint-safety.test.sh)
       printf '%s\n' backend-dispatch
       ;;
-    fm-pr-check-security.test.sh|fm-pr-merge.test.sh|fm-review-diff.test.sh|\
-    fm-teardown.test.sh|fm-x-mode.test.sh)
+    fm-check-unregister.test.sh|fm-pr-check-security.test.sh|fm-pr-merge.test.sh|\
+    fm-review-diff.test.sh|fm-teardown.test.sh|fm-x-mode.test.sh)
       printf '%s\n' pr-forge
       ;;
     fm-afk-inject-e2e.test.sh|fm-afk-return.test.sh)
       printf '%s\n' afk
       ;;
     fm-bearings-board-render.test.sh|fm-bearings-snapshot.test.sh|\
-    fm-fleet-snapshot-view.test.sh)
+    fm-fleet-snapshot-view.test.sh|fm-home-summary-refresh.test.sh)
       printf '%s\n' snapshot-bearings
       ;;
     fm-backend-cmux.test.sh|fm-backend-cmux-smoke.test.sh)
@@ -530,11 +533,14 @@ tests/fm-daemon.test.sh 25834
 tests/fm-documentation-audiences.test.sh 642
 tests/fm-fleet-snapshot-view.test.sh 6995
 tests/fm-fleet-sync.test.sh 20194
+tests/fm-extension-binding.test.sh 35000
 tests/fm-gate-refuse.test.sh 4071
 tests/fm-gitignore-config.test.sh 63
 tests/fm-gotmp.test.sh 762
 tests/fm-grok-continuity-live-e2e.test.sh 19
 tests/fm-grok-stop-live-e2e.test.sh 21
+tests/fm-harness-adapter-instructions-live-e2e.test.sh 20
+tests/fm-harness-adapter-references.test.sh 2
 tests/fm-guard-stale-banner.test.sh 11280
 tests/fm-harness-liveness-drift-live-e2e.test.sh 19
 tests/fm-herdr-session-cleanup.test.sh 14120
@@ -595,6 +601,7 @@ tests/fm-task-delivery.test.sh 2414
 tests/fm-teardown-endpoint-safety.test.sh 7295
 tests/fm-teardown.test.sh 87400
 tests/fm-test-fixture-cleanup.test.sh 532
+tests/fm-test-fixtures.test.sh 1045
 tests/fm-test-isolation-proof.test.sh 451
 tests/fm-tmux-agent-liveness.test.sh 4065
 tests/fm-tool-update-check.test.sh 12846
@@ -1130,8 +1137,19 @@ families_for_changed_path() {
       ;;
     bin/fm-session-start.sh|bin/fm-bootstrap.sh|bin/fm-fleet-sync.sh|\
     bin/fm-sessionstart-nudge.sh|bin/fm-startup-network.sh|bin/fm-tangle*|bin/fm-update.sh|\
-    bin/fm-gate-refuse*|bin/fm-lock*|bin/fm-quota-axi-lib.sh)
+    bin/fm-gate-refuse*|bin/fm-lock*)
       printf '%s\n' session-bootstrap
+      ;;
+    bin/fm-quota-axi-lib.sh)
+      printf '%s\n' session-bootstrap
+      printf '%s\n' "__script__:fm-procevent-quota.test.sh"
+      printf '%s\n' "__script__:fm-quota-choose.test.sh"
+      ;;
+    bin/fm-procevent-quota.sh)
+      printf '%s\n' "__script__:fm-procevent-quota.test.sh"
+      ;;
+    bin/fm-quota-choose.sh)
+      printf '%s\n' "__script__:fm-quota-choose.test.sh"
       ;;
     bin/fm-sessionstart-run.sh|.claude/settings.json|.codex/hooks.json|\
     .pi/extensions/fm-primary-turnend-guard.ts)
@@ -1139,6 +1157,15 @@ families_for_changed_path() {
       # context-reset stdout injection) only show up against a real harness.
       printf '%s\n' session-bootstrap
       printf '%s\n' live-harness-optin
+      ;;
+    bin/fm-extension.mjs|bin/fm-extension.sh|docs/examples/process-event-extension/*)
+      printf '%s\n' __script__:fm-extension-binding.test.sh
+      ;;
+    bin/fm-procevent.sh|bin/fm-procevent-lib.sh|bin/fm-procevent-extension-capture.pl)
+      printf '%s\n' __script__:fm-extension-binding.test.sh
+      printf '%s\n' __script__:fm-procevent.test.sh
+      printf '%s\n' __script__:fm-procevent-when.test.sh
+      printf '%s\n' __script__:fm-remote-reply.test.sh
       ;;
     bin/fm-timeout-lib.sh)
       # The shared hard bound: session start's runtime bound, the fleet/bearings
@@ -1149,6 +1176,7 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' secondmate
       printf '%s\n' watcher-wake-lock
+      printf '%s\n' "__script__:fm-procevent-quota.test.sh"
       ;;
     bin/fm-pr-*|bin/fm-merge-local.sh|bin/fm-teardown.sh|bin/fm-review-diff.sh|\
     bin/fm-x-*|bin/fm-check*)
@@ -1160,6 +1188,11 @@ families_for_changed_path() {
       # pre-teardown run abort (pr-forge).
       printf '%s\n' pure-contract-unit
       printf '%s\n' pr-forge
+      ;;
+    bin/fm-control-lib.sh)
+      printf '%s\n' backend-dispatch
+      printf '%s\n' session-bootstrap
+      printf '%s\n' "__script__:fm-quota-choose.test.sh"
       ;;
     bin/fm-composer-lib.sh)
       # The shared shape catalogue is vendor-rendered signal; a change to it
@@ -1182,7 +1215,8 @@ families_for_changed_path() {
       printf '%s\n' watcher-wake-lock
       printf '%s\n' live-harness-optin
       ;;
-    bin/fm-bearings-snapshot.sh|bin/fm-fleet-snapshot.sh|bin/fm-fleet-view.sh)
+    bin/fm-bearings-snapshot.sh|bin/fm-fleet-snapshot.sh|bin/fm-fleet-view.sh|\
+    bin/fm-home-summary-refresh.sh)
       printf '%s\n' snapshot-bearings
       ;;
     bin/fm-install-herdr.sh|bin/fm-install-treehouse.sh|bin/fm-herdr-ci-cleanup.sh)
@@ -1205,6 +1239,10 @@ families_for_changed_path() {
       printf '%s\n' pure-contract-unit
       printf '%s\n' live-harness-optin
       ;;
+    .agents/skills/harness-adapters/SKILL.md|.agents/skills/harness-adapters/references/*)
+      printf '%s\n' pure-contract-unit
+      printf '%s\n' live-harness-optin
+      ;;
     .agents/skills/*/SKILL.md)
       printf '%s\n' pure-contract-unit
       ;;
@@ -1220,7 +1258,7 @@ families_for_changed_path() {
     docs/configuration.md|docs/supervision-protocols/*)
       printf '%s\n' pure-contract-unit
       ;;
-    tests/lib.sh|tests/*-helpers.sh)
+    tests/lib.sh|tests/*-helpers.sh|tests/fixtures.sh)
       families_for_test_reference "$(basename "$path")" \
         || printf '%s\n' "__unmapped__:$path"
       ;;
